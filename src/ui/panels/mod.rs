@@ -9,11 +9,13 @@ pub mod traces;
 pub mod wiki;
 
 use serde::{Deserialize, Serialize};
+use tokio::{runtime::Handle, sync::mpsc};
 
-use crate::state::AppState;
+use crate::{runtime::UiEvent, state::AppState};
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum Tab {
+    #[default]
     Dashboard,
     Articles,
     Gather,
@@ -23,12 +25,6 @@ pub enum Tab {
     Prompts,
     Settings,
     Traces,
-}
-
-impl Default for Tab {
-    fn default() -> Self {
-        Self::Dashboard
-    }
 }
 
 impl Tab {
@@ -59,16 +55,43 @@ impl Tab {
     }
 }
 
-pub fn show(tab: Tab, ui: &mut egui::Ui, state: &AppState) {
-    match tab {
-        Tab::Dashboard => dashboard::show(ui, state),
-        Tab::Articles => articles::show(ui, state),
-        Tab::Gather => gather::show(ui, state),
-        Tab::KnowledgeGraph => knowledge_graph::show(ui, state),
-        Tab::Wiki => wiki::show(ui, state),
-        Tab::Newsletter => newsletter::show(ui, state),
-        Tab::Prompts => prompts::show(ui, state),
-        Tab::Settings => settings::show(ui, state),
-        Tab::Traces => traces::show(ui, state),
+/// Shared per-frame context handed to each panel.
+///
+/// Panels use `handle` to spawn async work on the tokio runtime and `ui_tx`
+/// to forward cross-cutting status messages (e.g. "Job X failed") back to
+/// the app-level status bar. Panel-local results travel on the panel's own
+/// `mpsc` channel, not `ui_tx`.
+pub struct PanelCtx<'a> {
+    pub state: &'a AppState,
+    pub handle: &'a Handle,
+    pub ui_tx: &'a mpsc::UnboundedSender<UiEvent>,
+}
+
+#[derive(Default)]
+pub struct Panels {
+    pub dashboard: dashboard::Panel,
+    pub articles: articles::Panel,
+    pub gather: gather::Panel,
+    pub knowledge_graph: knowledge_graph::Panel,
+    pub wiki: wiki::Panel,
+    pub newsletter: newsletter::Panel,
+    pub prompts: prompts::Panel,
+    pub settings: settings::Panel,
+    pub traces: traces::Panel,
+}
+
+impl Panels {
+    pub fn show(&mut self, tab: Tab, ui: &mut egui::Ui, ctx: &PanelCtx<'_>) {
+        match tab {
+            Tab::Dashboard => self.dashboard.show(ui, ctx),
+            Tab::Articles => self.articles.show(ui, ctx),
+            Tab::Gather => self.gather.show(ui, ctx),
+            Tab::KnowledgeGraph => self.knowledge_graph.show(ui, ctx),
+            Tab::Wiki => self.wiki.show(ui, ctx),
+            Tab::Newsletter => self.newsletter.show(ui, ctx),
+            Tab::Prompts => self.prompts.show(ui, ctx),
+            Tab::Settings => self.settings.show(ui, ctx),
+            Tab::Traces => self.traces.show(ui, ctx),
+        }
     }
 }

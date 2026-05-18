@@ -3,6 +3,7 @@ use researchwiki::{
     config::AppConfig,
     init_tracing, register_sqlite_vec,
     runtime::DesktopRuntime,
+    services::settings::load_overrides_sync,
 };
 
 fn main() -> eframe::Result<()> {
@@ -18,12 +19,23 @@ fn main() -> eframe::Result<()> {
 
     let runtime = DesktopRuntime::new().expect("tokio runtime should build");
 
-    let config = AppConfig::from_env().expect("AppConfig should resolve");
+    let mut config = AppConfig::from_env().expect("AppConfig should resolve");
 
     // Synchronous bootstrap: seed directories and copy bundled prompts, then
     // run async DB initialization on the runtime so vec0/FTS tables exist
     // before the first frame.
     first_launch_seed(&config).expect("first-launch directory setup failed");
+
+    // Overlay persisted LLM endpoint + embedding dimensions from settings.json,
+    // so the first-run modal only appears on a truly fresh install.
+    let (persisted_llm, persisted_dim) = load_overrides_sync(&config.storage.settings_file);
+    if let Some(llm) = persisted_llm {
+        config.llm = llm;
+    }
+    if let Some(dim) = persisted_dim {
+        config.embedding_dimensions = dim;
+    }
+
     runtime
         .handle
         .block_on(bootstrap_db(&config))

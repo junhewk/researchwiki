@@ -1,7 +1,12 @@
-use crate::state::AppState;
+use super::PanelCtx;
 
-pub fn show(ui: &mut egui::Ui, _state: &AppState) {
-    ui.heading("Dashboard");
-    ui.separator();
-    ui.label("Article counts, daily stats chart, tier summary tiles — TODO");
+#[derive(Default)]
+pub struct Panel;
+
+impl Panel {
+    pub fn show(&mut self, ui: &mut egui::Ui, _ctx: &PanelCtx<'_>) {
+        ui.heading("Dashboard");
+        ui.separator();
+        ui.label("Article counts, daily stats chart, tier summary tiles — TODO");
+    }
 }

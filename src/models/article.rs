@@ -22,7 +22,7 @@ pub struct ArticleUpdate {
     pub fields: serde_json::Map<String, serde_json::Value>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Clone, Debug, Serialize)]
 pub struct ArticleResponse {
     pub uid: String,
     pub title: Option<String>,

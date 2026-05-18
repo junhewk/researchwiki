@@ -96,6 +96,10 @@ pub struct StoredSettings {
     pub library_enabled: bool,
     #[serde(default = "default_true")]
     pub kg_enabled: bool,
+    #[serde(default)]
+    pub llm: Option<crate::config::LlmConfig>,
+    #[serde(default)]
+    pub embedding_dimensions: Option<u32>,
 }
 
 fn default_true() -> bool {

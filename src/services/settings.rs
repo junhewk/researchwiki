@@ -1,8 +1,9 @@
-use std::{collections::BTreeMap, env, path::PathBuf};
+use std::{collections::BTreeMap, env, path::{Path, PathBuf}};
 
 use tokio::sync::RwLock;
 
 use crate::{
+    config::LlmConfig,
     error::AppError,
     models::settings::{
         AiProvider, ApiKeyStatus, ApiKeyUpdate, SettingsResponse, SettingsUpdate, StoredSettings,
@@ -91,6 +92,30 @@ impl SettingsService {
         Ok((stored.library_enabled, stored.kg_enabled))
     }
 
+    pub async fn get_llm_config(&self) -> Result<Option<LlmConfig>, AppError> {
+        let stored = self.load().await?;
+        Ok(stored.llm)
+    }
+
+    pub async fn set_llm_config(&self, llm: LlmConfig) -> Result<(), AppError> {
+        let _guard = self.lock.write().await;
+        let mut stored = self.load().await?;
+        stored.llm = Some(llm);
+        self.save(&stored).await
+    }
+
+    pub async fn get_embedding_dimensions(&self) -> Result<Option<u32>, AppError> {
+        let stored = self.load().await?;
+        Ok(stored.embedding_dimensions)
+    }
+
+    pub async fn set_embedding_dimensions(&self, dim: u32) -> Result<(), AppError> {
+        let _guard = self.lock.write().await;
+        let mut stored = self.load().await?;
+        stored.embedding_dimensions = Some(dim);
+        self.save(&stored).await
+    }
+
     pub async fn get_api_key(&self, provider: AiProvider) -> Result<Option<String>, AppError> {
         let stored = self.load().await?;
         Ok(stored
@@ -124,6 +149,19 @@ impl SettingsService {
         tokio::fs::write(&self.settings_file, raw).await?;
         Ok(())
     }
+}
+
+/// Synchronously read persisted overrides from settings.json at startup,
+/// before the tokio runtime is available. Returns `(None, None)` if the
+/// file is missing or unparseable — startup proceeds with defaults.
+pub fn load_overrides_sync(settings_file: &Path) -> (Option<LlmConfig>, Option<u32>) {
+    let Ok(raw) = std::fs::read_to_string(settings_file) else {
+        return (None, None);
+    };
+    let Ok(stored) = serde_json::from_str::<StoredSettings>(&raw) else {
+        return (None, None);
+    };
+    (stored.llm, stored.embedding_dimensions)
 }
 
 fn mask_api_key(key: &str) -> String {

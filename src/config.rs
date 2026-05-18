@@ -20,17 +20,29 @@ pub struct StorageConfig {
     pub wiki_export_dir: PathBuf,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct LlmConfig {
     pub base_url: String,
     pub model: String,
+    #[serde(default)]
     pub api_key: String,
+    #[serde(default = "default_true")]
     pub disable_thinking: bool,
+    #[serde(default = "default_connect_timeout")]
     pub connect_timeout_seconds: u64,
+    #[serde(default = "default_request_timeout")]
     pub request_timeout_seconds: u64,
+    #[serde(default = "default_max_attempts")]
     pub max_attempts: usize,
+    #[serde(default = "default_max_concurrent")]
     pub max_concurrent_requests: usize,
 }
+
+fn default_true() -> bool { true }
+fn default_connect_timeout() -> u64 { 10 }
+fn default_request_timeout() -> u64 { 300 }
+fn default_max_attempts() -> usize { 4 }
+fn default_max_concurrent() -> usize { 1 }
 
 impl Default for LlmConfig {
     fn default() -> Self {

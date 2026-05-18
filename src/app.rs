@@ -13,11 +13,11 @@ use crate::{
     config::AppConfig,
     db,
     runtime::{DesktopRuntime, UiEvent},
-    services::scheduler::run_scheduler_loop,
+    services::{scheduler::run_scheduler_loop, settings::SettingsService},
     state::AppState,
     ui::{
         first_run::{FirstRunForm, FirstRunOutcome},
-        panels::Tab,
+        panels::{PanelCtx, Panels, Tab},
     },
 };
 
@@ -44,12 +44,11 @@ pub struct DesktopApp {
     shutdown_tx: watch::Sender<bool>,
     shutdown_rx: watch::Receiver<bool>,
     /// Cloned into background tasks so they can push progress events into
-    /// `ui_rx` for the UI thread to drain. Unused while panels are still
-    /// stubs; remove the allow once a real panel spawns work.
-    #[allow(dead_code)]
+    /// `ui_rx` for the UI thread to drain.
     ui_tx: mpsc::UnboundedSender<UiEvent>,
     ui_rx: mpsc::UnboundedReceiver<UiEvent>,
     first_run: FirstRunForm,
+    panels: Panels,
     persistent: PersistentUi,
     status: Option<String>,
 }
@@ -76,6 +75,7 @@ impl DesktopApp {
             ui_tx: runtime.ui_tx,
             ui_rx: runtime.ui_rx,
             first_run: FirstRunForm::default(),
+            panels: Panels::default(),
             persistent,
             status: None,
         };
@@ -141,6 +141,17 @@ impl eframe::App for DesktopApp {
         // First-run modal blocks everything until LLM endpoint is configured.
         if self.state.is_none() {
             if let FirstRunOutcome::Submitted(llm) = self.first_run.show(ctx) {
+                // Persist the LLM config before activating so the modal only
+                // shows once. Best-effort: a failed write still lets the user
+                // continue in this session.
+                let path = self.config.storage.settings_file.clone();
+                let llm_to_save = llm.clone();
+                let save_result = self.handle.block_on(async move {
+                    SettingsService::new(path).set_llm_config(llm_to_save).await
+                });
+                if let Err(err) = save_result {
+                    warn!("failed to persist LLM config from first-run modal: {err:#}");
+                }
                 self.config.llm = llm;
                 self.activate();
             }
@@ -167,7 +178,12 @@ impl eframe::App for DesktopApp {
 
         egui::CentralPanel::default().show(ctx, |ui| {
             if let Some(state) = &self.state {
-                crate::ui::panels::show(self.persistent.active_tab, ui, state);
+                let panel_ctx = PanelCtx {
+                    state,
+                    handle: &self.handle,
+                    ui_tx: &self.ui_tx,
+                };
+                self.panels.show(self.persistent.active_tab, ui, &panel_ctx);
             }
         });
     }
