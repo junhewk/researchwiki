@@ -1,9 +1,8 @@
 use egui_extras::{Column, TableBuilder};
-use tokio::sync::mpsc;
 
 use crate::models::article::{ArticleListQuery, ArticleListResponse, ArticleResponse};
 
-use super::PanelCtx;
+use super::{MsgChannel, PanelCtx};
 
 enum Msg {
     Page(ArticleListResponse),
@@ -34,7 +33,7 @@ struct Filters {
 
 #[derive(Default)]
 pub struct Panel {
-    channel: Option<Channel>,
+    channel: Option<MsgChannel<Msg>>,
     initialized: bool,
 
     items: Vec<ArticleResponse>,
@@ -55,22 +54,10 @@ pub struct Panel {
     error: Option<String>,
 }
 
-struct Channel {
-    tx: mpsc::UnboundedSender<Msg>,
-    rx: mpsc::UnboundedReceiver<Msg>,
-}
-
-impl Default for Channel {
-    fn default() -> Self {
-        let (tx, rx) = mpsc::unbounded_channel();
-        Self { tx, rx }
-    }
-}
-
 impl Panel {
     pub fn show(&mut self, ui: &mut egui::Ui, ctx: &PanelCtx<'_>) {
         if self.channel.is_none() {
-            self.channel = Some(Channel::default());
+            self.channel = Some(MsgChannel::default());
         }
         self.drain();
         if !self.initialized {
@@ -117,11 +104,9 @@ impl Panel {
                     self.apply_local_sort();
                     self.loading = false;
                     self.error = None;
-                    // Re-resolve the selected row index after the data changes.
-                    self.selected_index = match &self.selected_uid {
-                        Some(uid) => self.items.iter().position(|a| &a.uid == uid),
-                        None => None,
-                    };
+                    self.selected_index = self.selected_uid
+                        .as_ref()
+                        .and_then(|uid| self.items.iter().position(|a| &a.uid == uid));
                 }
                 Msg::Error(err) => {
                     self.loading = false;
@@ -245,31 +230,14 @@ impl Panel {
                     let selected = self.selected_index == Some(idx);
                     row.set_selected(selected);
 
-                    let (_, r0) = row.col(|ui| {
-                        ui.label(article.reg_date.as_deref().unwrap_or("—"));
-                    });
-                    let (_, r1) = row.col(|ui| {
-                        ui.add(
-                            egui::Label::new(article.title.as_deref().unwrap_or("(untitled)"))
-                                .truncate(),
-                        );
-                    });
-                    let (_, r2) = row.col(|ui| {
-                        ui.label(article.category.as_deref().unwrap_or("—"));
-                    });
-                    let (_, r3) = row.col(|ui| {
-                        ui.label(
-                            article
-                                .total_score
-                                .map(|s| s.to_string())
-                                .unwrap_or_else(|| "—".into()),
-                        );
-                    });
-                    let (_, r4) = row.col(|ui| {
-                        ui.label(article.priority.as_deref().unwrap_or("—"));
-                    });
-
-                    if r0.clicked() || r1.clicked() || r2.clicked() || r3.clicked() || r4.clicked() {
+                    let cells = [
+                        row.col(|ui| { ui.label(article.reg_date.as_deref().unwrap_or("—")); }).1,
+                        row.col(|ui| { ui.add(egui::Label::new(article.title.as_deref().unwrap_or("(untitled)")).truncate()); }).1,
+                        row.col(|ui| { ui.label(article.category.as_deref().unwrap_or("—")); }).1,
+                        row.col(|ui| { ui.label(article.total_score.map(|s| s.to_string()).unwrap_or_else(|| "—".into())); }).1,
+                        row.col(|ui| { ui.label(article.priority.as_deref().unwrap_or("—")); }).1,
+                    ];
+                    if cells.iter().any(|r| r.clicked()) {
                         selected_uid_click = Some((article.uid.clone(), idx));
                     }
                 });
@@ -435,11 +403,11 @@ impl Panel {
         self.items.sort_by(|a, b| {
             let ord = match self.sort_col {
                 SortCol::None => std::cmp::Ordering::Equal,
-                SortCol::Date => cmp_opt(a.reg_date.as_deref(), b.reg_date.as_deref()),
-                SortCol::Title => cmp_opt(a.title.as_deref(), b.title.as_deref()),
-                SortCol::Category => cmp_opt(a.category.as_deref(), b.category.as_deref()),
+                SortCol::Date => a.reg_date.cmp(&b.reg_date),
+                SortCol::Title => a.title.cmp(&b.title),
+                SortCol::Category => a.category.cmp(&b.category),
                 SortCol::Score => a.total_score.cmp(&b.total_score),
-                SortCol::Tier => cmp_opt(a.priority.as_deref(), b.priority.as_deref()),
+                SortCol::Tier => a.priority.cmp(&b.priority),
             };
             if asc { ord } else { ord.reverse() }
         });
@@ -482,12 +450,6 @@ fn opt(s: &str) -> Option<String> {
     } else {
         Some(t.to_string())
     }
-}
-
-fn cmp_opt(a: Option<&str>, b: Option<&str>) -> std::cmp::Ordering {
-    // None sorts before Some in ascending order so the default desc shows
-    // populated values first.
-    a.cmp(&b)
 }
 
 fn detail_kv(ui: &mut egui::Ui, label: &str, value: Option<&str>) {

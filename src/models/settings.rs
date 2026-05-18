@@ -4,9 +4,6 @@ use serde::{Deserialize, Serialize};
 #[serde(rename_all = "snake_case")]
 pub enum AiProvider {
     Openai,
-    Anthropic,
-    Google,
-    AzureOpenai,
 }
 
 impl AiProvider {
@@ -15,26 +12,14 @@ impl AiProvider {
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Openai => "openai",
-            Self::Anthropic => "anthropic",
-            Self::Google => "google",
-            Self::AzureOpenai => "azure_openai",
         }
     }
 
     pub fn env_key(self) -> &'static str {
         match self {
             Self::Openai => "OPENAI_API_KEY",
-            Self::Anthropic => "ANTHROPIC_API_KEY",
-            Self::Google => "GOOGLE_API_KEY",
-            Self::AzureOpenai => "AZURE_OPENAI_API_KEY",
         }
     }
-}
-
-#[derive(Debug, Deserialize, Serialize)]
-pub struct ApiKeyUpdate {
-    pub provider: AiProvider,
-    pub api_key: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -130,11 +115,4 @@ pub struct SchedulerJob {
     pub id: String,
     pub name: String,
     pub next_run: Option<String>,
-}
-
-#[derive(Debug, Serialize)]
-pub struct ProviderInfo {
-    pub id: String,
-    pub name: String,
-    pub models: Vec<String>,
 }

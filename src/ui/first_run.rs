@@ -1,11 +1,5 @@
 use crate::config::LlmConfig;
 
-/// State of the first-run / LLM-endpoint setup modal.
-///
-/// Stored on the `DesktopApp` and shown whenever `LlmConfig::is_configured`
-/// returns false. The user must complete it before any other panel becomes
-/// interactive, because every LLM-dependent feature will silently fail
-/// otherwise.
 #[derive(Default)]
 pub struct FirstRunForm {
     pub base_url: String,

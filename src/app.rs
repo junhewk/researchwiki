@@ -32,19 +32,15 @@ const PERSIST_SCHEMA: u32 = 1;
 const PERSIST_KEY: &str = "researchwiki_ui";
 
 pub struct DesktopApp {
-    /// Keeps the tokio runtime alive for the lifetime of the app — dropping
-    /// it would tear down all spawned background tasks. Held via Arc because
-    /// panels may want to clone the handle onto background work in Phase 4.
-    #[allow(dead_code)]
-    rt: Arc<Runtime>,
+    // Held only to keep the tokio runtime alive — dropping it tears down
+    // every spawned task.
+    _rt: Arc<Runtime>,
     handle: Handle,
     config: AppConfig,
     state: Option<AppState>,
     scheduler: Option<JoinHandle<()>>,
     shutdown_tx: watch::Sender<bool>,
     shutdown_rx: watch::Receiver<bool>,
-    /// Cloned into background tasks so they can push progress events into
-    /// `ui_rx` for the UI thread to drain.
     ui_tx: mpsc::UnboundedSender<UiEvent>,
     ui_rx: mpsc::UnboundedReceiver<UiEvent>,
     first_run: FirstRunForm,
@@ -65,7 +61,7 @@ impl DesktopApp {
             });
 
         let mut app = Self {
-            rt: runtime.rt,
+            _rt: runtime.rt,
             handle: runtime.handle,
             config,
             state: None,
@@ -138,12 +134,10 @@ impl eframe::App for DesktopApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.drain_events();
 
-        // First-run modal blocks everything until LLM endpoint is configured.
         if self.state.is_none() {
             if let FirstRunOutcome::Submitted(llm) = self.first_run.show(ctx) {
-                // Persist the LLM config before activating so the modal only
-                // shows once. Best-effort: a failed write still lets the user
-                // continue in this session.
+                // Best-effort persist so the modal only fires once. A failed
+                // write still lets the user continue in this session.
                 let path = self.config.storage.settings_file.clone();
                 let llm_to_save = llm.clone();
                 let save_result = self.handle.block_on(async move {
@@ -167,13 +161,7 @@ impl eframe::App for DesktopApp {
         });
 
         egui::TopBottomPanel::bottom("status").show(ctx, |ui| {
-            ui.horizontal(|ui| {
-                if let Some(status) = &self.status {
-                    ui.label(status);
-                } else {
-                    ui.label("");
-                }
-            });
+            ui.label(self.status.as_deref().unwrap_or(""));
         });
 
         egui::CentralPanel::default().show(ctx, |ui| {
@@ -203,11 +191,7 @@ impl eframe::App for DesktopApp {
     }
 }
 
-/// Ensure all per-user directories exist and seed bundled prompts on first launch.
-///
-/// On a freshly installed app, the `prompts/` directory under the user's data
-/// root is empty. We copy from the bundled prompts shipped beside the
-/// executable. Users edit the per-user copy; the bundled copy is read-only seed.
+/// Create per-user directories and copy bundled prompts into the user copy on first launch.
 pub fn first_launch_seed(config: &AppConfig) -> Result<()> {
     let storage = &config.storage;
     if let Some(parent) = storage.database_path.parent() {
@@ -276,8 +260,6 @@ fn copy_dir_recursive(src: &Path, dst: &Path) -> Result<()> {
     Ok(())
 }
 
-/// Initialize the database asynchronously. Called from `main` before
-/// `eframe::run_native` so the DB is ready before the first frame.
 pub async fn bootstrap_db(config: &AppConfig) -> Result<()> {
     db::initialize(config).await
 }

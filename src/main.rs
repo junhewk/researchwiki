@@ -7,27 +7,17 @@ use researchwiki::{
 };
 
 fn main() -> eframe::Result<()> {
-    // Load .env if present (development convenience; ignored in production builds).
     dotenvy::dotenv().ok();
-
-    // Tracing first so subsequent setup errors are visible.
     init_tracing();
-
-    // Process-global sqlite-vec auto-extension registration. Must happen before
-    // any Connection::open in any thread — including the tokio worker pool.
+    // sqlite-vec must register before any Connection::open in any thread.
     register_sqlite_vec();
 
     let runtime = DesktopRuntime::new().expect("tokio runtime should build");
-
     let mut config = AppConfig::from_env().expect("AppConfig should resolve");
 
-    // Synchronous bootstrap: seed directories and copy bundled prompts, then
-    // run async DB initialization on the runtime so vec0/FTS tables exist
-    // before the first frame.
     first_launch_seed(&config).expect("first-launch directory setup failed");
 
-    // Overlay persisted LLM endpoint + embedding dimensions from settings.json,
-    // so the first-run modal only appears on a truly fresh install.
+    // Overlay persisted settings so the first-run modal only fires on a fresh install.
     let (persisted_llm, persisted_dim) = load_overrides_sync(&config.storage.settings_file);
     if let Some(llm) = persisted_llm {
         config.llm = llm;

@@ -55,16 +55,26 @@ impl Tab {
     }
 }
 
-/// Shared per-frame context handed to each panel.
-///
-/// Panels use `handle` to spawn async work on the tokio runtime and `ui_tx`
-/// to forward cross-cutting status messages (e.g. "Job X failed") back to
-/// the app-level status bar. Panel-local results travel on the panel's own
-/// `mpsc` channel, not `ui_tx`.
+/// Per-frame context handed to each panel. `ui_tx` is for app-wide status
+/// events; panel-local results travel on the panel's own channel.
 pub struct PanelCtx<'a> {
     pub state: &'a AppState,
     pub handle: &'a Handle,
     pub ui_tx: &'a mpsc::UnboundedSender<UiEvent>,
+}
+
+/// Paired sender/receiver each panel uses to receive results from its own
+/// spawned background tasks. Defaults to a fresh unbounded mpsc.
+pub struct MsgChannel<T> {
+    pub tx: mpsc::UnboundedSender<T>,
+    pub rx: mpsc::UnboundedReceiver<T>,
+}
+
+impl<T> Default for MsgChannel<T> {
+    fn default() -> Self {
+        let (tx, rx) = mpsc::unbounded_channel();
+        Self { tx, rx }
+    }
 }
 
 #[derive(Default)]

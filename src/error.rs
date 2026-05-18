@@ -9,8 +9,6 @@ pub enum AppError {
     #[error("{0}")]
     NotFound(String),
     #[error("{0}")]
-    NotImplemented(String),
-    #[error("{0}")]
     Internal(String),
 }
 

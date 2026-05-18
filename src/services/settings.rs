@@ -6,7 +6,7 @@ use crate::{
     config::LlmConfig,
     error::AppError,
     models::settings::{
-        AiProvider, ApiKeyStatus, ApiKeyUpdate, SettingsResponse, SettingsUpdate, StoredSettings,
+        AiProvider, ApiKeyStatus, SettingsResponse, SettingsUpdate, StoredSettings,
     },
 };
 
@@ -61,29 +61,6 @@ impl SettingsService {
             stored.newsletter = newsletter;
         }
 
-        self.save(&stored).await
-    }
-
-    pub async fn set_api_key(&self, update: ApiKeyUpdate) -> Result<String, AppError> {
-        let _guard = self.lock.write().await;
-        let mut stored = self.load().await?;
-        stored
-            .api_keys
-            .insert(update.provider.as_str().to_string(), update.api_key.clone());
-        self.save(&stored).await?;
-        Ok(mask_api_key(&update.api_key))
-    }
-
-    pub async fn delete_api_key(&self, provider: AiProvider) -> Result<(), AppError> {
-        let _guard = self.lock.write().await;
-        let mut stored = self.load().await?;
-        let removed = stored.api_keys.remove(provider.as_str());
-        if removed.is_none() {
-            return Err(AppError::NotFound(format!(
-                "API key for {} not found",
-                provider.as_str()
-            )));
-        }
         self.save(&stored).await
     }
 
@@ -151,9 +128,8 @@ impl SettingsService {
     }
 }
 
-/// Synchronously read persisted overrides from settings.json at startup,
-/// before the tokio runtime is available. Returns `(None, None)` if the
-/// file is missing or unparseable — startup proceeds with defaults.
+/// Sync read of settings.json overrides at startup, before the tokio runtime
+/// exists. Missing/unparseable file → `(None, None)`; startup uses defaults.
 pub fn load_overrides_sync(settings_file: &Path) -> (Option<LlmConfig>, Option<u32>) {
     let Ok(raw) = std::fs::read_to_string(settings_file) else {
         return (None, None);

@@ -1,16 +1,10 @@
-use std::sync::Arc;
-
-use tokio::sync::mpsc;
-
 use crate::{
     config::LlmConfig,
     models::settings::{NewsletterSettings, SchedulerSettings, SettingsUpdate},
-    services::settings::SettingsService,
 };
 
-use super::PanelCtx;
+use super::{MsgChannel, PanelCtx};
 
-/// Async messages the panel's background tasks send back to itself.
 enum Msg {
     Loaded {
         scheduler: SchedulerSettings,
@@ -24,13 +18,13 @@ enum Msg {
 
 #[derive(Default)]
 pub struct Panel {
-    channel: Option<Channel>,
+    channel: Option<MsgChannel<Msg>>,
     initialized: bool,
     loading: bool,
 
     scheduler: Option<SchedulerSettings>,
-    // Persisted so future newsletter UI can edit defaults; held now to avoid
-    // overwriting them when saving scheduler-only updates.
+    // Held so scheduler-only saves don't clobber the persisted newsletter
+    // defaults; a future newsletter UI will edit this directly.
     #[allow(dead_code)]
     newsletter: Option<NewsletterSettings>,
 
@@ -46,18 +40,6 @@ pub struct Panel {
     notice: Option<(NoticeKind, String)>,
 }
 
-struct Channel {
-    tx: mpsc::UnboundedSender<Msg>,
-    rx: mpsc::UnboundedReceiver<Msg>,
-}
-
-impl Default for Channel {
-    fn default() -> Self {
-        let (tx, rx) = mpsc::unbounded_channel();
-        Self { tx, rx }
-    }
-}
-
 #[derive(Clone, Copy)]
 enum NoticeKind {
     Success,
@@ -67,7 +49,7 @@ enum NoticeKind {
 impl Panel {
     pub fn show(&mut self, ui: &mut egui::Ui, ctx: &PanelCtx<'_>) {
         if self.channel.is_none() {
-            self.channel = Some(Channel::default());
+            self.channel = Some(MsgChannel::default());
         }
         self.drain();
         if !self.initialized {
@@ -353,7 +335,7 @@ impl Panel {
         new_llm.base_url = self.llm_base_url.trim().trim_end_matches('/').to_string();
         new_llm.model = self.llm_model.trim().to_string();
         new_llm.api_key = self.llm_api_key.clone();
-        let svc: Arc<SettingsService> = ctx.state.settings_service.clone();
+        let svc = ctx.state.settings_service.clone();
         ctx.handle.spawn(async move {
             let result = svc.set_llm_config(new_llm).await;
             let _ = match result {

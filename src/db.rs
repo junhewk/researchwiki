@@ -6,11 +6,9 @@ use tokio::task;
 
 use crate::config::AppConfig;
 
-/// Open a SQLite connection with sensible per-connection PRAGMAs applied.
-///
-/// Sets `busy_timeout=5000` so concurrent service callers retry under WAL
-/// instead of failing with `SQLITE_BUSY`. Windows file locking is stricter
-/// than Linux, so this matters more there.
+/// `busy_timeout=5000` lets concurrent callers retry under WAL instead of
+/// failing with `SQLITE_BUSY` — matters more on Windows where file locking
+/// is stricter.
 pub fn open_connection(path: impl AsRef<Path>) -> rusqlite::Result<Connection> {
     let conn = Connection::open(path)?;
     conn.busy_timeout(Duration::from_millis(5000))?;
@@ -263,9 +261,8 @@ fn initialize_sync(database_path: &std::path::Path, embedding_dimensions: u32) -
         "#,
     )?;
 
-    // sqlite-vec virtual tables (vec0) — must be created outside execute_batch
-    // because virtual table DDL can conflict with batched statements.
-    // Drop old plain tables if they exist and recreate as vec0.
+    // vec0 virtual tables must run outside execute_batch — virtual table DDL
+    // can conflict with batched statements. Drop and recreate on dim change.
     let dim = embedding_dimensions;
     migrate_vec_table(
         &conn,
@@ -329,7 +326,7 @@ fn is_vec0_table(conn: &Connection, name: &str) -> Result<bool> {
             |row| row.get(0),
         )
         .unwrap_or(None);
-    Ok(sql.as_deref().map_or(false, |s| s.contains("vec0")))
+    Ok(sql.as_deref().is_some_and(|s| s.contains("vec0")))
 }
 
 fn migrate_vec_table(conn: &Connection, name: &str, schema: &str) -> Result<()> {
@@ -337,7 +334,6 @@ fn migrate_vec_table(conn: &Connection, name: &str, schema: &str) -> Result<()> 
         if is_vec0_table(conn, name)? && schema_matches(conn, name, schema) {
             return Ok(());
         }
-        // Old plain table or dimension mismatch — drop and recreate.
         conn.execute(&format!("DROP TABLE {name}"), [])?;
     }
     conn.execute_batch(&format!("CREATE VIRTUAL TABLE {name} USING vec0({schema})"))?;
@@ -352,9 +348,8 @@ fn schema_matches(conn: &Connection, name: &str, expected_schema: &str) -> bool 
             |row| row.get(0),
         )
         .unwrap_or(None);
-    // Check that the stored CREATE statement contains the expected schema fragment.
     sql.as_deref()
-        .map_or(false, |s| s.contains(expected_schema))
+        .is_some_and(|s| s.contains(expected_schema))
 }
 
 fn create_fts_table(conn: &Connection) -> Result<()> {
@@ -369,7 +364,6 @@ fn create_fts_table(conn: &Connection) -> Result<()> {
         )?;
     }
 
-    // Sync triggers — use IF NOT EXISTS so they're idempotent
     conn.execute_batch(
         "
         CREATE TRIGGER IF NOT EXISTS fts_chunks_insert AFTER INSERT ON article_chunks BEGIN
