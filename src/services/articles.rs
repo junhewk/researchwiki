@@ -2,7 +2,7 @@ use std::sync::Arc;
 
 use anyhow::Context;
 use chrono::{Duration, NaiveDate, Utc};
-use rusqlite::{Connection, params_from_iter, types::Value};
+use rusqlite::{params_from_iter, types::Value};
 use tokio::task;
 
 use crate::{
@@ -51,7 +51,7 @@ impl ArticleService {
         let database_path = self.database_path.clone();
 
         run_blocking(move || {
-            let conn = Connection::open(&*database_path)?;
+            let conn = crate::db::open_connection(&*database_path)?;
             let page = query.page.max(1);
             let page_size = query.page_size.clamp(1, 100);
             let (where_clause, base_params) = article_where_clause(&query);
@@ -97,7 +97,7 @@ impl ArticleService {
         let uid = uid.to_string();
 
         task::spawn_blocking(move || {
-            let conn = Connection::open(&*database_path)?;
+            let conn = crate::db::open_connection(&*database_path)?;
             let sql = format!("SELECT {ARTICLE_COLUMNS} FROM haie_rev WHERE uid = ?1");
 
             let mut stmt = conn.prepare(&sql)?;
@@ -132,7 +132,7 @@ impl ArticleService {
         let uid = uid.to_string();
 
         task::spawn_blocking(move || {
-            let conn = Connection::open(&*database_path)?;
+            let conn = crate::db::open_connection(&*database_path)?;
             let (assignments, params) = build_article_update(&update.fields)?;
 
             if assignments.is_empty() {
@@ -170,7 +170,7 @@ impl ArticleService {
         let uid = uid.to_string();
 
         task::spawn_blocking(move || {
-            let conn = Connection::open(&*database_path)?;
+            let conn = crate::db::open_connection(&*database_path)?;
             let mut stmt = conn.prepare(
                 "SELECT uid, category, title, byline_summary, full_text
                  FROM haie_rev
@@ -206,7 +206,7 @@ impl ArticleService {
         let uid = uid.to_string();
 
         task::spawn_blocking(move || {
-            let conn = Connection::open(&*database_path)?;
+            let conn = crate::db::open_connection(&*database_path)?;
             let deleted = conn.execute("DELETE FROM haie_rev WHERE uid = ?1", [uid.as_str()])?;
             if deleted == 0 {
                 return Err(anyhow::anyhow!("Article {uid} not found"));
@@ -221,7 +221,7 @@ impl ArticleService {
     pub async fn get_stats(&self) -> Result<ArticleStats, AppError> {
         let database_path = self.database_path.clone();
         run_blocking(move || {
-            let conn = Connection::open(&*database_path)?;
+            let conn = crate::db::open_connection(&*database_path)?;
             let today = Utc::now().date_naive();
             let week_ago = today - Duration::days(7);
 
@@ -256,7 +256,7 @@ impl ArticleService {
     pub async fn get_daily_stats(&self, days: u32) -> Result<DailyStatsResponse, AppError> {
         let database_path = self.database_path.clone();
         run_blocking(move || {
-            let conn = Connection::open(&*database_path)?;
+            let conn = crate::db::open_connection(&*database_path)?;
             let days = days.clamp(1, 90);
             let today = Utc::now().date_naive();
             let start_date = today - Duration::days(i64::from(days.saturating_sub(1)));
@@ -313,7 +313,7 @@ impl ArticleService {
     ) -> Result<Vec<ArticleResponse>, AppError> {
         let database_path = self.database_path.clone();
         run_blocking(move || {
-            let conn = Connection::open(&*database_path)?;
+            let conn = crate::db::open_connection(&*database_path)?;
             let threshold = (Utc::now().date_naive()
                 - Duration::days(i64::from(days.clamp(1, 30))))
             .to_string();
@@ -342,7 +342,7 @@ impl ArticleService {
     ) -> Result<Vec<ArticleResponse>, AppError> {
         let database_path = self.database_path.clone();
         run_blocking(move || {
-            let conn = Connection::open(&*database_path)?;
+            let conn = crate::db::open_connection(&*database_path)?;
             let threshold = (Utc::now().date_naive()
                 - Duration::days(i64::from(days.clamp(1, 30))))
             .to_string();
@@ -370,7 +370,7 @@ impl ArticleService {
         let uids = uids.to_vec();
 
         run_blocking(move || {
-            let conn = Connection::open(&*database_path)?;
+            let conn = crate::db::open_connection(&*database_path)?;
             if uids.is_empty() {
                 return Ok::<_, anyhow::Error>(Vec::new());
             }
@@ -396,7 +396,7 @@ impl ArticleService {
         let abstract_text = abstract_text.to_string();
 
         task::spawn_blocking(move || {
-            let conn = Connection::open(&*database_path)?;
+            let conn = crate::db::open_connection(&*database_path)?;
             let updated = conn.execute(
                 "UPDATE haie_rev
                  SET full_text = ?1,
@@ -431,7 +431,7 @@ impl ArticleService {
         let evaluation = evaluation.clone();
 
         task::spawn_blocking(move || {
-            let conn = Connection::open(&*database_path)?;
+            let conn = crate::db::open_connection(&*database_path)?;
 
             let text_fields = [
                 "ai_tech",

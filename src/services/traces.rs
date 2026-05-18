@@ -1,7 +1,7 @@
 use std::{path::PathBuf, sync::Arc};
 
 use anyhow::Context;
-use rusqlite::{Connection, params_from_iter, types::Value};
+use rusqlite::{params_from_iter, types::Value};
 use tokio::task;
 
 use crate::{
@@ -41,7 +41,7 @@ impl TraceService {
         let database_path = self.database_path.clone();
 
         run_blocking(move || {
-            let conn = Connection::open(&*database_path)?;
+            let conn = crate::db::open_connection(&*database_path)?;
             let page = query.page.max(1);
             let page_size = query.page_size.clamp(1, 100);
             let (where_clause, base_params) = trace_where_clause(&query);
@@ -92,7 +92,7 @@ impl TraceService {
         let database_path = self.database_path.clone();
 
         task::spawn_blocking(move || {
-            let conn = Connection::open(&*database_path)?;
+            let conn = crate::db::open_connection(&*database_path)?;
             let mut stmt = conn.prepare(
                 "
                 SELECT id, prompt_name, prompt_version, article_uid, model, input_text, output_text,
@@ -128,7 +128,7 @@ impl TraceService {
         let database_path = self.database_path.clone();
 
         run_blocking(move || {
-            let conn = Connection::open(&*database_path)?;
+            let conn = crate::db::open_connection(&*database_path)?;
             let mut stmt = conn.prepare(
                 "
                 SELECT prompt_name,
@@ -167,7 +167,7 @@ impl TraceService {
         let database_path = self.database_path.clone();
 
         run_blocking_db(move || {
-            let conn = Connection::open(&*database_path)?;
+            let conn = crate::db::open_connection(&*database_path)?;
             conn.execute(
                 "
                 INSERT INTO prompt_traces (

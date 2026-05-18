@@ -1,8 +1,21 @@
+use std::{path::Path, time::Duration};
+
 use anyhow::{Context, Result};
 use rusqlite::Connection;
 use tokio::task;
 
 use crate::config::AppConfig;
+
+/// Open a SQLite connection with sensible per-connection PRAGMAs applied.
+///
+/// Sets `busy_timeout=5000` so concurrent service callers retry under WAL
+/// instead of failing with `SQLITE_BUSY`. Windows file locking is stricter
+/// than Linux, so this matters more there.
+pub fn open_connection(path: impl AsRef<Path>) -> rusqlite::Result<Connection> {
+    let conn = Connection::open(path)?;
+    conn.busy_timeout(Duration::from_millis(5000))?;
+    Ok(conn)
+}
 
 pub async fn initialize(config: &AppConfig) -> Result<()> {
     let database_path = config.storage.database_path.clone();
@@ -33,6 +46,7 @@ fn initialize_sync(database_path: &std::path::Path, embedding_dimensions: u32) -
         r#"
         PRAGMA journal_mode=WAL;
         PRAGMA foreign_keys=ON;
+        PRAGMA busy_timeout=5000;
 
         CREATE TABLE IF NOT EXISTS haie_rev (
             uid TEXT PRIMARY KEY,

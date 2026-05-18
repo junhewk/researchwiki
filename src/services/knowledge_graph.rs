@@ -399,7 +399,7 @@ impl KnowledgeGraphService {
         let database_path = self.database_path.clone();
 
         run_blocking(move || {
-            let conn = Connection::open(&*database_path)?;
+            let conn = crate::db::open_connection(&*database_path)?;
             let query = request.query.trim().to_string();
             let matched = query_entities(&conn, &query, 12)?;
             let entity_ids = matched.iter().map(|entity| entity.id).collect::<Vec<_>>();
@@ -439,7 +439,7 @@ impl KnowledgeGraphService {
         let database_path = self.database_path.clone();
 
         run_blocking(move || {
-            let conn = Connection::open(&*database_path)?;
+            let conn = crate::db::open_connection(&*database_path)?;
             let nodes = conn.query_row("SELECT COUNT(*) FROM kg_entities", [], |row| {
                 row.get::<_, i64>(0)
             })?;
@@ -482,7 +482,7 @@ impl KnowledgeGraphService {
         let database_path = self.database_path.clone();
 
         run_blocking(move || {
-            let conn = Connection::open(&*database_path)?;
+            let conn = crate::db::open_connection(&*database_path)?;
             let limit = i64::from(query.limit.clamp(1, 2000));
             let min_degree = i64::from(query.min_degree.min(100));
             let entity_types = parse_entity_types(query.entity_types);
@@ -577,7 +577,7 @@ impl KnowledgeGraphService {
         let entity = entity.trim().to_string();
 
         run_blocking(move || {
-            let conn = Connection::open(&*database_path)?;
+            let conn = crate::db::open_connection(&*database_path)?;
             let entity_like = format!("%{}%", entity.to_lowercase());
 
             let row = conn
@@ -799,7 +799,7 @@ impl KnowledgeGraphService {
         let uid = uid.to_string();
 
         run_blocking(move || {
-            let conn = Connection::open(&*database_path)?;
+            let conn = crate::db::open_connection(&*database_path)?;
             let mut stmt = conn.prepare(
                 "
                 SELECT kae.entity_id, e.canonical_name, e.entity_type, kae.mention_text, kae.context,
@@ -1568,7 +1568,7 @@ impl KnowledgeGraphService {
     async fn load_entity_engram(&self) -> Result<EntityEngram, AppError> {
         let database_path = self.database_path.clone();
         let entities = run_blocking(move || {
-            let conn = Connection::open(&*database_path)?;
+            let conn = crate::db::open_connection(&*database_path)?;
             let mut stmt = conn.prepare(
                 "
                 SELECT id, canonical_name, entity_type, description, mention_count, aliases_json
@@ -1605,7 +1605,7 @@ impl KnowledgeGraphService {
         let entity_type = entity_type.to_string();
 
         run_blocking(move || {
-            let conn = Connection::open(&*database_path)?;
+            let conn = crate::db::open_connection(&*database_path)?;
             let mut stmt = conn.prepare(
                 "
                 SELECT e.id, v.embedding
@@ -1634,7 +1634,7 @@ impl KnowledgeGraphService {
         let uids = uids.to_vec();
 
         run_blocking(move || {
-            let conn = Connection::open(&*database_path)?;
+            let conn = crate::db::open_connection(&*database_path)?;
             if uids.is_empty() {
                 return Ok(Vec::new());
             }
@@ -1660,7 +1660,7 @@ impl KnowledgeGraphService {
     async fn count_backfill_candidates(&self) -> Result<i64, AppError> {
         let database_path = self.database_path.clone();
         run_blocking(move || {
-            let conn = Connection::open(&*database_path)?;
+            let conn = crate::db::open_connection(&*database_path)?;
             let count = conn.query_row(
                 "
                 SELECT COUNT(*)
@@ -1683,7 +1683,7 @@ impl KnowledgeGraphService {
     ) -> Result<Vec<ArticleInput>, AppError> {
         let database_path = self.database_path.clone();
         run_blocking(move || {
-            let conn = Connection::open(&*database_path)?;
+            let conn = crate::db::open_connection(&*database_path)?;
             let mut stmt = conn.prepare(
                 "
                 SELECT uid, title, full_text, byline_summary
@@ -1724,7 +1724,7 @@ impl KnowledgeGraphService {
         let embedding_bytes = embedding.as_bytes().to_vec();
 
         run_blocking(move || {
-            let conn = Connection::open(&*database_path)?;
+            let conn = crate::db::open_connection(&*database_path)?;
             conn.execute(
                 "
                 INSERT INTO kg_entities (
@@ -1763,7 +1763,7 @@ impl KnowledgeGraphService {
         let alias = alias.trim().to_string();
 
         run_blocking(move || {
-            let conn = Connection::open(&*database_path)?;
+            let conn = crate::db::open_connection(&*database_path)?;
             let row = conn
                 .query_row(
                     "
@@ -1819,7 +1819,7 @@ impl KnowledgeGraphService {
         let context = context.map(str::to_string);
 
         run_blocking(move || {
-            let conn = Connection::open(&*database_path)?;
+            let conn = crate::db::open_connection(&*database_path)?;
             conn.execute(
                 "
                 INSERT OR IGNORE INTO kg_article_entities (
@@ -1847,7 +1847,7 @@ impl KnowledgeGraphService {
         let description = description.map(|value| value.trim().to_string());
 
         run_blocking(move || {
-            let conn = Connection::open(&*database_path)?;
+            let conn = crate::db::open_connection(&*database_path)?;
             let existing = conn
                 .query_row(
                     "
@@ -1928,7 +1928,7 @@ impl KnowledgeGraphService {
         let database_path = self.database_path.clone();
         let uid = uid.to_string();
         run_blocking(move || {
-            let conn = Connection::open(&*database_path)?;
+            let conn = crate::db::open_connection(&*database_path)?;
             conn.execute(
                 "
                 UPDATE haie_rev
@@ -1950,7 +1950,7 @@ impl KnowledgeGraphService {
         let database_path = self.database_path.clone();
         let entity_ids = entity_ids.to_vec();
         run_blocking(move || {
-            let conn = Connection::open(&*database_path)?;
+            let conn = crate::db::open_connection(&*database_path)?;
             let placeholders = vec!["?"; entity_ids.len()].join(", ");
 
             // Mark entity syntheses stale.
@@ -1992,7 +1992,7 @@ impl KnowledgeGraphService {
         let candidate_ids = candidate_ids.to_vec();
 
         run_blocking(move || {
-            let conn = Connection::open(&*database_path)?;
+            let conn = crate::db::open_connection(&*database_path)?;
             let placeholders = vec!["?"; candidate_ids.len()].join(", ");
             let sql = format!(
                 "
@@ -2039,7 +2039,7 @@ impl KnowledgeGraphService {
         let query_type = query_type.to_string();
 
         run_blocking(move || {
-            let conn = Connection::open(&*database_path)?;
+            let conn = crate::db::open_connection(&*database_path)?;
             conn.execute(
                 "
                 INSERT INTO kg_resolution_cache (
@@ -2077,7 +2077,7 @@ impl KnowledgeGraphService {
         let entity_name_for_error = entity_name.clone();
 
         run_blocking(move || {
-            let conn = Connection::open(&*database_path)?;
+            let conn = crate::db::open_connection(&*database_path)?;
             let row = conn
                 .query_row(
                     "
@@ -2167,7 +2167,7 @@ impl KnowledgeGraphService {
         let database_path = self.database_path.clone();
 
         run_blocking(move || {
-            let conn = Connection::open(&*database_path)?;
+            let conn = crate::db::open_connection(&*database_path)?;
             let stale_only_flag: i64 = if query.stale_only { 1 } else { 0 };
             let entity_type = query.entity_type.clone();
             let limit = i64::from(query.limit.clamp(1, 500));
@@ -2262,7 +2262,7 @@ impl KnowledgeGraphService {
         let limit = i64::from(limit.clamp(1, 100));
 
         run_blocking(move || {
-            let conn = Connection::open(&*database_path)?;
+            let conn = crate::db::open_connection(&*database_path)?;
             let sql = format!(
                 "
                 SELECT s.entity_id, e.canonical_name, e.entity_type, s.summary,
@@ -2309,7 +2309,7 @@ impl KnowledgeGraphService {
             isolated_entities,
             entities_reviewed,
         ) = run_blocking(move || {
-            let conn = Connection::open(&*database_path)?;
+            let conn = crate::db::open_connection(&*database_path)?;
 
             let mut stmt = conn.prepare(
                 "
@@ -2630,7 +2630,7 @@ impl KnowledgeGraphService {
         let entity_ids = entity_ids.map(|ids| ids.to_vec());
 
         run_blocking(move || {
-            let conn = Connection::open(&*database_path)?;
+            let conn = crate::db::open_connection(&*database_path)?;
 
             if let Some(ids) = entity_ids {
                 // Count only specified entities
@@ -2693,7 +2693,7 @@ impl KnowledgeGraphService {
         let entity_ids = entity_ids.map(|ids| ids.to_vec());
 
         run_blocking(move || {
-            let conn = Connection::open(&*database_path)?;
+            let conn = crate::db::open_connection(&*database_path)?;
 
             if let Some(ids) = entity_ids {
                 let placeholders = vec!["?"; ids.len()].join(", ");
@@ -2783,7 +2783,7 @@ impl KnowledgeGraphService {
         let database_path = self.database_path.clone();
 
         run_blocking(move || {
-            let conn = Connection::open(&*database_path)?;
+            let conn = crate::db::open_connection(&*database_path)?;
 
             // 1. Entity metadata
             let (entity_name, entity_type, description, aliases_json): (
@@ -2963,7 +2963,7 @@ impl KnowledgeGraphService {
         let synthesis = output.synthesis;
 
         run_blocking(move || {
-            let conn = Connection::open(&*database_path)?;
+            let conn = crate::db::open_connection(&*database_path)?;
 
             let source_article_count: i64 = conn.query_row(
                 "SELECT COUNT(DISTINCT article_uid) FROM kg_article_entities WHERE entity_id = ?",
@@ -3011,7 +3011,7 @@ impl KnowledgeGraphService {
         let daily_date_for_query = daily_date.clone();
 
         let payload = run_blocking(move || {
-            let conn = Connection::open(&*database_path)?;
+            let conn = crate::db::open_connection(&*database_path)?;
             let entity = load_wiki_entity(&conn, entity_id)?;
             let sources = load_wiki_sources_for_entity(&conn, entity_id)?;
             let all_sources = load_all_wiki_sources(&conn)?;
@@ -3090,7 +3090,7 @@ impl KnowledgeGraphService {
         // Load top 5 relationships by weight that lack evidence_summary.
         let database_path = self.database_path.clone();
         let relationship_ids = run_blocking(move || {
-            let conn = Connection::open(&*database_path)?;
+            let conn = crate::db::open_connection(&*database_path)?;
             let mut stmt = conn.prepare(
                 "SELECT id FROM kg_relationships
                  WHERE (source_entity_id = ?1 OR target_entity_id = ?1)
@@ -3117,7 +3117,7 @@ impl KnowledgeGraphService {
         // 1. Load relationship with entity names.
         let database_path = self.database_path.clone();
         let rel_info = run_blocking(move || {
-            let conn = Connection::open(&*database_path)?;
+            let conn = crate::db::open_connection(&*database_path)?;
             let (source_name, target_name, rel_type, source_id, target_id): (
                 String,
                 String,
@@ -3221,7 +3221,7 @@ impl KnowledgeGraphService {
         let database_path = self.database_path.clone();
         let evidence = output.evidence_summary;
         run_blocking(move || {
-            let conn = Connection::open(&*database_path)?;
+            let conn = crate::db::open_connection(&*database_path)?;
             conn.execute(
                 "UPDATE kg_relationships SET evidence_summary = ? WHERE id = ?",
                 params![evidence, relationship_id],

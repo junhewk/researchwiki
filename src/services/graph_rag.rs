@@ -1,6 +1,6 @@
 use std::{collections::HashSet, path::PathBuf, sync::Arc};
 
-use rusqlite::{Connection, params_from_iter, types::Value};
+use rusqlite::{params_from_iter, types::Value};
 
 use crate::error::{AppError, run_blocking};
 
@@ -41,7 +41,7 @@ pub async fn get_entity_context(
 
     run_blocking(move || {
         let query = &query_owned;
-        let conn = Connection::open(&*db_path)?;
+        let conn = crate::db::open_connection(&*db_path)?;
 
         // Find entities matching keywords with a single batched query.
         let patterns: Vec<String> = keywords.iter().map(|kw| format!("%{kw}%")).collect();

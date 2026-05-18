@@ -1,6 +1,6 @@
 use std::{path::PathBuf, sync::Arc, time::Instant};
 
-use rusqlite::{Connection, params, params_from_iter, types::Value};
+use rusqlite::{params, params_from_iter, types::Value};
 use tracing::warn;
 use zerocopy::IntoBytes;
 
@@ -42,7 +42,7 @@ impl LibraryService {
         let database_path = self.database_path.clone();
 
         run_blocking(move || {
-            let conn = Connection::open(&*database_path)?;
+            let conn = crate::db::open_connection(&*database_path)?;
             let total_articles =
                 conn.query_row("SELECT COUNT(*) FROM haie_rev", [], |row| row.get::<_, i64>(0))?;
             let articles_with_embeddings = conn.query_row(
@@ -81,7 +81,7 @@ impl LibraryService {
         let uid = uid.to_string();
 
         run_blocking(move || {
-            let conn = Connection::open(&*database_path)?;
+            let conn = crate::db::open_connection(&*database_path)?;
             let mut stmt = conn.prepare(
                 "
                 SELECT id, chunk_index, chunk_type, content, token_count, source_page,
@@ -117,7 +117,7 @@ impl LibraryService {
         let database_path = self.database_path.clone();
 
         run_blocking(move || {
-            let conn = Connection::open(&*database_path)?;
+            let conn = crate::db::open_connection(&*database_path)?;
             conn.execute(
                 "INSERT INTO fts_article_chunks(fts_article_chunks) VALUES ('rebuild')",
                 [],
@@ -136,7 +136,7 @@ impl LibraryService {
         let database_path = self.database_path.clone();
         let uid_str = uid.to_string();
         let (full_text, content_type) = run_blocking(move || {
-            let conn = Connection::open(&*database_path)?;
+            let conn = crate::db::open_connection(&*database_path)?;
             let row = conn.query_row(
                 "SELECT full_text, content_type FROM haie_rev WHERE uid = ?1",
                 [uid_str.as_str()],
@@ -184,7 +184,7 @@ impl LibraryService {
         let database_path = self.database_path.clone();
         let uid_str = uid.to_string();
         let chunks_created = run_blocking(move || {
-            let conn = Connection::open(&*database_path)?;
+            let conn = crate::db::open_connection(&*database_path)?;
             conn.execute_batch("BEGIN")?;
 
             // Delete existing chunks and embeddings for this article.
@@ -258,7 +258,7 @@ impl LibraryService {
 
         // Get articles that need processing.
         let article_uids: Vec<String> = run_blocking(move || {
-            let conn = Connection::open(&*database_path)?;
+            let conn = crate::db::open_connection(&*database_path)?;
             let mut stmt = conn.prepare(
                 "SELECT uid FROM haie_rev
                  WHERE full_text IS NOT NULL AND COALESCE(has_embeddings, 0) = 0
@@ -294,7 +294,7 @@ impl LibraryService {
         // Count remaining.
         let database_path = self.database_path.clone();
         let remaining: i64 = run_blocking(move || {
-            let conn = Connection::open(&*database_path)?;
+            let conn = crate::db::open_connection(&*database_path)?;
             conn.query_row(
                 "SELECT COUNT(*) FROM haie_rev
                  WHERE full_text IS NOT NULL AND COALESCE(has_embeddings, 0) = 0",
@@ -423,7 +423,7 @@ impl LibraryService {
         let k_param = (limit * 3) as i64; // Over-fetch for filtering.
 
         run_blocking(move || {
-            let conn = Connection::open(&*database_path)?;
+            let conn = crate::db::open_connection(&*database_path)?;
             let mut stmt = conn.prepare(
                 "
                 SELECT v.chunk_id, v.distance,
@@ -473,7 +473,7 @@ impl LibraryService {
         let limit_i64 = limit as i64;
 
         run_blocking(move || {
-            let conn = Connection::open(&*database_path)?;
+            let conn = crate::db::open_connection(&*database_path)?;
             let mut stmt = conn.prepare(
                 "
                 SELECT c.id, -bm25(fts_article_chunks) as score,
@@ -550,7 +550,7 @@ impl LibraryService {
         let k_param = limit as i64;
 
         run_blocking(move || {
-            let conn = Connection::open(&*database_path)?;
+            let conn = crate::db::open_connection(&*database_path)?;
             let mut stmt = conn.prepare(
                 "
                 SELECT v.chunk_id, v.distance
@@ -582,7 +582,7 @@ impl LibraryService {
         let limit_i64 = limit as i64;
 
         run_blocking(move || {
-            let conn = Connection::open(&*database_path)?;
+            let conn = crate::db::open_connection(&*database_path)?;
             let mut stmt = conn.prepare(
                 "
                 SELECT f.rowid as chunk_id, -bm25(fts_article_chunks) as score
@@ -616,7 +616,7 @@ impl LibraryService {
         let scores = scores.to_vec();
 
         run_blocking(move || {
-            let conn = Connection::open(&*database_path)?;
+            let conn = crate::db::open_connection(&*database_path)?;
             let placeholders = vec!["?"; chunk_ids.len()].join(", ");
             let sql = format!(
                 "

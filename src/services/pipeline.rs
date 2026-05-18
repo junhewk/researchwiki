@@ -143,7 +143,7 @@ impl PipelineService {
         let uids = uids.to_vec();
 
         task::spawn_blocking(move || {
-            let conn = Connection::open(&*database_path)?;
+            let conn = crate::db::open_connection(&*database_path)?;
             let placeholders = vec!["?"; uids.len()].join(", ");
             let sql = format!("SELECT uid FROM haie_rev WHERE uid IN ({placeholders})");
             let params: Vec<rusqlite::types::Value> =
@@ -177,7 +177,7 @@ impl PipelineService {
         let evaluation = evaluation.clone();
 
         task::spawn_blocking(move || {
-            let conn = Connection::open(&*database_path).with_context(|| {
+            let conn = crate::db::open_connection(&*database_path).with_context(|| {
                 format!("failed to open database at {}", database_path.display())
             })?;
             save_article_sync(&conn, &candidate, Some(&evaluation))
@@ -1623,7 +1623,7 @@ fn save_candidates_sync(
     database_path: &std::path::Path,
     candidates: Vec<ArticleCandidate>,
 ) -> Result<SaveCounters> {
-    let conn = Connection::open(database_path)
+    let conn = crate::db::open_connection(database_path)
         .with_context(|| format!("failed to open database at {}", database_path.display()))?;
     let mut counters = SaveCounters::default();
 

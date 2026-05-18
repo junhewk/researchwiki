@@ -2,7 +2,7 @@ use std::sync::Arc;
 
 use anyhow::{Context, anyhow};
 use chrono::{Duration, FixedOffset, Utc};
-use rusqlite::{Connection, OptionalExtension, params};
+use rusqlite::{OptionalExtension, params};
 use tokio::task;
 use uuid::Uuid;
 
@@ -88,7 +88,7 @@ impl JobService {
     pub async fn recover_interrupted_runs(&self) -> Result<u64, AppError> {
         let database_path = self.database_path.clone();
         run_blocking_db(move || {
-            let conn = Connection::open(&*database_path)?;
+            let conn = crate::db::open_connection(&*database_path)?;
             let updated = conn.execute(
                 "UPDATE job_runs
                  SET status = 'failed',
@@ -107,7 +107,7 @@ impl JobService {
     pub async fn list_jobs(&self, limit: u32) -> Result<Vec<JobRunResponse>, AppError> {
         let database_path = self.database_path.clone();
         run_blocking(move || {
-            let conn = Connection::open(&*database_path)?;
+            let conn = crate::db::open_connection(&*database_path)?;
             let mut stmt = conn.prepare(&format!(
                 "SELECT {JOB_RUN_COLUMNS}
                  FROM job_runs
@@ -126,7 +126,7 @@ impl JobService {
         let run_id = run_id.to_string();
 
         task::spawn_blocking(move || {
-            let conn = Connection::open(&*database_path)?;
+            let conn = crate::db::open_connection(&*database_path)?;
             let run = conn
                 .query_row(
                     &format!(
@@ -187,7 +187,7 @@ impl JobService {
         let run_id_for_insert = run_id.clone();
 
         let queued_job = task::spawn_blocking(move || {
-            let conn = Connection::open(&*database_path)?;
+            let conn = crate::db::open_connection(&*database_path)?;
             conn.execute(
                 "INSERT INTO job_runs (id, source, days_back, status)
                  VALUES (?1, ?2, ?3, 'queued')",
@@ -283,7 +283,7 @@ impl JobService {
         let run_id = run_id.to_string();
 
         task::spawn_blocking(move || {
-            let conn = Connection::open(&*database_path)?;
+            let conn = crate::db::open_connection(&*database_path)?;
             let updated = conn.execute(
                 "UPDATE job_runs
                  SET status = 'cancelled',
@@ -339,7 +339,7 @@ impl JobService {
         let database_path = self.database_path.clone();
         let source = source.to_string();
         run_blocking_db(move || {
-            let conn = Connection::open(&*database_path)?;
+            let conn = crate::db::open_connection(&*database_path)?;
             if source == "all" {
                 conn.query_row(
                     "SELECT id, source
@@ -693,7 +693,7 @@ impl JobService {
         let database_path = self.database_path.clone();
         let run_id = run_id.to_string();
         run_blocking_db(move || {
-            let conn = Connection::open(&*database_path)?;
+            let conn = crate::db::open_connection(&*database_path)?;
             conn.execute(
                 "UPDATE job_runs
                  SET status = 'running',
@@ -721,7 +721,7 @@ impl JobService {
         let step = step.to_string();
         let current_item = current_item.map(ToOwned::to_owned);
         run_blocking_db(move || {
-            let conn = Connection::open(&*database_path)?;
+            let conn = crate::db::open_connection(&*database_path)?;
             conn.execute(
                 "UPDATE job_runs
                  SET current_step = ?2,
@@ -768,7 +768,7 @@ impl JobService {
         let status = status.to_string();
         let error_message = error_message.map(ToOwned::to_owned);
         run_blocking_db(move || {
-            let conn = Connection::open(&*database_path)?;
+            let conn = crate::db::open_connection(&*database_path)?;
             conn.execute(
                 "UPDATE job_runs
                  SET status = ?2,
@@ -817,7 +817,7 @@ impl JobService {
         let event_type = event_type.to_string();
         let payload_json = payload.to_string();
         run_blocking_db(move || {
-            let conn = Connection::open(&*database_path)?;
+            let conn = crate::db::open_connection(&*database_path)?;
             conn.execute(
                 "INSERT INTO job_events (run_id, event_type, payload_json)
                  VALUES (?1, ?2, ?3)",
@@ -832,7 +832,7 @@ impl JobService {
         let database_path = self.database_path.clone();
         let run_id = run_id.to_string();
         run_blocking_db(move || {
-            let conn = Connection::open(&*database_path)?;
+            let conn = crate::db::open_connection(&*database_path)?;
             let status = conn
                 .query_row(
                     "SELECT status FROM job_runs WHERE id = ?1",

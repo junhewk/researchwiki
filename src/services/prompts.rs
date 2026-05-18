@@ -36,7 +36,7 @@ impl PromptService {
         let database_path = self.database_path.clone();
 
         run_blocking_db(move || {
-            let conn = Connection::open(&*database_path)?;
+            let conn = crate::db::open_connection(&*database_path)?;
 
             for file in files {
                 let version_exists: Option<i64> = conn
@@ -71,7 +71,7 @@ impl PromptService {
         let database_path = self.database_path.clone();
 
         run_blocking_db(move || {
-            let conn = Connection::open(&*database_path)?;
+            let conn = crate::db::open_connection(&*database_path)?;
             let mut prompts = Vec::with_capacity(files.len());
 
             for file in files {
@@ -99,7 +99,7 @@ impl PromptService {
         let name = name.to_string();
 
         run_blocking_db(move || {
-            let conn = Connection::open(&*database_path)?;
+            let conn = crate::db::open_connection(&*database_path)?;
             let stats = prompt_stats(&conn, &name)?;
 
             Ok(PromptResponse {
@@ -141,7 +141,7 @@ impl PromptService {
         let temperature = parsed.temperature;
 
         run_blocking_db(move || {
-            let conn = Connection::open(&*database_path)?;
+            let conn = crate::db::open_connection(&*database_path)?;
             let next_version: i64 = conn.query_row(
                 "SELECT COALESCE(MAX(version), 0) + 1 FROM prompt_versions WHERE prompt_name = ?1",
                 [name_for_write.as_str()],
@@ -171,7 +171,7 @@ impl PromptService {
         let name = name.to_string();
 
         run_blocking_db(move || {
-            let conn = Connection::open(&*database_path)?;
+            let conn = crate::db::open_connection(&*database_path)?;
             let mut stmt = conn.prepare(
                 "SELECT id, prompt_name, version, content, model, temperature, description,
                         changed_by, created_at
@@ -283,7 +283,7 @@ impl PromptService {
         let prompt_name = update.prompt_name.clone();
 
         run_blocking_db(move || {
-            let conn = Connection::open(&*database_path)?;
+            let conn = crate::db::open_connection(&*database_path)?;
             let next_version: i64 = conn.query_row(
                 "SELECT COALESCE(MAX(version), 0) + 1 FROM prompt_versions WHERE prompt_name = ?1",
                 [prompt_name.as_str()],
@@ -313,7 +313,7 @@ impl PromptService {
         let name = name.to_string();
 
         run_blocking_db(move || {
-            let conn = Connection::open(&*database_path)?;
+            let conn = crate::db::open_connection(&*database_path)?;
             conn.query_row(
                 "SELECT COALESCE(MAX(version), 1) FROM prompt_versions WHERE prompt_name = ?1",
                 [name.as_str()],
