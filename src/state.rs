@@ -12,6 +12,7 @@ use crate::{
 
 #[derive(Clone)]
 pub struct AppState {
+    pub config: AppConfig,
     pub article_service: std::sync::Arc<ArticleService>,
     pub job_service: std::sync::Arc<JobService>,
     pub knowledge_graph_service: std::sync::Arc<KnowledgeGraphService>,
@@ -43,7 +44,7 @@ impl AppState {
             config.llm.clone(),
         ));
         let http_client = Client::builder()
-            .user_agent("articlegatherer-rust-backend/0.1")
+            .user_agent("researchwiki/0.1")
             .timeout(std::time::Duration::from_secs(30))
             .build()
             .expect("reqwest client should build");
@@ -76,6 +77,7 @@ impl AppState {
         ));
 
         Self {
+            config,
             article_service,
             job_service,
             knowledge_graph_service,

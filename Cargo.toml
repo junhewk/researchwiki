@@ -10,7 +10,11 @@ anyhow = "1.0.100"
 chrono = { version = "0.4.42", features = ["serde"] }
 directories = "5"
 dotenvy = "0.15.7"
+eframe = { version = "0.32", default-features = false, features = ["default_fonts", "glow", "persistence"] }
+egui = "0.32"
+egui_extras = "0.32"
 futures = "0.3"
+rfd = "0.17"
 quick-xml = "0.38.3"
 reqwest = { version = "0.12.24", default-features = false, features = ["charset", "http2", "json", "multipart", "rustls-tls"] }
 rusqlite = { version = "0.37.0", features = ["bundled", "chrono"] }
@@ -26,6 +30,10 @@ tracing = "0.1.41"
 tracing-subscriber = { version = "0.3.20", features = ["env-filter", "fmt"] }
 urlencoding = "2.1"
 uuid = { version = "1.18.1", features = ["v4", "serde"] }
+# Pin winit to 0.30.11 — 0.30.12 and 0.30.13 hit a type-inference regression
+# on rustc 1.93+ (E0282 in winit::window). Holds eframe's transitive choice
+# back to a version that compiles.
+winit = "=0.30.11"
 zerocopy = { version = "0.8", features = ["derive"] }
 
 [profile.release]
