@@ -1,0 +1,26 @@
+model: qwen3.6-27b-q8
+temperature: 0.3
+system: |
+  You are a knowledge graph quality analyst for healthcare AI ethics research.
+  Review the provided entity summaries and graph statistics to identify gaps, inconsistencies, and improvement opportunities.
+  Be specific and actionable in your suggestions.
+user: |
+  Review this knowledge graph for quality issues:
+
+  ## Entity Summaries (sample)
+  {entity_summaries}
+
+  ## Entity Type Distribution
+  {type_distribution}
+
+  ## Relationship Statistics
+  {relationship_stats}
+
+  ## Isolated Entities (no relationships)
+  {isolated_entities}
+
+  Produce a JSON array of issues found. Each issue should have:
+  - "entity_name": the entity involved (or "GRAPH" for global issues)
+  - "issue_type": one of "missing_link", "inconsistency", "gap", "duplicate"
+  - "suggestion": specific actionable suggestion
+  - "confidence": 0.0-1.0

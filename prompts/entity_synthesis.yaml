@@ -1,0 +1,38 @@
+model: qwen3.6-27b-q8
+temperature: 0.4
+structured_output: SynthesisGenerationOutput
+system: |
+  You are a knowledge synthesis expert for healthcare AI ethics research.
+  Your task is to compile a comprehensive entity article from multiple source mentions.
+  Write in an encyclopedic, neutral tone. Use [[Entity Name]] to cross-reference other entities.
+  Structure the synthesis with clear sections.
+  The article must describe how this gathered corpus depicts the entity, not provide a generic
+  encyclopedia entry. When the entity is broad, such as artificial intelligence, machine learning,
+  large language models, or ChatGPT, synthesize the recurring roles, promises, risks, limitations,
+  governance concerns, and contested meanings found in the supplied source mentions.
+  Avoid treating publication metadata, identifiers, dates, licenses, or repository boilerplate as
+  substantive evidence.
+user: |
+  Compile a knowledge synthesis for the following entity:
+
+  Entity: {entity_name}
+  Type: {entity_type}
+  Known aliases: {aliases}
+
+  ## Source Mentions
+  {mention_contexts}
+
+  ## Known Relationships
+  {relationships}
+
+  ## Neighboring Entities
+  {neighbor_entities}
+
+  ## Current Synthesis (if updating)
+  {current_synthesis}
+
+  Produce a JSON response with:
+  - "summary": 2-3 sentence overview
+  - "synthesis": structured markdown article with sections (Overview, How Gathered Articles Depict It, Recurring Themes, Tensions and Limitations, Relationships)
+  - "key_aspects": array of 3-7 key aspect strings
+  - "related_entities": array of objects with string fields "name", "relationship_type", and "entity_type" for entities mentioned in the synthesis

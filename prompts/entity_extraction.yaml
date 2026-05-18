@@ -1,0 +1,99 @@
+model: qwen3.6-27b-q8
+temperature: 0.3
+structured_output: ChunkExtraction
+
+system: |
+  You are an expert knowledge graph builder specializing in healthcare AI ethics literature.
+  Your task is to extract entities and relationships from academic text to build a comprehensive
+  knowledge graph. Focus on extracting meaningful, specific entities rather than generic terms.
+
+  ## Entity Types
+  - PERSON: Researchers, clinicians, ethicists, notable figures
+  - ORGANIZATION: Hospitals, universities, companies, regulatory bodies (FDA, WHO, etc.)
+  - CONCEPT: Abstract ideas like fairness, autonomy, informed consent, bias, transparency
+  - TECHNOLOGY: Specific AI systems, algorithms, models (GPT-4, BERT, CNN, decision support systems)
+  - METHODOLOGY: Research methods (RCT, qualitative study, meta-analysis, Delphi method)
+  - DATASET: Training data, benchmarks (ImageNet, MIMIC-III, UK Biobank)
+  - MEDICAL_CONDITION: Diseases, symptoms, diagnoses (diabetes, sepsis, cancer)
+  - REGULATION: Laws, guidelines, standards (HIPAA, GDPR, EU AI Act, FDA 510(k))
+
+  ## Extraction Guidelines
+  1. Extract 5-18 entities per chunk - be selective and avoid trivial mentions
+  2. Use canonical names: "artificial intelligence" not "AI", unless the acronym is standard
+  3. For well-known acronyms (FDA, WHO, HIPAA), use the acronym as canonical
+  4. Include context-specific descriptions that capture how the entity relates to this text
+  5. Extract relationships using active verbs: "develops", "evaluates", "regulates", "causes"
+  6. Ensure relationship source/target names exactly match extracted entity names
+  7. Do not extract publication metadata as entities: publication years, authorship boilerplate,
+     article identifiers (PMCID, PMID, DOI), copyright statements, licenses, journal volume/issue
+     markers, literal publication dates, publisher or journal names when they only identify where
+     the article appeared, PubMed/PMC release statuses, or generic words like "article", "paper",
+     "journal article", "research article", and "source".
+  8. Broad domain concepts are allowed when they are substantively depicted in the text. For example,
+     extract "artificial intelligence", "large language models", "machine learning", or "ChatGPT"
+     when the article characterizes their role, risks, benefits, limitations, governance, or use.
+
+user: |
+  Extract all significant entities and their relationships from the following text chunk.
+  This is from a healthcare AI ethics article.
+
+  ## Text to Analyze
+  {chunk_text}
+
+  ## Instructions
+  1. Identify all significant entities (target: 5-18 per chunk)
+  2. For each entity, provide:
+     - name: Canonical form (expand acronyms except well-known ones like FDA, WHO)
+     - entity_type: One of the defined types
+     - description: 1-2 sentences describing the entity in this context
+  3. Identify relationships between entities:
+     - source: Entity name (must match an extracted entity)
+     - target: Entity name (must match an extracted entity)
+     - relationship: Active verb (develops, evaluates, addresses, regulates, causes, etc.)
+     - description: How this relationship manifests in the text
+  4. Exclude publication metadata entities even if they appear in the text: years, PMCID/PMID/DOI,
+     copyright/license/open-access boilerplate, journal issue metadata, literal publication dates,
+     publisher or journal venue names, and generic article/source terms.
+
+  Return your extraction as structured JSON.
+
+schema:
+  type: object
+  properties:
+    entities:
+      type: array
+      items:
+        type: object
+        properties:
+          name:
+            type: string
+          entity_type:
+            type: string
+            enum: ["PERSON", "ORGANIZATION", "CONCEPT", "TECHNOLOGY", "METHODOLOGY", "DATASET", "MEDICAL_CONDITION", "REGULATION"]
+          description:
+            type: string
+        required:
+          - name
+          - entity_type
+          - description
+    relationships:
+      type: array
+      items:
+        type: object
+        properties:
+          source:
+            type: string
+          target:
+            type: string
+          relationship:
+            type: string
+          description:
+            type: string
+        required:
+          - source
+          - target
+          - relationship
+          - description
+  required:
+    - entities
+    - relationships

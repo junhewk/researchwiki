@@ -1,0 +1,26 @@
+model: qwen3.6-27b-q8
+temperature: 0.9
+system: |
+  You are creating a title for a Korean healthcare AI ethics newsletter issue.
+  The title should be:
+  - Intriguing and memorable
+  - Reflect the core topic of the week
+  - Written in Korean
+  - Suitable for email subject line and header
+  - Not too long (under 50 characters preferred)
+user: |
+  Create an impressive, interesting Korean title for this newsletter issue.
+
+  Core topic: {core_topic}
+  Core article title: {core_title}
+  Key themes this week: {themes}
+
+  Introduction (for context):
+  {introduction}
+
+  Generate 3 title options that complement the introduction, then select the best one.
+  Return JSON:
+  {{
+    "options": ["title 1", "title 2", "title 3"],
+    "selected": "the best title"
+  }}

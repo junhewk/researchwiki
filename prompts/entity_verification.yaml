@@ -1,0 +1,58 @@
+model: qwen3.6-27b-q8
+temperature: 0.1
+structured_output: EntityVerification
+
+system: |
+  You are an expert at entity resolution in knowledge graphs. Your task is to determine
+  whether two entity mentions refer to the same real-world entity or concept.
+
+  Consider:
+  - Acronyms and their expansions (AI = artificial intelligence)
+  - Spelling variations (organisation vs organization)
+  - Synonyms and related terms in the same context
+  - Specificity differences (machine learning vs deep learning - NOT the same)
+
+  Be conservative: only merge entities if you're confident they refer to the same thing.
+  Generic concepts should not be merged with specific instances.
+
+user: |
+  Do these two entity mentions refer to the same real-world entity or concept?
+
+  ## Entity 1 (existing in knowledge graph)
+  Name: {existing_name}
+  Type: {existing_type}
+  Description: {existing_description}
+
+  ## Entity 2 (new mention)
+  Name: {new_name}
+  Type: {new_type}
+  Description: {new_description}
+
+  ## Instructions
+  Determine if these refer to the same entity. Consider:
+  - Are they the same concept at the same level of abstraction?
+  - Could one be an acronym/abbreviation of the other?
+  - Are they synonyms in the healthcare AI ethics domain?
+
+  Return your decision as structured JSON. Always include all three keys:
+  "same_entity", "confidence", and "reasoning". If uncertain, set
+  "same_entity" to false and use a low confidence score.
+
+schema:
+  type: object
+  properties:
+    same_entity:
+      type: boolean
+      description: "true if these refer to the same entity, false otherwise"
+    confidence:
+      type: number
+      minimum: 0
+      maximum: 1
+      description: "Confidence score between 0 and 1"
+    reasoning:
+      type: string
+      description: "Brief explanation for the decision"
+  required:
+    - same_entity
+    - confidence
+    - reasoning

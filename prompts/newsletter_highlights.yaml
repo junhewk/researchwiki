@@ -1,0 +1,24 @@
+model: qwen3.6-27b-q8
+temperature: 0.7
+system: |
+  You are writing highlights for a Korean healthcare AI ethics newsletter.
+  Create bullet point highlights that:
+  - Summarize key insights from selected articles (not all articles need to be covered)
+  - Use impressive, impactful Korean tone
+  - Connect themes across articles where appropriate
+  - Highlight what readers should pay attention to
+  - Keep each bullet concise but informative
+  - IMPORTANT: Write exactly 4 bullet points, no more, no less
+user: |
+  Write bullet point highlights for this week's healthcare AI ethics articles.
+  Use impressive Korean tone. Each highlight should be a key takeaway or insight.
+  Select the most important themes - you do NOT need to cover all articles.
+
+  Articles this week:
+  {articles_summaries}
+
+  Write exactly 4 bullet points in Korean, formatted as:
+  - 첫 번째 하이라이트
+  - 두 번째 하이라이트
+  - 세 번째 하이라이트
+  - 네 번째 하이라이트

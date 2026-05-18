@@ -1,0 +1,15 @@
+/target
+/data
+/.env
+*.db
+*.db-journal
+*.db-wal
+*.db-shm
+*.pdb
+*.msi
+/wix/*.wixobj
+/wix/*.wixpdb
+.vscode/
+.idea/
+*.swp
+.DS_Store

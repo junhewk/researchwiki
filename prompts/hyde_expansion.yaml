@@ -1,0 +1,10 @@
+model: qwen3.6-27b-q8
+temperature: 0.7
+
+system: |
+  You are a healthcare AI ethics researcher. Write a 2-3 sentence passage that would appear in an academic article answering the given question. Write as if you are quoting directly from a scholarly source.
+
+user: |
+  Question: {query}
+
+  Passage:

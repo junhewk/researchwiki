@@ -1,0 +1,135 @@
+model: qwen3.6-27b-q8
+temperature: 0.5
+structured_output: ArticleEvaluation
+
+system: |
+  You are an expert evaluator of healthcare AI ethics papers. Analyze the provided
+  article and return a structured evaluation in JSON format. All text fields should
+  be in Korean unless otherwise specified.
+
+user: |
+  Analyze this healthcare AI ethics paper and provide a comprehensive structured evaluation.
+
+  ## Article to Analyze
+  {article_text}
+
+  ## Instructions
+  Return your analysis as valid JSON with the following fields:
+
+  ## Metadata (keep in original language)
+  Note: Author info is extracted from source APIs, not LLM evaluation
+  - title: string - Article title
+  - pub_date: string - Publication date in yyyy-MM-dd format
+  - journal: string - Journal name
+
+  ## Classification (use exact values from options)
+  - ai_tech: One of ["ML", "DL", "LLM", "Clinical Decision Support", "Diagnostic AI", "Other"]
+  - clinical_domain: One of ["Radiology", "Pathology", "Primary Care", "ICU", "Multi-domain", "General"]
+  - ethics_framework: One of ["원칙주의", "덕윤리", "돌봄윤리", "결과주의", "권리 기반 접근", "다수 이론", "명시 없음"]
+  - primary_issue: One of ["공정성", "프라이버시", "투명성", "설명책임", "자율성", "선행", "정의", "기타"]
+  - key_stakeholders: One of ["Patients", "Clinicians", "Developers", "Regulators", "Institutions", "Other"]
+  - practical_impl: One of ["정책", "임상 실무", "AI 개발", "규제", "기타"]
+
+  ## Content Analysis (write in Korean)
+  - secondary_issues: string - 2-3 other relevant ethics issues
+  - key_argument: string - Main thesis in one sentence
+  - main_findings: string - 2-3 key findings/claims, line-separated
+  - normative_claims: string - "Should"/"ought" statements from the paper
+  - limitations: string - Author-stated limitations
+  - theoretical_strengths: string - Strong theoretical contributions
+  - theoretical_weaknesses: string - Theoretical gaps or problems
+  - empirical_strengths: string - Strong empirical aspects (if applicable)
+  - empirical_weaknesses: string - Empirical limitations (if applicable)
+  - byline_summary: string - 3-4 sentence elevator pitch summary
+  - why_it_matters: string - Why healthcare AI ethics researchers should read this (3-4 sentences)
+
+  ## Scoring (provide integer scores)
+  - scholarly_rigor: 0-5 (5=theoretical depth, 0=problematic reasoning)
+  - novelty: 0-5 (5=paradigm-shifting, 0=no novelty)
+  - relevance_score: 0-5 (5=directly addresses healthcare AI ethics, 0=not relevant)
+  - practical_impact: 0-5 (5=actionable recommendations, 0=unclear implications)
+  - interdisciplinary: 0-4 (4=covers ethics+CS+medicine+policy, 0=ethics only)
+  - critical_concerns: -5 to 0 (0=no concerns, -3=major methodological flaws)
+  - total_score: sum of all scores (max 22)
+  - priority: "Tier1" if 18-22, "Tier2" if 9-17, "Tier3" if 0-8
+
+schema:
+  type: object
+  properties:
+    title:
+      type: string
+    pub_date:
+      type: string
+    journal:
+      type: string
+    ai_tech:
+      type: string
+      enum: ["ML", "DL", "LLM", "Clinical Decision Support", "Diagnostic AI", "Other"]
+    clinical_domain:
+      type: string
+      enum: ["Radiology", "Pathology", "Primary Care", "ICU", "Multi-domain", "General"]
+    ethics_framework:
+      type: string
+    primary_issue:
+      type: string
+    key_stakeholders:
+      type: string
+    practical_impl:
+      type: string
+    secondary_issues:
+      type: string
+    key_argument:
+      type: string
+    main_findings:
+      type: string
+    normative_claims:
+      type: string
+    limitations:
+      type: string
+    theoretical_strengths:
+      type: string
+    theoretical_weaknesses:
+      type: string
+    empirical_strengths:
+      type: string
+    empirical_weaknesses:
+      type: string
+    byline_summary:
+      type: string
+    why_it_matters:
+      type: string
+    scholarly_rigor:
+      type: integer
+      minimum: 0
+      maximum: 5
+    novelty:
+      type: integer
+      minimum: 0
+      maximum: 5
+    relevance_score:
+      type: integer
+      minimum: 0
+      maximum: 5
+    practical_impact:
+      type: integer
+      minimum: 0
+      maximum: 5
+    interdisciplinary:
+      type: integer
+      minimum: 0
+      maximum: 4
+    critical_concerns:
+      type: integer
+      minimum: -5
+      maximum: 0
+    total_score:
+      type: integer
+    priority:
+      type: string
+      enum: ["Tier1", "Tier2", "Tier3"]
+  required:
+    - title
+    - byline_summary
+    - why_it_matters
+    - total_score
+    - priority
