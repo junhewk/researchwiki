@@ -25,7 +25,7 @@ mod platform {
     }
 
     impl TrayController {
-        pub fn new(ctx: &egui::Context) -> anyhow::Result<Self> {
+        pub fn new(ctx: &egui::Context, window_handle: Option<isize>) -> anyhow::Result<Self> {
             let (tx, rx) = mpsc::channel();
             let menu = Menu::new();
             let open = MenuItem::with_id(OPEN_ID, "Open ResearchWiki", true, None);
@@ -42,12 +42,14 @@ mod platform {
 
             let repaint_ctx = ctx.clone();
             let menu_tx = tx.clone();
-            MenuEvent::set_event_handler(Some(move |event| {
+            MenuEvent::set_event_handler(Some(move |event: MenuEvent| {
                 match event.id.as_ref() {
                     OPEN_ID => {
+                        restore_window(window_handle);
                         let _ = menu_tx.send(TrayCommand::Show);
                     }
                     QUIT_ID => {
+                        close_window(window_handle);
                         let _ = menu_tx.send(TrayCommand::Quit);
                     }
                     _ => {}
@@ -65,6 +67,7 @@ mod platform {
                         ..
                     }
                 ) {
+                    restore_window(window_handle);
                     let _ = tray_tx.send(TrayCommand::Show);
                     repaint_ctx.request_repaint();
                 }
@@ -105,6 +108,44 @@ mod platform {
         }
         Icon::from_rgba(rgba, SIZE, SIZE)
     }
+
+    fn restore_window(window_handle: Option<isize>) {
+        let Some(hwnd) = window_handle else {
+            return;
+        };
+
+        unsafe {
+            use windows_sys::Win32::UI::WindowsAndMessaging::{
+                BringWindowToTop, IsWindow, SetForegroundWindow, ShowWindow, ShowWindowAsync,
+                SW_RESTORE,
+            };
+
+            let hwnd = hwnd as windows_sys::Win32::Foundation::HWND;
+            if IsWindow(hwnd) == 0 {
+                return;
+            }
+
+            ShowWindowAsync(hwnd, SW_RESTORE);
+            ShowWindow(hwnd, SW_RESTORE);
+            BringWindowToTop(hwnd);
+            SetForegroundWindow(hwnd);
+        }
+    }
+
+    fn close_window(window_handle: Option<isize>) {
+        let Some(hwnd) = window_handle else {
+            return;
+        };
+
+        unsafe {
+            use windows_sys::Win32::UI::WindowsAndMessaging::{IsWindow, PostMessageW, WM_CLOSE};
+
+            let hwnd = hwnd as windows_sys::Win32::Foundation::HWND;
+            if IsWindow(hwnd) != 0 {
+                PostMessageW(hwnd, WM_CLOSE, 0, 0);
+            }
+        }
+    }
 }
 
 #[cfg(not(target_os = "windows"))]
@@ -114,7 +155,7 @@ mod platform {
     pub struct TrayController;
 
     impl TrayController {
-        pub fn new(_ctx: &egui::Context) -> anyhow::Result<Self> {
+        pub fn new(_ctx: &egui::Context, _window_handle: Option<isize>) -> anyhow::Result<Self> {
             Ok(Self)
         }
 

@@ -37,7 +37,9 @@ winit = "=0.30.11"
 zerocopy = { version = "0.8", features = ["derive"] }
 
 [target.'cfg(target_os = "windows")'.dependencies]
+raw-window-handle = "0.6"
 tray-icon = { version = "0.23.1", default-features = false }
+windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_UI_WindowsAndMessaging"] }
 
 [profile.release]
 lto = "thin"

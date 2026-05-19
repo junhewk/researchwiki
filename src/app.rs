@@ -47,6 +47,8 @@ pub struct DesktopApp {
     tray: Option<TrayController>,
     tray_error_reported: bool,
     hidden_to_tray: bool,
+    restoring_from_tray: bool,
+    native_window_handle: Option<isize>,
     first_run: FirstRunForm,
     panels: Panels,
     persistent: PersistentUi,
@@ -81,6 +83,8 @@ impl DesktopApp {
             tray: None,
             tray_error_reported: false,
             hidden_to_tray: false,
+            restoring_from_tray: false,
+            native_window_handle: native_window_handle(cc),
             first_run: FirstRunForm::default(),
             panels: Panels::default(),
             persistent,
@@ -155,7 +159,7 @@ impl DesktopApp {
             return;
         }
 
-        match TrayController::new(ctx) {
+        match TrayController::new(ctx, self.native_window_handle) {
             Ok(tray) => self.tray = Some(tray),
             Err(err) => {
                 self.tray_error_reported = true;
@@ -184,6 +188,7 @@ impl DesktopApp {
 
     fn restore_from_tray(&mut self, ctx: &egui::Context) {
         self.hidden_to_tray = false;
+        self.restoring_from_tray = true;
         ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
         ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
         ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
@@ -196,8 +201,19 @@ impl DesktopApp {
         }
 
         let minimized = ctx.input(|input| input.viewport().minimized.unwrap_or(false));
+        if self.restoring_from_tray {
+            if minimized {
+                ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
+                ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
+                ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+                return;
+            }
+            self.restoring_from_tray = false;
+        }
+
         if minimized {
             self.hidden_to_tray = true;
+            ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
             ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
             self.status = Some("Minimized to system tray. Scheduler remains active.".to_string());
         }
@@ -270,6 +286,22 @@ impl eframe::App for DesktopApp {
                 .block_on(async move { timeout(Duration::from_secs(5), scheduler).await });
         }
     }
+}
+
+#[cfg(target_os = "windows")]
+fn native_window_handle(cc: &eframe::CreationContext<'_>) -> Option<isize> {
+    use raw_window_handle::{HasWindowHandle as _, RawWindowHandle};
+
+    let handle = cc.window_handle().ok()?.as_raw();
+    match handle {
+        RawWindowHandle::Win32(handle) => Some(handle.hwnd.get()),
+        _ => None,
+    }
+}
+
+#[cfg(not(target_os = "windows"))]
+fn native_window_handle(_cc: &eframe::CreationContext<'_>) -> Option<isize> {
+    None
 }
 
 /// Create per-user directories and copy bundled prompts into the user copy on first launch.

@@ -3155,6 +3155,7 @@ dependencies = [
  "egui_extras",
  "futures",
  "quick-xml 0.38.4",
+ "raw-window-handle",
  "reqwest",
  "rfd",
  "rusqlite",
@@ -3171,6 +3172,7 @@ dependencies = [
  "tray-icon",
  "urlencoding",
  "uuid",
+ "windows-sys 0.61.2",
  "winit",
  "zerocopy",
 ]
