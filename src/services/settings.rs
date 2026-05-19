@@ -3,7 +3,7 @@ use std::{collections::BTreeMap, env, path::{Path, PathBuf}};
 use tokio::sync::RwLock;
 
 use crate::{
-    config::LlmConfig,
+    config::{EmbeddingConfig, LlmConfig},
     error::AppError,
     models::settings::{
         AiProvider, ApiKeyStatus, SettingsResponse, SettingsUpdate, StoredSettings,
@@ -81,6 +81,18 @@ impl SettingsService {
         self.save(&stored).await
     }
 
+    pub async fn get_embedding_config(&self) -> Result<Option<EmbeddingConfig>, AppError> {
+        let stored = self.load().await?;
+        Ok(stored.embedding)
+    }
+
+    pub async fn set_embedding_config(&self, embedding: EmbeddingConfig) -> Result<(), AppError> {
+        let _guard = self.lock.write().await;
+        let mut stored = self.load().await?;
+        stored.embedding = Some(embedding);
+        self.save(&stored).await
+    }
+
     pub async fn get_embedding_dimensions(&self) -> Result<Option<u32>, AppError> {
         let stored = self.load().await?;
         Ok(stored.embedding_dimensions)
@@ -129,15 +141,17 @@ impl SettingsService {
 }
 
 /// Sync read of settings.json overrides at startup, before the tokio runtime
-/// exists. Missing/unparseable file → `(None, None)`; startup uses defaults.
-pub fn load_overrides_sync(settings_file: &Path) -> (Option<LlmConfig>, Option<u32>) {
+/// exists. Missing/unparseable file → all-`None`; startup uses defaults.
+pub fn load_overrides_sync(
+    settings_file: &Path,
+) -> (Option<LlmConfig>, Option<EmbeddingConfig>, Option<u32>) {
     let Ok(raw) = std::fs::read_to_string(settings_file) else {
-        return (None, None);
+        return (None, None, None);
     };
     let Ok(stored) = serde_json::from_str::<StoredSettings>(&raw) else {
-        return (None, None);
+        return (None, None, None);
     };
-    (stored.llm, stored.embedding_dimensions)
+    (stored.llm, stored.embedding, stored.embedding_dimensions)
 }
 
 fn mask_api_key(key: &str) -> String {

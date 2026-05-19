@@ -1,5 +1,5 @@
 use crate::{
-    config::LlmConfig,
+    config::{EmbeddingConfig, LlmConfig},
     models::settings::{NewsletterSettings, SchedulerSettings, SettingsUpdate},
 };
 
@@ -32,6 +32,11 @@ pub struct Panel {
     llm_model: String,
     llm_api_key: String,
     llm_dirty: bool,
+
+    embed_base_url: String,
+    embed_model: String,
+    embed_api_key: String,
+    embed_dirty: bool,
 
     embedding_dim_persisted: Option<u32>,
     embedding_dim_input: String,
@@ -70,6 +75,9 @@ impl Panel {
             .auto_shrink([false, false])
             .show(ui, |ui| {
                 self.section_llm(ui, ctx);
+                ui.add_space(8.0);
+                ui.separator();
+                self.section_embedding_endpoint(ui, ctx);
                 ui.add_space(8.0);
                 ui.separator();
                 self.section_paths(ui, ctx);
@@ -114,8 +122,10 @@ impl Panel {
                 }
                 Msg::Saved(what) => {
                     self.notice = Some((NoticeKind::Success, format!("{what} saved.")));
-                    if what == "LLM endpoint" {
-                        self.llm_dirty = false;
+                    match what {
+                        "LLM endpoint" => self.llm_dirty = false,
+                        "Embedding endpoint" => self.embed_dirty = false,
+                        _ => {}
                     }
                 }
                 Msg::SaveError(err) => {
@@ -130,6 +140,9 @@ impl Panel {
         self.llm_base_url = cfg.llm.base_url.clone();
         self.llm_model = cfg.llm.model.clone();
         self.llm_api_key = cfg.llm.api_key.clone();
+        self.embed_base_url = cfg.embedding.base_url.clone();
+        self.embed_model = cfg.embedding.model.clone();
+        self.embed_api_key = cfg.embedding.api_key.clone();
         self.embedding_dim_input = cfg.embedding_dimensions.to_string();
     }
 
@@ -196,6 +209,55 @@ impl Panel {
                 self.save_llm(ctx);
             }
             if self.llm_dirty {
+                ui.label(egui::RichText::new("unsaved changes").italics());
+            }
+        });
+    }
+
+    fn section_embedding_endpoint(&mut self, ui: &mut egui::Ui, ctx: &PanelCtx<'_>) {
+        ui.heading("Embedding endpoint");
+        ui.label("Used to embed article chunks for semantic + hybrid search. Restart to apply.");
+        ui.add_space(4.0);
+
+        egui::Grid::new("settings-embed-endpoint-grid")
+            .num_columns(2)
+            .spacing([8.0, 6.0])
+            .show(ui, |ui| {
+                ui.label("Base URL");
+                if ui.text_edit_singleline(&mut self.embed_base_url).changed() {
+                    self.embed_dirty = true;
+                }
+                ui.end_row();
+
+                ui.label("Model");
+                if ui.text_edit_singleline(&mut self.embed_model).changed() {
+                    self.embed_dirty = true;
+                }
+                ui.end_row();
+
+                ui.label("API key");
+                let resp = ui.add(
+                    egui::TextEdit::singleline(&mut self.embed_api_key)
+                        .password(true)
+                        .hint_text("(leave blank for local servers)"),
+                );
+                if resp.changed() {
+                    self.embed_dirty = true;
+                }
+                ui.end_row();
+            });
+
+        ui.horizontal(|ui| {
+            let save_enabled = self.embed_dirty
+                && !self.embed_base_url.trim().is_empty()
+                && !self.embed_model.trim().is_empty();
+            if ui
+                .add_enabled(save_enabled, egui::Button::new("Save embedding endpoint"))
+                .clicked()
+            {
+                self.save_embedding_endpoint(ctx);
+            }
+            if self.embed_dirty {
                 ui.label(egui::RichText::new("unsaved changes").italics());
             }
         });
@@ -340,6 +402,24 @@ impl Panel {
             let result = svc.set_llm_config(new_llm).await;
             let _ = match result {
                 Ok(()) => tx.send(Msg::Saved("LLM endpoint")),
+                Err(err) => tx.send(Msg::SaveError(err.to_string())),
+            };
+        });
+    }
+
+    fn save_embedding_endpoint(&mut self, ctx: &PanelCtx<'_>) {
+        let Some(channel) = self.channel.as_ref() else { return };
+        let tx = channel.tx.clone();
+        let new_embed = EmbeddingConfig {
+            base_url: self.embed_base_url.trim().trim_end_matches('/').to_string(),
+            model: self.embed_model.trim().to_string(),
+            api_key: self.embed_api_key.clone(),
+        };
+        let svc = ctx.state.settings_service.clone();
+        ctx.handle.spawn(async move {
+            let result = svc.set_embedding_config(new_embed).await;
+            let _ = match result {
+                Ok(()) => tx.send(Msg::Saved("Embedding endpoint")),
                 Err(err) => tx.send(Msg::SaveError(err.to_string())),
             };
         });

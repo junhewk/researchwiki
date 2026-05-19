@@ -135,18 +135,22 @@ impl eframe::App for DesktopApp {
         self.drain_events();
 
         if self.state.is_none() {
-            if let FirstRunOutcome::Submitted(llm) = self.first_run.show(ctx) {
+            if let FirstRunOutcome::Submitted { llm, embedding } = self.first_run.show(ctx) {
                 // Best-effort persist so the modal only fires once. A failed
                 // write still lets the user continue in this session.
                 let path = self.config.storage.settings_file.clone();
                 let llm_to_save = llm.clone();
+                let embedding_to_save = embedding.clone();
                 let save_result = self.handle.block_on(async move {
-                    SettingsService::new(path).set_llm_config(llm_to_save).await
+                    let svc = SettingsService::new(path);
+                    svc.set_llm_config(llm_to_save).await?;
+                    svc.set_embedding_config(embedding_to_save).await
                 });
                 if let Err(err) = save_result {
-                    warn!("failed to persist LLM config from first-run modal: {err:#}");
+                    warn!("failed to persist first-run config: {err:#}");
                 }
                 self.config.llm = llm;
+                self.config.embedding = embedding;
                 self.activate();
             }
             return;

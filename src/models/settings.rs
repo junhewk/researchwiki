@@ -84,6 +84,8 @@ pub struct StoredSettings {
     #[serde(default)]
     pub llm: Option<crate::config::LlmConfig>,
     #[serde(default)]
+    pub embedding: Option<crate::config::EmbeddingConfig>,
+    #[serde(default)]
     pub embedding_dimensions: Option<u32>,
 }
 

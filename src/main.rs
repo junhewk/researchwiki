@@ -18,9 +18,13 @@ fn main() -> eframe::Result<()> {
     first_launch_seed(&config).expect("first-launch directory setup failed");
 
     // Overlay persisted settings so the first-run modal only fires on a fresh install.
-    let (persisted_llm, persisted_dim) = load_overrides_sync(&config.storage.settings_file);
+    let (persisted_llm, persisted_embedding, persisted_dim) =
+        load_overrides_sync(&config.storage.settings_file);
     if let Some(llm) = persisted_llm {
         config.llm = llm;
+    }
+    if let Some(embedding) = persisted_embedding {
+        config.embedding = embedding;
     }
     if let Some(dim) = persisted_dim {
         config.embedding_dimensions = dim;

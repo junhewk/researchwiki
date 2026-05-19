@@ -1,24 +1,17 @@
-use std::sync::Arc;
-
-use reqwest::Client;
+use reqwest::{Client, RequestBuilder};
 use serde_json::{Value as JsonValue, json};
 
-use crate::{error::AppError, models::settings::AiProvider, services::settings::SettingsService};
-
-const EMBEDDING_MODEL: &str = "text-embedding-3-small";
+use crate::{config::EmbeddingConfig, error::AppError};
 
 #[derive(Clone)]
 pub struct EmbeddingService {
     client: Client,
-    settings_service: Arc<SettingsService>,
+    config: EmbeddingConfig,
 }
 
 impl EmbeddingService {
-    pub fn new(client: Client, settings_service: Arc<SettingsService>) -> Self {
-        Self {
-            client,
-            settings_service,
-        }
+    pub fn new(client: Client, config: EmbeddingConfig) -> Self {
+        Self { client, config }
     }
 
     pub async fn embed_texts(&self, texts: &[String]) -> Result<Vec<Vec<f32>>, AppError> {
@@ -26,24 +19,23 @@ impl EmbeddingService {
             return Ok(Vec::new());
         }
 
-        let api_key = self
-            .settings_service
-            .get_api_key(AiProvider::Openai)
-            .await?
-            .ok_or_else(|| AppError::BadRequest("OpenAI API key is not configured".to_string()))?;
+        if !self.config.is_configured() {
+            return Err(AppError::BadRequest(
+                "Embedding endpoint is not configured (Settings → Embedding endpoint)".to_string(),
+            ));
+        }
 
+        let endpoint = format!("{}/embeddings", self.config.base_url);
         let response = self
-            .client
-            .post("https://api.openai.com/v1/embeddings")
-            .bearer_auth(api_key)
+            .with_optional_auth(self.client.post(&endpoint))
             .json(&json!({
-                "model": EMBEDDING_MODEL,
+                "model": self.config.model,
                 "input": texts,
             }))
             .send()
             .await
             .map_err(|error| {
-                AppError::Internal(format!("OpenAI embeddings request failed: {error}"))
+                AppError::Internal(format!("Embeddings request to {endpoint} failed: {error}"))
             })?;
 
         let status = response.status();
@@ -57,7 +49,7 @@ impl EmbeddingService {
                 body
             };
             return Err(AppError::Internal(format!(
-                "OpenAI embeddings request failed with status {status}: {snippet}"
+                "Embeddings request failed with status {status}: {snippet}"
             )));
         }
 
@@ -66,7 +58,7 @@ impl EmbeddingService {
         })?;
         let Some(data) = payload.get("data").and_then(JsonValue::as_array) else {
             return Err(AppError::Internal(
-                "OpenAI embeddings response missing data".to_string(),
+                "Embeddings response missing data".to_string(),
             ));
         };
 
@@ -105,5 +97,15 @@ impl EmbeddingService {
             .into_iter()
             .next()
             .ok_or_else(|| AppError::Internal("Embedding response was empty".to_string()))
+    }
+
+    fn with_optional_auth(&self, req: RequestBuilder) -> RequestBuilder {
+        // Local embedding servers (llama-server, infinity) usually accept
+        // no auth header. Only attach Bearer when we actually have a key.
+        if self.config.api_key.is_empty() {
+            req
+        } else {
+            req.bearer_auth(&self.config.api_key)
+        }
     }
 }

@@ -9,6 +9,7 @@ use anyhow::{Context, Result};
 pub struct AppConfig {
     pub storage: StorageConfig,
     pub llm: LlmConfig,
+    pub embedding: EmbeddingConfig,
     pub embedding_dimensions: u32,
 }
 
@@ -65,6 +66,30 @@ impl LlmConfig {
     }
 }
 
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+pub struct EmbeddingConfig {
+    pub base_url: String,
+    pub model: String,
+    #[serde(default)]
+    pub api_key: String,
+}
+
+impl Default for EmbeddingConfig {
+    fn default() -> Self {
+        Self {
+            base_url: "https://api.openai.com/v1".to_string(),
+            model: "text-embedding-3-small".to_string(),
+            api_key: String::new(),
+        }
+    }
+}
+
+impl EmbeddingConfig {
+    pub fn is_configured(&self) -> bool {
+        !self.base_url.is_empty() && !self.model.is_empty()
+    }
+}
+
 impl AppConfig {
     /// Per-user data directory via `directories::ProjectDirs`.
     pub fn for_desktop() -> Result<Self> {
@@ -80,6 +105,7 @@ impl AppConfig {
                 wiki_export_dir: root.join("wiki"),
             },
             llm: LlmConfig::default(),
+            embedding: EmbeddingConfig::default(),
             embedding_dimensions: 1536,
         })
     }
@@ -115,6 +141,18 @@ impl AppConfig {
                 .clamp(1, 16),
         };
 
+        let embedding = EmbeddingConfig {
+            base_url: env::var("EMBEDDING_BASE_URL")
+                .map(|v| v.trim_end_matches('/').to_string())
+                .unwrap_or(base.embedding.base_url),
+            model: env::var("EMBEDDING_MODEL").unwrap_or(base.embedding.model),
+            // OPENAI_API_KEY kept as a fallback so existing setups don't
+            // break — embedding endpoint defaults to OpenAI anyway.
+            api_key: env::var("EMBEDDING_API_KEY")
+                .or_else(|_| env::var("OPENAI_API_KEY"))
+                .unwrap_or(base.embedding.api_key),
+        };
+
         let embedding_dimensions = env::var("EMBEDDING_DIMENSIONS")
             .ok()
             .and_then(|value| value.parse().ok())
@@ -123,6 +161,7 @@ impl AppConfig {
         Ok(Self {
             storage,
             llm,
+            embedding,
             embedding_dimensions,
         })
     }

@@ -50,7 +50,7 @@ impl AppState {
             .expect("reqwest client should build");
         let embedding_service = std::sync::Arc::new(EmbeddingService::new(
             http_client.clone(),
-            settings_service.clone(),
+            config.embedding.clone(),
         ));
         let knowledge_graph_service = std::sync::Arc::new(KnowledgeGraphService::new(
             config.storage.database_path.clone(),
