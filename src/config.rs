@@ -39,11 +39,21 @@ pub struct LlmConfig {
     pub max_concurrent_requests: usize,
 }
 
-fn default_true() -> bool { true }
-fn default_connect_timeout() -> u64 { 10 }
-fn default_request_timeout() -> u64 { 300 }
-fn default_max_attempts() -> usize { 4 }
-fn default_max_concurrent() -> usize { 1 }
+fn default_true() -> bool {
+    true
+}
+fn default_connect_timeout() -> u64 {
+    10
+}
+fn default_request_timeout() -> u64 {
+    300
+}
+fn default_max_attempts() -> usize {
+    4
+}
+fn default_max_concurrent() -> usize {
+    1
+}
 
 impl Default for LlmConfig {
     fn default() -> Self {
@@ -132,13 +142,22 @@ impl AppConfig {
             model: env::var("LLM_MODEL").unwrap_or(base.llm.model),
             api_key: env::var("LLM_API_KEY").unwrap_or(base.llm.api_key),
             disable_thinking: env_bool("LLM_DISABLE_THINKING", base.llm.disable_thinking),
-            connect_timeout_seconds: env_parse("LLM_CONNECT_TIMEOUT_SECONDS", base.llm.connect_timeout_seconds)
-                .clamp(1, 120),
-            request_timeout_seconds: env_parse("LLM_REQUEST_TIMEOUT_SECONDS", base.llm.request_timeout_seconds)
-                .clamp(10, 900),
+            connect_timeout_seconds: env_parse(
+                "LLM_CONNECT_TIMEOUT_SECONDS",
+                base.llm.connect_timeout_seconds,
+            )
+            .clamp(1, 120),
+            request_timeout_seconds: env_parse(
+                "LLM_REQUEST_TIMEOUT_SECONDS",
+                base.llm.request_timeout_seconds,
+            )
+            .clamp(10, 900),
             max_attempts: env_parse("LLM_MAX_ATTEMPTS", base.llm.max_attempts).clamp(1, 5),
-            max_concurrent_requests: env_parse("LLM_MAX_CONCURRENT_REQUESTS", base.llm.max_concurrent_requests)
-                .clamp(1, 16),
+            max_concurrent_requests: env_parse(
+                "LLM_MAX_CONCURRENT_REQUESTS",
+                base.llm.max_concurrent_requests,
+            )
+            .clamp(1, 16),
         };
 
         let embedding = EmbeddingConfig {

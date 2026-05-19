@@ -104,10 +104,16 @@ impl Panel {
     }
 
     fn drain(&mut self) {
-        let Some(channel) = self.channel.as_mut() else { return };
+        let Some(channel) = self.channel.as_mut() else {
+            return;
+        };
         while let Ok(msg) = channel.rx.try_recv() {
             match msg {
-                Msg::Loaded { scheduler, newsletter, embedding_dimensions } => {
+                Msg::Loaded {
+                    scheduler,
+                    newsletter,
+                    embedding_dimensions,
+                } => {
                     self.scheduler = Some(scheduler);
                     self.newsletter = Some(newsletter);
                     self.embedding_dim_persisted = embedding_dimensions;
@@ -118,7 +124,8 @@ impl Panel {
                 }
                 Msg::LoadError(err) => {
                     self.loading = false;
-                    self.notice = Some((NoticeKind::Error, format!("Failed to load settings: {err}")));
+                    self.notice =
+                        Some((NoticeKind::Error, format!("Failed to load settings: {err}")));
                 }
                 Msg::Saved(what) => {
                     self.notice = Some((NoticeKind::Success, format!("{what} saved.")));
@@ -148,7 +155,9 @@ impl Panel {
 
     fn spawn_load(&mut self, ctx: &PanelCtx<'_>) {
         self.loading = true;
-        let Some(channel) = self.channel.as_ref() else { return };
+        let Some(channel) = self.channel.as_ref() else {
+            return;
+        };
         let tx = channel.tx.clone();
         let svc = ctx.state.settings_service.clone();
         ctx.handle.spawn(async move {
@@ -205,7 +214,10 @@ impl Panel {
             let save_enabled = self.llm_dirty
                 && !self.llm_base_url.trim().is_empty()
                 && !self.llm_model.trim().is_empty();
-            if ui.add_enabled(save_enabled, egui::Button::new("Save LLM endpoint")).clicked() {
+            if ui
+                .add_enabled(save_enabled, egui::Button::new("Save LLM endpoint"))
+                .clicked()
+            {
                 self.save_llm(ctx);
             }
             if self.llm_dirty {
@@ -284,7 +296,9 @@ impl Panel {
             return;
         };
 
-        let mut changed = ui.checkbox(&mut sched.enabled, "Enable scheduled gathers").changed();
+        let mut changed = ui
+            .checkbox(&mut sched.enabled, "Enable scheduled gathers")
+            .changed();
 
         ui.add_space(4.0);
         ui.label("Daily schedule (KST, 24h)");
@@ -297,9 +311,24 @@ impl Panel {
                 ui.label("Minute");
                 ui.end_row();
 
-                changed |= hm_row(ui, "arXiv", &mut sched.arxiv_schedule_hour, &mut sched.arxiv_schedule_minute);
-                changed |= hm_row(ui, "PMC", &mut sched.pmc_schedule_hour, &mut sched.pmc_schedule_minute);
-                changed |= hm_row(ui, "PubMed", &mut sched.pubmed_schedule_hour, &mut sched.pubmed_schedule_minute);
+                changed |= hm_row(
+                    ui,
+                    "arXiv",
+                    &mut sched.arxiv_schedule_hour,
+                    &mut sched.arxiv_schedule_minute,
+                );
+                changed |= hm_row(
+                    ui,
+                    "PMC",
+                    &mut sched.pmc_schedule_hour,
+                    &mut sched.pmc_schedule_minute,
+                );
+                changed |= hm_row(
+                    ui,
+                    "PubMed",
+                    &mut sched.pubmed_schedule_hour,
+                    &mut sched.pubmed_schedule_minute,
+                );
             });
 
         ui.add_space(4.0);
@@ -315,7 +344,10 @@ impl Panel {
 
     fn section_embedding(&mut self, ui: &mut egui::Ui, ctx: &PanelCtx<'_>) {
         ui.heading("Embeddings");
-        ui.label(format!("Current dimension: {}", ctx.state.config.embedding_dimensions));
+        ui.label(format!(
+            "Current dimension: {}",
+            ctx.state.config.embedding_dimensions
+        ));
         if let Some(dim) = self.embedding_dim_persisted
             && dim != ctx.state.config.embedding_dimensions
         {
@@ -328,14 +360,15 @@ impl Panel {
         ui.add_space(4.0);
         ui.horizontal(|ui| {
             ui.label("New dimension:");
-            ui.add(
-                egui::TextEdit::singleline(&mut self.embedding_dim_input)
-                    .desired_width(80.0),
-            );
+            ui.add(egui::TextEdit::singleline(&mut self.embedding_dim_input).desired_width(80.0));
             let parsed = self.embedding_dim_input.trim().parse::<u32>().ok();
-            let new_dim_differs = parsed.is_some_and(|d| d != ctx.state.config.embedding_dimensions);
+            let new_dim_differs =
+                parsed.is_some_and(|d| d != ctx.state.config.embedding_dimensions);
             let enabled = parsed.is_some_and(|d| (1..=8192).contains(&d)) && new_dim_differs;
-            if ui.add_enabled(enabled, egui::Button::new("Change…")).clicked() {
+            if ui
+                .add_enabled(enabled, egui::Button::new("Change…"))
+                .clicked()
+            {
                 self.embedding_confirm_open = true;
             }
         });
@@ -391,7 +424,9 @@ impl Panel {
     }
 
     fn save_llm(&mut self, ctx: &PanelCtx<'_>) {
-        let Some(channel) = self.channel.as_ref() else { return };
+        let Some(channel) = self.channel.as_ref() else {
+            return;
+        };
         let tx = channel.tx.clone();
         let mut new_llm: LlmConfig = ctx.state.config.llm.clone();
         new_llm.base_url = self.llm_base_url.trim().trim_end_matches('/').to_string();
@@ -408,7 +443,9 @@ impl Panel {
     }
 
     fn save_embedding_endpoint(&mut self, ctx: &PanelCtx<'_>) {
-        let Some(channel) = self.channel.as_ref() else { return };
+        let Some(channel) = self.channel.as_ref() else {
+            return;
+        };
         let tx = channel.tx.clone();
         let new_embed = EmbeddingConfig {
             base_url: self.embed_base_url.trim().trim_end_matches('/').to_string(),
@@ -426,8 +463,12 @@ impl Panel {
     }
 
     fn save_scheduler(&mut self, ctx: &PanelCtx<'_>) {
-        let Some(channel) = self.channel.as_ref() else { return };
-        let Some(sched) = self.scheduler.clone() else { return };
+        let Some(channel) = self.channel.as_ref() else {
+            return;
+        };
+        let Some(sched) = self.scheduler.clone() else {
+            return;
+        };
         let tx = channel.tx.clone();
         let svc = ctx.state.settings_service.clone();
         let update = SettingsUpdate {
@@ -444,7 +485,9 @@ impl Panel {
     }
 
     fn save_embedding_dim(&mut self, ctx: &PanelCtx<'_>, new_dim: u32) {
-        let Some(channel) = self.channel.as_ref() else { return };
+        let Some(channel) = self.channel.as_ref() else {
+            return;
+        };
         let tx = channel.tx.clone();
         let svc = ctx.state.settings_service.clone();
         ctx.handle.spawn(async move {
@@ -462,9 +505,7 @@ fn path_row(ui: &mut egui::Ui, label: &str, path: &std::path::Path) {
     ui.label(label);
     let display = path.display().to_string();
     ui.horizontal(|ui| {
-        ui.add(
-            egui::Label::new(egui::RichText::new(&display).monospace()).truncate(),
-        );
+        ui.add(egui::Label::new(egui::RichText::new(&display).monospace()).truncate());
         if ui.small_button("Copy").clicked() {
             ui.ctx().copy_text(display.clone());
         }
@@ -497,14 +538,23 @@ fn hm_row(ui: &mut egui::Ui, label: &str, hour: &mut u8, minute: &mut u8) -> boo
 fn open_in_file_manager(path: &std::path::Path) -> std::io::Result<()> {
     #[cfg(target_os = "windows")]
     {
-        std::process::Command::new("explorer").arg(path).spawn().map(|_| ())
+        std::process::Command::new("explorer")
+            .arg(path)
+            .spawn()
+            .map(|_| ())
     }
     #[cfg(target_os = "macos")]
     {
-        std::process::Command::new("open").arg(path).spawn().map(|_| ())
+        std::process::Command::new("open")
+            .arg(path)
+            .spawn()
+            .map(|_| ())
     }
     #[cfg(all(unix, not(target_os = "macos")))]
     {
-        std::process::Command::new("xdg-open").arg(path).spawn().map(|_| ())
+        std::process::Command::new("xdg-open")
+            .arg(path)
+            .spawn()
+            .map(|_| ())
     }
 }

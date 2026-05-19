@@ -61,9 +61,7 @@ impl FirstRunForm {
                         ui.end_row();
 
                         ui.label("API key");
-                        ui.add(
-                            egui::TextEdit::singleline(&mut self.llm_api_key).password(true),
-                        );
+                        ui.add(egui::TextEdit::singleline(&mut self.llm_api_key).password(true));
                         ui.end_row();
                     });
 

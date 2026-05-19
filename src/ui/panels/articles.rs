@@ -104,7 +104,8 @@ impl Panel {
                     self.apply_local_sort();
                     self.loading = false;
                     self.error = None;
-                    self.selected_index = self.selected_uid
+                    self.selected_index = self
+                        .selected_uid
                         .as_ref()
                         .and_then(|uid| self.items.iter().position(|a| &a.uid == uid));
                 }
@@ -172,9 +173,21 @@ impl Panel {
                             })
                             .show_ui(ui, |ui| {
                                 ui.selectable_value(&mut self.filters.tier, String::new(), "(any)");
-                                ui.selectable_value(&mut self.filters.tier, "Tier1".into(), "Tier1");
-                                ui.selectable_value(&mut self.filters.tier, "Tier2".into(), "Tier2");
-                                ui.selectable_value(&mut self.filters.tier, "Tier3".into(), "Tier3");
+                                ui.selectable_value(
+                                    &mut self.filters.tier,
+                                    "Tier1".into(),
+                                    "Tier1",
+                                );
+                                ui.selectable_value(
+                                    &mut self.filters.tier,
+                                    "Tier2".into(),
+                                    "Tier2",
+                                );
+                                ui.selectable_value(
+                                    &mut self.filters.tier,
+                                    "Tier3".into(),
+                                    "Tier3",
+                                );
                             });
                         ui.end_row();
                     });
@@ -216,26 +229,62 @@ impl Panel {
             .max_scroll_height(available_height.max(120.0))
             .sense(egui::Sense::click())
             .header(text_height + 4.0, |mut header| {
-                header.col(|ui| sort_request = sort_request.or(self.header_label(ui, "Date", SortCol::Date)));
-                header.col(|ui| sort_request = sort_request.or(self.header_label(ui, "Title", SortCol::Title)));
-                header.col(|ui| sort_request = sort_request.or(self.header_label(ui, "Category", SortCol::Category)));
-                header.col(|ui| sort_request = sort_request.or(self.header_label(ui, "Score", SortCol::Score)));
-                header.col(|ui| sort_request = sort_request.or(self.header_label(ui, "Tier", SortCol::Tier)));
+                header.col(|ui| {
+                    sort_request = sort_request.or(self.header_label(ui, "Date", SortCol::Date))
+                });
+                header.col(|ui| {
+                    sort_request = sort_request.or(self.header_label(ui, "Title", SortCol::Title))
+                });
+                header.col(|ui| {
+                    sort_request =
+                        sort_request.or(self.header_label(ui, "Category", SortCol::Category))
+                });
+                header.col(|ui| {
+                    sort_request = sort_request.or(self.header_label(ui, "Score", SortCol::Score))
+                });
+                header.col(|ui| {
+                    sort_request = sort_request.or(self.header_label(ui, "Tier", SortCol::Tier))
+                });
             })
             .body(|body| {
                 let total = self.items.len();
                 body.rows(text_height, total, |mut row| {
                     let idx = row.index();
-                    let Some(article) = self.items.get(idx) else { return };
+                    let Some(article) = self.items.get(idx) else {
+                        return;
+                    };
                     let selected = self.selected_index == Some(idx);
                     row.set_selected(selected);
 
                     let cells = [
-                        row.col(|ui| { ui.label(article.reg_date.as_deref().unwrap_or("—")); }).1,
-                        row.col(|ui| { ui.add(egui::Label::new(article.title.as_deref().unwrap_or("(untitled)")).truncate()); }).1,
-                        row.col(|ui| { ui.label(article.category.as_deref().unwrap_or("—")); }).1,
-                        row.col(|ui| { ui.label(article.total_score.map(|s| s.to_string()).unwrap_or_else(|| "—".into())); }).1,
-                        row.col(|ui| { ui.label(article.priority.as_deref().unwrap_or("—")); }).1,
+                        row.col(|ui| {
+                            ui.label(article.reg_date.as_deref().unwrap_or("—"));
+                        })
+                        .1,
+                        row.col(|ui| {
+                            ui.add(
+                                egui::Label::new(article.title.as_deref().unwrap_or("(untitled)"))
+                                    .truncate(),
+                            );
+                        })
+                        .1,
+                        row.col(|ui| {
+                            ui.label(article.category.as_deref().unwrap_or("—"));
+                        })
+                        .1,
+                        row.col(|ui| {
+                            ui.label(
+                                article
+                                    .total_score
+                                    .map(|s| s.to_string())
+                                    .unwrap_or_else(|| "—".into()),
+                            );
+                        })
+                        .1,
+                        row.col(|ui| {
+                            ui.label(article.priority.as_deref().unwrap_or("—"));
+                        })
+                        .1,
                     ];
                     if cells.iter().any(|r| r.clicked()) {
                         selected_uid_click = Some((article.uid.clone(), idx));
@@ -356,13 +405,41 @@ impl Panel {
                                 detail_kv(ui, "Reg date", article.reg_date.as_deref());
                                 detail_kv(ui, "Category", article.category.as_deref());
                                 detail_kv(ui, "Tier", article.priority.as_deref());
-                                detail_kv(ui, "Total score", article.total_score.map(|v| v.to_string()).as_deref());
-                                detail_kv(ui, "Scholarly rigor", article.scholarly_rigor.map(|v| v.to_string()).as_deref());
-                                detail_kv(ui, "Novelty", article.novelty.map(|v| v.to_string()).as_deref());
-                                detail_kv(ui, "Relevance", article.relevance_score.map(|v| v.to_string()).as_deref());
-                                detail_kv(ui, "Practical impact", article.practical_impact.map(|v| v.to_string()).as_deref());
-                                detail_kv(ui, "Interdisciplinary", article.interdisciplinary.map(|v| v.to_string()).as_deref());
-                                detail_kv(ui, "Critical concerns", article.critical_concerns.map(|v| v.to_string()).as_deref());
+                                detail_kv(
+                                    ui,
+                                    "Total score",
+                                    article.total_score.map(|v| v.to_string()).as_deref(),
+                                );
+                                detail_kv(
+                                    ui,
+                                    "Scholarly rigor",
+                                    article.scholarly_rigor.map(|v| v.to_string()).as_deref(),
+                                );
+                                detail_kv(
+                                    ui,
+                                    "Novelty",
+                                    article.novelty.map(|v| v.to_string()).as_deref(),
+                                );
+                                detail_kv(
+                                    ui,
+                                    "Relevance",
+                                    article.relevance_score.map(|v| v.to_string()).as_deref(),
+                                );
+                                detail_kv(
+                                    ui,
+                                    "Practical impact",
+                                    article.practical_impact.map(|v| v.to_string()).as_deref(),
+                                );
+                                detail_kv(
+                                    ui,
+                                    "Interdisciplinary",
+                                    article.interdisciplinary.map(|v| v.to_string()).as_deref(),
+                                );
+                                detail_kv(
+                                    ui,
+                                    "Critical concerns",
+                                    article.critical_concerns.map(|v| v.to_string()).as_deref(),
+                                );
                             });
                         ui.add_space(8.0);
                         detail_block(ui, "Byline summary", article.byline_summary.as_deref());
@@ -415,7 +492,9 @@ impl Panel {
 
     fn fetch(&mut self, ctx: &PanelCtx<'_>) {
         self.loading = true;
-        let Some(channel) = self.channel.as_ref() else { return };
+        let Some(channel) = self.channel.as_ref() else {
+            return;
+        };
         let tx = channel.tx.clone();
         let svc = ctx.state.article_service.clone();
         let query = build_query(&self.filters, self.page, self.page_size);
@@ -459,7 +538,9 @@ fn detail_kv(ui: &mut egui::Ui, label: &str, value: Option<&str>) {
 }
 
 fn detail_block(ui: &mut egui::Ui, label: &str, value: Option<&str>) {
-    let Some(value) = value.filter(|s| !s.is_empty()) else { return };
+    let Some(value) = value.filter(|s| !s.is_empty()) else {
+        return;
+    };
     ui.add_space(4.0);
     ui.label(egui::RichText::new(label).strong());
     ui.label(value);

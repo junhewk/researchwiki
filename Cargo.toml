@@ -36,6 +36,9 @@ uuid = { version = "1.18.1", features = ["v4", "serde"] }
 winit = "=0.30.11"
 zerocopy = { version = "0.8", features = ["derive"] }
 
+[target.'cfg(target_os = "windows")'.dependencies]
+tray-icon = { version = "0.23.1", default-features = false }
+
 [profile.release]
 lto = "thin"
 codegen-units = 1

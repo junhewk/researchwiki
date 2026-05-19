@@ -17,21 +17,21 @@
 //! Reads config from env (LLM_*, OPENAI_API_KEY) and from the persisted
 //! settings.json, exactly like the desktop app.
 
-use std::{sync::Arc, time::{Duration, Instant}};
+use std::{
+    sync::Arc,
+    time::{Duration, Instant},
+};
 
 use anyhow::{Context, Result, bail};
 use reqwest::Client;
 use researchwiki::{
     config::{AppConfig, EmbeddingConfig, LlmConfig},
-    init_tracing, register_sqlite_vec,
+    init_tracing,
     models::library::{SearchMode, SearchRequest},
+    register_sqlite_vec,
     services::{
-        embedding::EmbeddingService,
-        library::LibraryService,
-        llm::LlmService,
-        prompts::PromptService,
-        settings::load_overrides_sync,
-        traces::TraceService,
+        embedding::EmbeddingService, library::LibraryService, llm::LlmService,
+        prompts::PromptService, settings::load_overrides_sync, traces::TraceService,
     },
 };
 use rusqlite::{Connection, params};
@@ -249,7 +249,14 @@ async fn main() -> Result<()> {
     };
 
     println!("\n[search] query = {query:?}");
-    run_search(&library_service, &query, SearchMode::Keyword, "keyword (FTS5)", &mut s).await;
+    run_search(
+        &library_service,
+        &query,
+        SearchMode::Keyword,
+        "keyword (FTS5)",
+        &mut s,
+    )
+    .await;
     if embed_ready {
         run_search(
             &library_service,
@@ -268,10 +275,7 @@ async fn main() -> Result<()> {
         )
         .await;
     } else {
-        s.skip(
-            "semantic (sqlite-vec)",
-            "embedding endpoint not configured",
-        );
+        s.skip("semantic (sqlite-vec)", "embedding endpoint not configured");
         s.skip("hybrid (RRF)", "embedding endpoint not configured");
     }
 
@@ -346,7 +350,10 @@ async fn probe_embedding(embed: &EmbeddingConfig) -> Result<String> {
     if !embed.api_key.is_empty() {
         req = req.bearer_auth(&embed.api_key);
     }
-    let resp = req.send().await.with_context(|| format!("POST {endpoint}"))?;
+    let resp = req
+        .send()
+        .await
+        .with_context(|| format!("POST {endpoint}"))?;
     let status = resp.status();
     let body_text = resp.text().await?;
     if !status.is_success() {
@@ -470,8 +477,7 @@ async fn cleanup_test_article(config: &AppConfig, uid: &str) -> Result<()> {
         // vec0 tables have no FK so we have to delete their rows manually
         // before the haie_rev cascade nukes article_chunks.
         let chunk_ids: Vec<i64> = {
-            let mut stmt =
-                conn.prepare("SELECT id FROM article_chunks WHERE article_uid = ?1")?;
+            let mut stmt = conn.prepare("SELECT id FROM article_chunks WHERE article_uid = ?1")?;
             stmt.query_map([&uid], |row| row.get::<_, i64>(0))?
                 .collect::<Result<_, _>>()?
         };

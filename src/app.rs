@@ -15,6 +15,7 @@ use crate::{
     runtime::{DesktopRuntime, UiEvent},
     services::{scheduler::run_scheduler_loop, settings::SettingsService},
     state::AppState,
+    tray::{TrayCommand, TrayController},
     ui::{
         first_run::{FirstRunForm, FirstRunOutcome},
         panels::{PanelCtx, Panels, Tab},
@@ -43,6 +44,9 @@ pub struct DesktopApp {
     shutdown_rx: watch::Receiver<bool>,
     ui_tx: mpsc::UnboundedSender<UiEvent>,
     ui_rx: mpsc::UnboundedReceiver<UiEvent>,
+    tray: Option<TrayController>,
+    tray_error_reported: bool,
+    hidden_to_tray: bool,
     first_run: FirstRunForm,
     panels: Panels,
     persistent: PersistentUi,
@@ -50,7 +54,11 @@ pub struct DesktopApp {
 }
 
 impl DesktopApp {
-    pub fn new(cc: &eframe::CreationContext<'_>, runtime: DesktopRuntime, config: AppConfig) -> Self {
+    pub fn new(
+        cc: &eframe::CreationContext<'_>,
+        runtime: DesktopRuntime,
+        config: AppConfig,
+    ) -> Self {
         let persistent = cc
             .storage
             .and_then(|storage| eframe::get_value::<PersistentUi>(storage, PERSIST_KEY))
@@ -70,6 +78,9 @@ impl DesktopApp {
             shutdown_rx: runtime.shutdown_rx,
             ui_tx: runtime.ui_tx,
             ui_rx: runtime.ui_rx,
+            tray: None,
+            tray_error_reported: false,
+            hidden_to_tray: false,
             first_run: FirstRunForm::default(),
             panels: Panels::default(),
             persistent,
@@ -102,9 +113,11 @@ impl DesktopApp {
         let scheduler_job = state.job_service.clone();
         let scheduler_settings = state.settings_service.clone();
         let shutdown_rx = self.shutdown_rx.clone();
-        let scheduler = self
-            .handle
-            .spawn(run_scheduler_loop(scheduler_job, scheduler_settings, shutdown_rx));
+        let scheduler = self.handle.spawn(run_scheduler_loop(
+            scheduler_job,
+            scheduler_settings,
+            shutdown_rx,
+        ));
 
         self.scheduler = Some(scheduler);
         self.state = Some(state);
@@ -115,10 +128,18 @@ impl DesktopApp {
         while let Ok(evt) = self.ui_rx.try_recv() {
             match evt {
                 UiEvent::Status(msg) => self.status = Some(msg),
-                UiEvent::JobProgress { run_id, step, message } => {
+                UiEvent::JobProgress {
+                    run_id,
+                    step,
+                    message,
+                } => {
                     self.status = Some(format!("[{run_id}] {step}: {message}"));
                 }
-                UiEvent::JobFinished { run_id, success, message } => {
+                UiEvent::JobFinished {
+                    run_id,
+                    success,
+                    message,
+                } => {
                     let outcome = if success { "ok" } else { "failed" };
                     self.status = Some(match message {
                         Some(m) => format!("[{run_id}] {outcome}: {m}"),
@@ -128,10 +149,66 @@ impl DesktopApp {
             }
         }
     }
+
+    fn ensure_tray(&mut self, ctx: &egui::Context) {
+        if self.tray.is_some() || self.tray_error_reported {
+            return;
+        }
+
+        match TrayController::new(ctx) {
+            Ok(tray) => self.tray = Some(tray),
+            Err(err) => {
+                self.tray_error_reported = true;
+                warn!("failed to initialize system tray: {err:#}");
+                self.status = Some(format!("System tray unavailable: {err}"));
+            }
+        }
+    }
+
+    fn handle_tray(&mut self, ctx: &egui::Context) {
+        let Some(tray) = self.tray.as_mut() else {
+            return;
+        };
+
+        for command in tray.drain_commands() {
+            match command {
+                TrayCommand::Show => self.restore_from_tray(ctx),
+                TrayCommand::Quit => {
+                    self.hidden_to_tray = false;
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                }
+            }
+        }
+    }
+
+    fn restore_from_tray(&mut self, ctx: &egui::Context) {
+        self.hidden_to_tray = false;
+        ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
+        ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
+        ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+        self.status = Some("Restored from system tray.".to_string());
+    }
+
+    fn hide_to_tray_if_minimized(&mut self, ctx: &egui::Context) {
+        if self.hidden_to_tray {
+            return;
+        }
+
+        let minimized = ctx.input(|input| input.viewport().minimized.unwrap_or(false));
+        if minimized {
+            self.hidden_to_tray = true;
+            ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
+            self.status = Some("Minimized to system tray. Scheduler remains active.".to_string());
+        }
+    }
 }
 
 impl eframe::App for DesktopApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        self.ensure_tray(ctx);
+        self.handle_tray(ctx);
+        self.hide_to_tray_if_minimized(ctx);
         self.drain_events();
 
         if self.state.is_none() {
@@ -188,9 +265,9 @@ impl eframe::App for DesktopApp {
         info!("desktop app exiting; signalling scheduler shutdown");
         let _ = self.shutdown_tx.send(true);
         if let Some(scheduler) = self.scheduler.take() {
-            let _ = self.handle.block_on(async move {
-                timeout(Duration::from_secs(5), scheduler).await
-            });
+            let _ = self
+                .handle
+                .block_on(async move { timeout(Duration::from_secs(5), scheduler).await });
         }
     }
 }
@@ -199,8 +276,7 @@ impl eframe::App for DesktopApp {
 pub fn first_launch_seed(config: &AppConfig) -> Result<()> {
     let storage = &config.storage;
     if let Some(parent) = storage.database_path.parent() {
-        std::fs::create_dir_all(parent)
-            .with_context(|| format!("failed to create {parent:?}"))?;
+        std::fs::create_dir_all(parent).with_context(|| format!("failed to create {parent:?}"))?;
     }
     std::fs::create_dir_all(&storage.prompts_dir)
         .with_context(|| format!("failed to create {:?}", storage.prompts_dir))?;

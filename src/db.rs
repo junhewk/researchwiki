@@ -348,8 +348,7 @@ fn schema_matches(conn: &Connection, name: &str, expected_schema: &str) -> bool 
             |row| row.get(0),
         )
         .unwrap_or(None);
-    sql.as_deref()
-        .is_some_and(|s| s.contains(expected_schema))
+    sql.as_deref().is_some_and(|s| s.contains(expected_schema))
 }
 
 fn create_fts_table(conn: &Connection) -> Result<()> {
