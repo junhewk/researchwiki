@@ -8,6 +8,7 @@ Single-binary Windows desktop app built on egui/eframe. Data lives at `%APPDATA%
 
 - Gather articles manually from any supported source, or run all sources from the Gather tab.
 - Track queued/running gather jobs with live counters, cancel active jobs, and inspect run history/events.
+- Use Gather's smoke-test controls to run a source through gather + KG creation, start KG/wiki backfills, and verify the scheduler by arming a real next-minute scheduled run.
 - Configure daily scheduled gathers from Settings.
 - On Windows, minimizing the app hides it to the system tray while the in-process scheduler keeps running. Use the tray icon to restore the window or quit the app.
 
@@ -29,6 +30,7 @@ Requires:
 
 - Scheduled gathers only run while the app process is alive.
 - Closing or quitting the app stops the scheduler; minimizing on Windows keeps it running from the system tray.
+- The Gather scheduler test temporarily changes one source schedule, waits for the normal scheduler loop to enqueue it, then restores the previous scheduler settings.
 
 ## License
 

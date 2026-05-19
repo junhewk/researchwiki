@@ -22,7 +22,7 @@ pub async fn run_scheduler_loop(
 ) {
     info!("scheduler loop started");
 
-    let mut last_fired: HashMap<&str, NaiveDate> = HashMap::new();
+    let mut last_fired: HashMap<&str, (NaiveDate, u8, u8)> = HashMap::new();
     let kst = FixedOffset::east_opt(9 * 3600).expect("valid KST offset");
 
     let mut interval = tokio::time::interval(TICK_INTERVAL);
@@ -65,7 +65,7 @@ pub async fn run_scheduler_loop(
                 continue;
             }
 
-            if last_fired.get(source) == Some(&today_kst) {
+            if last_fired.get(source) == Some(&(today_kst, sched_hour, sched_minute)) {
                 continue;
             }
 
@@ -93,11 +93,11 @@ pub async fn run_scheduler_loop(
                 }
             }
 
-            last_fired.insert(source, today_kst);
+            last_fired.insert(source, (today_kst, sched_hour, sched_minute));
         }
 
         // Prune stale entries.
-        last_fired.retain(|_, date| *date >= today_kst);
+        last_fired.retain(|_, (date, _, _)| *date >= today_kst);
     }
 
     info!("scheduler loop exited");
