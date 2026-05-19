@@ -1,12 +1,18 @@
 use reqwest::Client;
-use tokio::sync::Semaphore;
+use tokio::{process::Command, sync::Semaphore, time::timeout};
 use tracing::{debug, info, warn};
 
 use crate::{error::AppError, services::pipeline::ArticleCandidate};
 
-use std::sync::Arc;
+use std::{env, sync::Arc, time::Duration};
 
 const NCBI_EFETCH_URL: &str = "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/efetch.fcgi";
+const MARKITDOWN_COMMAND_ENV: &str = "MARKITDOWN_COMMAND";
+const MARKITDOWN_TIMEOUT: Duration = Duration::from_secs(120);
+const SCORING_ABSTRACT_CHARS: usize = 4_000;
+const SCORING_SECTION_CHARS: usize = 2_500;
+const SCORING_SECTION_LIMIT: usize = 4;
+const SCORING_TEXT_MAX_CHARS: usize = 14_000;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ContentType {
@@ -62,17 +68,15 @@ impl ContentFetcher {
     pub async fn fetch(&self, candidate: &ArticleCandidate) -> Option<FetchedContent> {
         let strategies: &[(&str, fn(&ArticleCandidate) -> bool)] = &[
             ("arxiv_pdf", |c| c.source == "arxiv"),
+            ("arxiv_abstract", |c| {
+                c.source == "arxiv" && has_candidate_summary(c)
+            }),
             ("pmc_xml", |c| c.source == "pmc"),
             ("publisher_transform", |c| can_publisher_transform(c)),
             ("pubmed_abstract", |c| {
                 c.source == "pubmed" || c.source == "pmc"
             }),
-            ("candidate_summary", |c| {
-                c.summary
-                    .as_deref()
-                    .map(str::trim)
-                    .is_some_and(|value| !value.is_empty())
-            }),
+            ("candidate_summary", has_candidate_summary),
         ];
 
         for &(name, can_fetch) in strategies {
@@ -126,6 +130,7 @@ impl ContentFetcher {
         candidate: &ArticleCandidate,
     ) -> Result<Option<FetchedContent>, AppError> {
         match name {
+            "arxiv_abstract" => self.fetch_arxiv_abstract(candidate).await,
             "arxiv_pdf" => self.fetch_arxiv_pdf(candidate).await,
             "pmc_xml" => self.fetch_pmc_xml(candidate).await,
             "publisher_transform" => self.fetch_publisher_transform(candidate).await,
@@ -133,6 +138,14 @@ impl ContentFetcher {
             "candidate_summary" => self.fetch_candidate_summary(candidate).await,
             _ => Ok(None),
         }
+    }
+
+    async fn fetch_arxiv_abstract(
+        &self,
+        candidate: &ArticleCandidate,
+    ) -> Result<Option<FetchedContent>, AppError> {
+        self.fetch_candidate_summary_with_method(candidate, "arxiv_abstract")
+            .await
     }
 
     async fn fetch_arxiv_pdf(
@@ -162,10 +175,36 @@ impl ContentFetcher {
             return Ok(None);
         }
 
+        let markdown = match pdf_to_markdown_with_markitdown(&bytes).await {
+            Ok(Some(markdown)) => markdown,
+            Ok(None) => {
+                warn!(
+                    "MarkItDown returned no Markdown for {}; falling back to abstract",
+                    candidate.uid()
+                );
+                return Ok(None);
+            }
+            Err(error) => {
+                warn!(
+                    "MarkItDown PDF conversion failed for {}: {error}; falling back to abstract",
+                    candidate.uid()
+                );
+                return Ok(None);
+            }
+        };
+
+        let Some(scoring_text) = build_arxiv_scoring_text(candidate, &markdown) else {
+            warn!(
+                "MarkItDown produced no scoring sections for {}; falling back to abstract",
+                candidate.uid()
+            );
+            return Ok(None);
+        };
+
         Ok(Some(FetchedContent {
             content_type: ContentType::Pdf,
-            content: ContentData::Binary(bytes.to_vec()),
-            fetch_method: "arxiv_pdf".to_string(),
+            content: ContentData::Text(scoring_text),
+            fetch_method: "arxiv_pdf_markitdown_scoring".to_string(),
         }))
     }
 
@@ -317,6 +356,15 @@ impl ContentFetcher {
         &self,
         candidate: &ArticleCandidate,
     ) -> Result<Option<FetchedContent>, AppError> {
+        self.fetch_candidate_summary_with_method(candidate, "candidate_summary")
+            .await
+    }
+
+    async fn fetch_candidate_summary_with_method(
+        &self,
+        candidate: &ArticleCandidate,
+        fetch_method: &str,
+    ) -> Result<Option<FetchedContent>, AppError> {
         let Some(summary) = candidate
             .summary
             .as_deref()
@@ -329,8 +377,310 @@ impl ContentFetcher {
         Ok(Some(FetchedContent {
             content_type: ContentType::AbstractOnly,
             content: ContentData::Text(summary.to_string()),
-            fetch_method: "candidate_summary".to_string(),
+            fetch_method: fetch_method.to_string(),
         }))
+    }
+}
+
+fn has_candidate_summary(candidate: &ArticleCandidate) -> bool {
+    candidate
+        .summary
+        .as_deref()
+        .map(str::trim)
+        .is_some_and(|value| !value.is_empty())
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct MarkdownSection {
+    heading: String,
+    body: String,
+}
+
+fn build_arxiv_scoring_text(candidate: &ArticleCandidate, markdown: &str) -> Option<String> {
+    let sections = selected_scoring_sections(markdown);
+    if sections.is_empty() {
+        return None;
+    }
+
+    let mut text = String::new();
+    text.push_str("# Title\n");
+    text.push_str(candidate.title.trim());
+    text.push_str("\n\n");
+
+    if let Some(summary) = candidate
+        .summary
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        text.push_str("## Abstract (selection basis)\n");
+        text.push_str(&truncate_chars(summary, SCORING_ABSTRACT_CHARS));
+        text.push_str("\n\n");
+    }
+
+    text.push_str("## Selected PDF evidence for scoring\n");
+    for section in sections.into_iter().take(SCORING_SECTION_LIMIT) {
+        text.push_str("### ");
+        text.push_str(section.heading.trim());
+        text.push('\n');
+        text.push_str(&truncate_chars(section.body.trim(), SCORING_SECTION_CHARS));
+        text.push_str("\n\n");
+
+        if text.chars().count() >= SCORING_TEXT_MAX_CHARS {
+            break;
+        }
+    }
+
+    Some(truncate_chars(&text, SCORING_TEXT_MAX_CHARS))
+}
+
+fn selected_scoring_sections(markdown: &str) -> Vec<MarkdownSection> {
+    let mut sections = Vec::new();
+    let mut current_heading = None::<String>;
+    let mut current_body = String::new();
+
+    for line in markdown.lines() {
+        if let Some(heading) = parse_section_heading(line) {
+            push_markdown_section(&mut sections, current_heading.take(), &mut current_body);
+            current_heading = Some(heading);
+            continue;
+        }
+
+        if current_heading.is_some() {
+            current_body.push_str(line);
+            current_body.push('\n');
+        }
+    }
+
+    push_markdown_section(&mut sections, current_heading, &mut current_body);
+
+    sections
+        .into_iter()
+        .filter(|section| is_scoring_heading(&section.heading) && !section.body.trim().is_empty())
+        .collect()
+}
+
+fn push_markdown_section(
+    sections: &mut Vec<MarkdownSection>,
+    heading: Option<String>,
+    body: &mut String,
+) {
+    if let Some(heading) = heading {
+        let trimmed_body = body.trim();
+        if !trimmed_body.is_empty() {
+            sections.push(MarkdownSection {
+                heading,
+                body: trimmed_body.to_string(),
+            });
+        }
+    }
+    body.clear();
+}
+
+fn parse_section_heading(line: &str) -> Option<String> {
+    let trimmed = line.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+
+    if trimmed.starts_with('#') {
+        let heading = trimmed.trim_start_matches('#').trim();
+        return (!heading.is_empty()).then(|| clean_heading(heading));
+    }
+
+    if !looks_like_plain_heading(trimmed) {
+        return None;
+    }
+
+    let heading = clean_heading(trimmed);
+    (is_common_paper_heading(&heading) || is_scoring_heading(&heading)).then_some(heading)
+}
+
+fn looks_like_plain_heading(line: &str) -> bool {
+    let char_count = line.chars().count();
+    if !(3..=80).contains(&char_count) {
+        return false;
+    }
+    if line.ends_with('.') || line.ends_with(',') || line.contains("  ") {
+        return false;
+    }
+    line.split_whitespace().count() <= 8
+}
+
+fn clean_heading(heading: &str) -> String {
+    let without_number = heading
+        .trim()
+        .trim_start_matches(|character: char| {
+            character.is_ascii_digit() || matches!(character, '.' | ')' | '(' | '-' | ':' | ' ')
+        })
+        .trim();
+    let cleaned = without_number
+        .trim_matches(|character: char| matches!(character, ':' | '.' | '-' | ' '))
+        .trim();
+
+    if cleaned.is_empty() {
+        heading.trim().to_string()
+    } else {
+        cleaned.to_string()
+    }
+}
+
+fn is_scoring_heading(heading: &str) -> bool {
+    let heading = heading.to_lowercase();
+    [
+        "result",
+        "finding",
+        "discussion",
+        "conclusion",
+        "evaluation",
+        "experiment",
+        "analysis",
+        "limitation",
+        "implication",
+    ]
+    .iter()
+    .any(|keyword| heading.contains(keyword))
+}
+
+fn is_common_paper_heading(heading: &str) -> bool {
+    let heading = heading.to_lowercase();
+    [
+        "abstract",
+        "introduction",
+        "background",
+        "related work",
+        "methods",
+        "method",
+        "materials and methods",
+        "study design",
+        "results",
+        "findings",
+        "discussion",
+        "conclusion",
+        "references",
+        "bibliography",
+        "acknowledgments",
+        "acknowledgements",
+        "appendix",
+        "supplement",
+    ]
+    .iter()
+    .any(|keyword| heading == *keyword || heading.contains(keyword))
+}
+
+fn truncate_chars(text: &str, limit: usize) -> String {
+    let mut chars = text.chars();
+    let truncated = chars.by_ref().take(limit).collect::<String>();
+    if chars.next().is_some() {
+        format!("{truncated}\n[truncated]")
+    } else {
+        truncated
+    }
+}
+
+async fn pdf_to_markdown_with_markitdown(bytes: &[u8]) -> Result<Option<String>, AppError> {
+    let path = env::temp_dir().join(format!(
+        "researchwiki-markitdown-{}.pdf",
+        uuid::Uuid::new_v4()
+    ));
+
+    let result = async {
+        tokio::fs::write(&path, bytes).await.map_err(|error| {
+            AppError::Internal(format!(
+                "failed to write temporary PDF for MarkItDown at {}: {error}",
+                path.display()
+            ))
+        })?;
+
+        let markdown = run_markitdown_commands(&path).await?;
+        Ok((!markdown.is_empty()).then_some(markdown))
+    }
+    .await;
+
+    if let Err(error) = tokio::fs::remove_file(&path).await {
+        debug!(
+            "failed to remove temporary MarkItDown PDF {}: {error}",
+            path.display()
+        );
+    }
+
+    result
+}
+
+async fn run_markitdown_commands(path: &std::path::Path) -> Result<String, AppError> {
+    let mut commands = Vec::<(String, Vec<String>)>::new();
+    if let Ok(command) = env::var(MARKITDOWN_COMMAND_ENV) {
+        let command = command.trim();
+        if !command.is_empty() {
+            commands.push((command.to_string(), Vec::new()));
+        }
+    }
+    commands.push(("markitdown".to_string(), Vec::new()));
+    commands.push((
+        "uvx".to_string(),
+        vec![
+            "--from".to_string(),
+            "markitdown[pdf]".to_string(),
+            "markitdown".to_string(),
+        ],
+    ));
+
+    let mut errors = Vec::new();
+    for (program, args) in commands {
+        match run_markitdown_command(&program, &args, path).await {
+            Ok(markdown) => return Ok(markdown),
+            Err(error) => errors.push(error.to_string()),
+        }
+    }
+
+    Err(AppError::Internal(format!(
+        "all MarkItDown command attempts failed: {}",
+        errors.join(" | ")
+    )))
+}
+
+async fn run_markitdown_command(
+    program: &str,
+    args: &[String],
+    path: &std::path::Path,
+) -> Result<String, AppError> {
+    let mut command = Command::new(program);
+    command.args(args).arg(path);
+    let output = timeout(MARKITDOWN_TIMEOUT, command.output())
+        .await
+        .map_err(|_| {
+            AppError::Internal(format!(
+                "{program} timed out after {} seconds",
+                MARKITDOWN_TIMEOUT.as_secs()
+            ))
+        })?;
+    let output = output.map_err(|error| {
+        AppError::Internal(format!(
+            "failed to run MarkItDown command '{}{}': {error}",
+            program,
+            format_command_args(args)
+        ))
+    })?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(AppError::Internal(format!(
+            "MarkItDown command '{}{}' exited with status {}: {}",
+            program,
+            format_command_args(args),
+            output.status,
+            stderr.trim()
+        )));
+    }
+
+    Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+}
+
+fn format_command_args(args: &[String]) -> String {
+    if args.is_empty() {
+        String::new()
+    } else {
+        format!(" {}", args.join(" "))
     }
 }
 
@@ -344,4 +694,98 @@ fn can_publisher_transform(candidate: &ArticleCandidate) -> bool {
                 .iter()
                 .any(|publisher| doi.contains(publisher))
         })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn candidate_summary_detection_trims_whitespace() {
+        let mut candidate = test_candidate();
+        candidate.summary = Some("  ".to_string());
+        assert!(!has_candidate_summary(&candidate));
+
+        candidate.summary = Some("Useful abstract".to_string());
+        assert!(has_candidate_summary(&candidate));
+    }
+
+    #[test]
+    fn formats_markitdown_command_args() {
+        assert_eq!(format_command_args(&[]), "");
+        assert_eq!(
+            format_command_args(&[
+                "--from".to_string(),
+                "markitdown[pdf]".to_string(),
+                "markitdown".to_string()
+            ]),
+            " --from markitdown[pdf] markitdown"
+        );
+    }
+
+    #[test]
+    fn arxiv_scoring_text_keeps_abstract_and_selected_sections() {
+        let mut candidate = test_candidate();
+        candidate.summary = Some("This is the abstract used for selection.".to_string());
+        let markdown = r#"
+# Paper title
+
+## Methods
+This method text should not be included.
+
+## Results
+The intervention improved the primary outcome.
+
+## Discussion
+The finding changes the interpretation of prior work.
+
+## References
+Reference text should not be included.
+"#;
+
+        let text = build_arxiv_scoring_text(&candidate, markdown).unwrap();
+
+        assert!(text.contains("This is the abstract used for selection."));
+        assert!(text.contains("## Selected PDF evidence for scoring"));
+        assert!(text.contains("### Results"));
+        assert!(text.contains("The intervention improved the primary outcome."));
+        assert!(text.contains("### Discussion"));
+        assert!(!text.contains("This method text should not be included."));
+        assert!(!text.contains("Reference text should not be included."));
+    }
+
+    #[test]
+    fn selected_scoring_sections_support_plain_headings() {
+        let markdown = r#"
+INTRODUCTION
+Background text.
+
+RESULTS
+Observed effect size was large.
+
+REFERENCES
+Ignored reference.
+"#;
+
+        let sections = selected_scoring_sections(markdown);
+
+        assert_eq!(sections.len(), 1);
+        assert_eq!(sections[0].heading, "RESULTS");
+        assert_eq!(sections[0].body, "Observed effect size was large.");
+    }
+
+    fn test_candidate() -> ArticleCandidate {
+        ArticleCandidate {
+            source: "arxiv".to_string(),
+            source_id: "2605.00001".to_string(),
+            title: "Test title".to_string(),
+            summary: None,
+            first_author: "Unknown".to_string(),
+            authors: None,
+            pub_date: None,
+            journal: Some("arXiv".to_string()),
+            doi: None,
+            url: "https://arxiv.org/pdf/2605.00001.pdf".to_string(),
+        }
+    }
 }

@@ -1,14 +1,21 @@
-use std::{collections::BTreeMap, sync::Arc, time::Duration};
+use std::{
+    collections::BTreeMap,
+    sync::Arc,
+    time::{Duration, Instant},
+};
 
 use anyhow::{Context, Result, anyhow, bail};
-use chrono::{Datelike, Days, NaiveDate, Utc};
+use chrono::{DateTime, Datelike, Days, NaiveDate, Utc};
 use quick_xml::{Reader, events::Event};
-use reqwest::{Client, StatusCode};
+use reqwest::{Client, StatusCode, header};
 use rusqlite::{Connection, params};
 use serde_json::Value;
-use tokio::task;
+use tokio::{sync::Mutex, task};
 
 const ARXIV_API_URL: &str = "https://export.arxiv.org/api/query";
+const ARXIV_OAI_URL: &str = "https://oaipmh.arxiv.org/oai";
+const ARXIV_MIN_REQUEST_INTERVAL: Duration = Duration::from_secs(3);
+const ARXIV_MAX_RETRY_DELAY: Duration = Duration::from_secs(15 * 60);
 const NCBI_ESEARCH_URL: &str = "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/esearch.fcgi";
 const NCBI_ESUMMARY_URL: &str = "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/esummary.fcgi";
 const NCBI_ELINK_URL: &str = "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/elink.fcgi";
@@ -29,6 +36,16 @@ const ARXIV_QUERIES: &[&str] = &[
     r#"(all:"human in the loop" OR all:"human oversight") AND (all:healthcare OR all:clinical OR all:medical)"#,
     r#"(all:"AI governance" OR all:"algorithmic fairness") AND (all:healthcare OR all:clinical OR all:medical)"#,
 ];
+
+const ARXIV_OAI_SETS: &[&str] = &[
+    "cs:cs:AI",
+    "cs:cs:LG",
+    "cs:cs:CL",
+    "cs:cs:CY",
+    "cs:cs:HC",
+    "stat:stat:ML",
+];
+const ARXIV_OAI_MAX_PAGES_PER_SET: usize = 4;
 
 const PMC_QUERY: &str = r#"("artificial intelligence"[All Fields] OR "machine learning"[All Fields] OR "large language model"[All Fields] OR "clinical decision support"[All Fields]) AND (ethics[All Fields] OR bias[All Fields] OR fairness[All Fields] OR privacy[All Fields] OR governance[All Fields] OR accountability[All Fields]) AND open access[filter]"#;
 const PUBMED_QUERY: &str = r#"(("Artificial Intelligence"[Mesh] OR "Machine Learning"[Mesh] OR "artificial intelligence"[Title/Abstract] OR "machine learning"[Title/Abstract] OR "large language model"[Title/Abstract] OR "clinical decision support"[Title/Abstract]) AND (ethics[Title/Abstract] OR bias[Title/Abstract] OR fairness[Title/Abstract] OR privacy[Title/Abstract] OR governance[Title/Abstract] OR accountability[Title/Abstract]) AND hasabstract[text])"#;
@@ -78,6 +95,37 @@ pub const GATHER_SOURCE_IDS: &[&str] = &[
 pub struct PipelineService {
     database_path: Arc<std::path::PathBuf>,
     client: Client,
+    arxiv_limiter: Arc<Mutex<ArxivRequestLimiter>>,
+}
+
+#[derive(Debug, Default)]
+struct ArxivRequestLimiter {
+    next_request_at: Option<Instant>,
+}
+
+impl ArxivRequestLimiter {
+    async fn wait_for_turn(&mut self) {
+        let Some(next_request_at) = self.next_request_at else {
+            return;
+        };
+
+        let now = Instant::now();
+        if next_request_at > now {
+            tokio::time::sleep(next_request_at.duration_since(now)).await;
+        }
+    }
+
+    fn mark_request_started(&mut self) {
+        self.next_request_at = Some(Instant::now() + ARXIV_MIN_REQUEST_INTERVAL);
+    }
+
+    fn defer_for(&mut self, delay: Duration) {
+        let next_request_at = Instant::now() + delay.max(ARXIV_MIN_REQUEST_INTERVAL);
+        self.next_request_at = Some(match self.next_request_at {
+            Some(existing) => existing.max(next_request_at),
+            None => next_request_at,
+        });
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -104,7 +152,7 @@ pub struct SaveCounters {
 impl PipelineService {
     pub fn new(database_path: std::path::PathBuf) -> Self {
         let client = Client::builder()
-            .user_agent("articlegatherer-rust-backend/0.1")
+            .user_agent(POLITE_POOL_UA)
             .timeout(std::time::Duration::from_secs(60))
             .build()
             .expect("reqwest client should build");
@@ -112,6 +160,7 @@ impl PipelineService {
         Self {
             database_path: Arc::new(database_path),
             client,
+            arxiv_limiter: Arc::new(Mutex::new(ArxivRequestLimiter::default())),
         }
     }
 
@@ -145,7 +194,18 @@ impl PipelineService {
         task::spawn_blocking(move || {
             let conn = crate::db::open_connection(&*database_path)?;
             let placeholders = vec!["?"; uids.len()].join(", ");
-            let sql = format!("SELECT uid FROM haie_rev WHERE uid IN ({placeholders})");
+            let sql = format!(
+                "SELECT uid FROM haie_rev
+                 WHERE uid IN ({placeholders})
+                   AND scholarly_rigor IS NOT NULL
+                   AND novelty IS NOT NULL
+                   AND relevance_score IS NOT NULL
+                   AND practical_impact IS NOT NULL
+                   AND interdisciplinary IS NOT NULL
+                   AND critical_concerns IS NOT NULL
+                   AND total_score IS NOT NULL
+                   AND priority IS NOT NULL"
+            );
             let params: Vec<rusqlite::types::Value> =
                 uids.into_iter().map(rusqlite::types::Value::Text).collect();
             let mut stmt = conn.prepare(&sql)?;
@@ -192,11 +252,106 @@ impl PipelineService {
             .checked_sub_days(Days::new(days_back.max(1) as u64))
             .unwrap_or(today);
 
+        match self.list_arxiv_oai(start, today).await {
+            Ok(candidates) => return Ok(candidates),
+            Err(error) => {
+                tracing::warn!(
+                    "arXiv OAI-PMH harvest failed; falling back to legacy search API: {error}"
+                );
+            }
+        }
+
+        self.list_arxiv_legacy_search(start, today).await
+    }
+
+    async fn list_arxiv_oai(
+        &self,
+        start: NaiveDate,
+        end: NaiveDate,
+    ) -> Result<Vec<ArticleCandidate>> {
+        let mut merged = std::collections::BTreeMap::<String, ArticleCandidate>::new();
+        let mut errors = Vec::new();
+
+        for (index, set) in ARXIV_OAI_SETS.iter().enumerate() {
+            if index > 0 {
+                tokio::time::sleep(ARXIV_MIN_REQUEST_INTERVAL).await;
+            }
+
+            match self.fetch_arxiv_oai_set(set, start, end).await {
+                Ok(candidates) => merge_candidates(&mut merged, candidates),
+                Err(error) => {
+                    tracing::warn!("arXiv OAI-PMH set '{set}' failed: {error}");
+                    errors.push(error);
+                }
+            }
+        }
+
+        finish_merged_source("arXiv OAI-PMH", merged, errors)
+    }
+
+    async fn fetch_arxiv_oai_set(
+        &self,
+        set: &str,
+        start: NaiveDate,
+        end: NaiveDate,
+    ) -> Result<Vec<ArticleCandidate>> {
+        let mut candidates = Vec::new();
+        let mut resumption_token = None::<String>;
+
+        for _ in 0..ARXIV_OAI_MAX_PAGES_PER_SET {
+            let body = if let Some(token) = resumption_token.as_deref() {
+                self.send_arxiv_oai_request(&[
+                    ("verb", "ListRecords".to_string()),
+                    ("resumptionToken", token.to_string()),
+                ])
+                .await?
+            } else {
+                self.send_arxiv_oai_request(&[
+                    ("verb", "ListRecords".to_string()),
+                    ("from", start.format("%Y-%m-%d").to_string()),
+                    ("until", end.format("%Y-%m-%d").to_string()),
+                    ("metadataPrefix", "arXiv".to_string()),
+                    ("set", set.to_string()),
+                ])
+                .await?
+            };
+
+            let page = parse_arxiv_oai_records(&body)?;
+            if page.no_records_match {
+                return Ok(filter_arxiv_oai_candidates(candidates));
+            }
+            candidates.extend(page.candidates);
+
+            let Some(token) = page.resumption_token else {
+                return Ok(filter_arxiv_oai_candidates(candidates));
+            };
+            if token.trim().is_empty() {
+                return Ok(filter_arxiv_oai_candidates(candidates));
+            }
+            resumption_token = Some(token);
+        }
+
+        if resumption_token.is_some() {
+            tracing::warn!(
+                set,
+                pages = ARXIV_OAI_MAX_PAGES_PER_SET,
+                "arXiv OAI-PMH page limit reached; using partial harvest"
+            );
+        }
+
+        Ok(filter_arxiv_oai_candidates(candidates))
+    }
+
+    async fn list_arxiv_legacy_search(
+        &self,
+        start: NaiveDate,
+        today: NaiveDate,
+    ) -> Result<Vec<ArticleCandidate>> {
         let mut merged = std::collections::BTreeMap::<String, ArticleCandidate>::new();
         let mut errors = Vec::new();
         for (index, query) in ARXIV_QUERIES.iter().enumerate() {
             if index > 0 {
-                tokio::time::sleep(Duration::from_secs(3)).await;
+                tokio::time::sleep(ARXIV_MIN_REQUEST_INTERVAL).await;
             }
             match self.fetch_arxiv_query(query, start, today).await {
                 Ok(candidates) => {
@@ -235,26 +390,16 @@ impl PipelineService {
 
         const MAX_ATTEMPTS: usize = 4;
         const RETRY_DELAYS: [Duration; 3] = [
-            Duration::from_secs(10),
-            Duration::from_secs(30),
-            Duration::from_secs(90),
+            Duration::from_secs(60),
+            Duration::from_secs(180),
+            Duration::from_secs(600),
         ];
 
         for attempt in 1..=MAX_ATTEMPTS {
-            let response = self
-                .client
-                .get(ARXIV_API_URL)
-                .query(&[
-                    ("search_query", search_query.as_str()),
-                    ("sortBy", "lastUpdatedDate"),
-                    ("sortOrder", "descending"),
-                    ("max_results", "100"),
-                ])
-                .send()
-                .await
-                .with_context(|| format!("failed to request arXiv query '{query}'"))?;
+            let response = self.send_arxiv_query_request(&search_query).await?;
 
             let status = response.status();
+            let retry_after = parse_retry_after(response.headers().get(header::RETRY_AFTER));
             let body = response
                 .text()
                 .await
@@ -267,9 +412,17 @@ impl PipelineService {
             let snippet = body.chars().take(240).collect::<String>();
             let retryable = status == StatusCode::TOO_MANY_REQUESTS || status.is_server_error();
             if retryable && attempt < MAX_ATTEMPTS {
-                let delay = RETRY_DELAYS[attempt - 1];
+                let delay = if status == StatusCode::TOO_MANY_REQUESTS {
+                    retry_after
+                        .unwrap_or(RETRY_DELAYS[attempt - 1])
+                        .max(RETRY_DELAYS[attempt - 1])
+                } else {
+                    RETRY_DELAYS[attempt - 1]
+                }
+                .min(ARXIV_MAX_RETRY_DELAY);
+                self.defer_arxiv_requests(delay).await;
                 tracing::warn!(
-                    "arXiv query '{query}' returned HTTP {}; retrying in {} seconds",
+                    "arXiv query '{query}' returned HTTP {}; backing off for {} seconds",
                     status.as_u16(),
                     delay.as_secs()
                 );
@@ -285,6 +438,59 @@ impl PipelineService {
         }
 
         unreachable!("arXiv retry loop always returns or bails")
+    }
+
+    async fn send_arxiv_query_request(&self, search_query: &str) -> Result<reqwest::Response> {
+        let mut limiter = self.arxiv_limiter.lock().await;
+        limiter.wait_for_turn().await;
+        limiter.mark_request_started();
+
+        self.client
+            .get(ARXIV_API_URL)
+            .query(&[
+                ("search_query", search_query),
+                ("sortBy", "lastUpdatedDate"),
+                ("sortOrder", "descending"),
+                ("max_results", "100"),
+            ])
+            .send()
+            .await
+            .context("failed to request arXiv query")
+    }
+
+    async fn send_arxiv_oai_request(&self, params: &[(&str, String)]) -> Result<String> {
+        let mut limiter = self.arxiv_limiter.lock().await;
+        limiter.wait_for_turn().await;
+        limiter.mark_request_started();
+
+        let response = self
+            .client
+            .get(ARXIV_OAI_URL)
+            .query(params)
+            .send()
+            .await
+            .context("failed to request arXiv OAI-PMH")?;
+        let status = response.status();
+        let body = response
+            .text()
+            .await
+            .context("failed to read arXiv OAI-PMH response body")?;
+
+        if status.is_success() {
+            return Ok(body);
+        }
+
+        let snippet = body.chars().take(240).collect::<String>();
+        bail!(
+            "arXiv OAI-PMH returned HTTP {}: {}",
+            status.as_u16(),
+            snippet
+        )
+    }
+
+    async fn defer_arxiv_requests(&self, delay: Duration) {
+        let mut limiter = self.arxiv_limiter.lock().await;
+        limiter.defer_for(delay);
     }
 
     async fn list_pmc(&self, days_back: i32) -> Result<Vec<ArticleCandidate>> {
@@ -1022,6 +1228,27 @@ fn parse_candidate_date(value: &str) -> Option<NaiveDate> {
         .or_else(|| NaiveDate::parse_from_str(value, "%Y/%m/%d").ok())
 }
 
+fn parse_retry_after(value: Option<&header::HeaderValue>) -> Option<Duration> {
+    let value = value?.to_str().ok()?.trim();
+    if value.is_empty() {
+        return None;
+    }
+
+    if let Ok(seconds) = value.parse::<u64>() {
+        return Some(Duration::from_secs(seconds));
+    }
+
+    let retry_at = DateTime::parse_from_rfc2822(value)
+        .ok()?
+        .with_timezone(&Utc);
+    let now = Utc::now();
+    if retry_at <= now {
+        return Some(ARXIV_MIN_REQUEST_INTERVAL);
+    }
+
+    retry_at.signed_duration_since(now).to_std().ok()
+}
+
 async fn pause_between_source_queries(index: usize) {
     if index > 0 {
         tokio::time::sleep(Duration::from_secs(1)).await;
@@ -1668,14 +1895,12 @@ fn save_article_sync(
     let pub_date = candidate.pub_date.clone().or_else(|| get_str("pub_date"));
     let journal = candidate.journal.clone().or_else(|| get_str("journal"));
 
-    let why_it_matters = get_str("why_it_matters").unwrap_or_else(|| {
-        if evaluation.is_some() {
-            String::new()
-        } else {
+    let why_it_matters = get_str("why_it_matters").or_else(|| {
+        evaluation.is_none().then(|| {
             format!(
                 "Imported from {category} metadata. Detailed Rust evaluation is not ported yet."
             )
-        }
+        })
     });
     let byline_summary = get_str("byline_summary").or_else(|| {
         if evaluation.is_none() {
@@ -1731,8 +1956,8 @@ fn save_article_sync(
             get_str("theoretical_weaknesses"),
             get_str("empirical_strengths"),
             get_str("empirical_weaknesses"),
-            byline_summary,
-            why_it_matters,
+            byline_summary.clone(),
+            why_it_matters.clone(),
             get_int("scholarly_rigor"),
             get_int("novelty"),
             get_int("relevance_score"),
@@ -1747,12 +1972,401 @@ fn save_article_sync(
     );
 
     match changed {
+        Ok(0) if evaluation.is_some() => {
+            counters.saved += update_existing_article_sync(
+                conn,
+                candidate,
+                &category,
+                &title,
+                &first_author,
+                candidate.authors.as_deref(),
+                pub_date.as_deref(),
+                journal.as_deref(),
+                candidate.doi.as_deref(),
+                get_str("ai_tech").as_deref(),
+                get_str("clinical_domain").as_deref(),
+                get_str("ethics_framework").as_deref(),
+                get_str("primary_issue").as_deref(),
+                get_str("key_stakeholders").as_deref(),
+                get_str("practical_impl").as_deref(),
+                get_str("secondary_issues").as_deref(),
+                get_str("key_argument").as_deref(),
+                get_str("main_findings").as_deref(),
+                get_str("normative_claims").as_deref(),
+                get_str("limitations").as_deref(),
+                get_str("theoretical_strengths").as_deref(),
+                get_str("theoretical_weaknesses").as_deref(),
+                get_str("empirical_strengths").as_deref(),
+                get_str("empirical_weaknesses").as_deref(),
+                byline_summary.as_deref(),
+                why_it_matters.as_deref(),
+                get_int("scholarly_rigor"),
+                get_int("novelty"),
+                get_int("relevance_score"),
+                get_int("practical_impact"),
+                get_int("interdisciplinary"),
+                get_int("critical_concerns"),
+                get_int("total_score"),
+                get_str("priority").as_deref(),
+                candidate.summary.as_deref(),
+            )? as i32;
+        }
         Ok(0) => counters.skipped += 1,
         Ok(_) => counters.saved += 1,
         Err(_) => counters.errors += 1,
     }
 
     Ok(counters)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn update_existing_article_sync(
+    conn: &Connection,
+    candidate: &ArticleCandidate,
+    category: &str,
+    title: &str,
+    first_author: &str,
+    authors: Option<&str>,
+    pub_date: Option<&str>,
+    journal: Option<&str>,
+    doi: Option<&str>,
+    ai_tech: Option<&str>,
+    clinical_domain: Option<&str>,
+    ethics_framework: Option<&str>,
+    primary_issue: Option<&str>,
+    key_stakeholders: Option<&str>,
+    practical_impl: Option<&str>,
+    secondary_issues: Option<&str>,
+    key_argument: Option<&str>,
+    main_findings: Option<&str>,
+    normative_claims: Option<&str>,
+    limitations: Option<&str>,
+    theoretical_strengths: Option<&str>,
+    theoretical_weaknesses: Option<&str>,
+    empirical_strengths: Option<&str>,
+    empirical_weaknesses: Option<&str>,
+    byline_summary: Option<&str>,
+    why_it_matters: Option<&str>,
+    scholarly_rigor: Option<i64>,
+    novelty: Option<i64>,
+    relevance_score: Option<i64>,
+    practical_impact: Option<i64>,
+    interdisciplinary: Option<i64>,
+    critical_concerns: Option<i64>,
+    total_score: Option<i64>,
+    priority: Option<&str>,
+    full_text: Option<&str>,
+) -> Result<usize> {
+    conn.execute(
+        "UPDATE haie_rev
+         SET url = COALESCE(?2, url),
+             category = COALESCE(?3, category),
+             title = COALESCE(?4, title),
+             first_author = COALESCE(?5, first_author),
+             authors = COALESCE(?6, authors),
+             pub_date = COALESCE(?7, pub_date),
+             journal = COALESCE(?8, journal),
+             doi = COALESCE(?9, doi),
+             ai_tech = COALESCE(?10, ai_tech),
+             clinical_domain = COALESCE(?11, clinical_domain),
+             ethics_framework = COALESCE(?12, ethics_framework),
+             primary_issue = COALESCE(?13, primary_issue),
+             key_stakeholders = COALESCE(?14, key_stakeholders),
+             practical_impl = COALESCE(?15, practical_impl),
+             secondary_issues = COALESCE(?16, secondary_issues),
+             key_argument = COALESCE(?17, key_argument),
+             main_findings = COALESCE(?18, main_findings),
+             normative_claims = COALESCE(?19, normative_claims),
+             limitations = COALESCE(?20, limitations),
+             theoretical_strengths = COALESCE(?21, theoretical_strengths),
+             theoretical_weaknesses = COALESCE(?22, theoretical_weaknesses),
+             empirical_strengths = COALESCE(?23, empirical_strengths),
+             empirical_weaknesses = COALESCE(?24, empirical_weaknesses),
+             byline_summary = COALESCE(?25, byline_summary),
+             why_it_matters = COALESCE(?26, why_it_matters),
+             scholarly_rigor = COALESCE(?27, scholarly_rigor),
+             novelty = COALESCE(?28, novelty),
+             relevance_score = COALESCE(?29, relevance_score),
+             practical_impact = COALESCE(?30, practical_impact),
+             interdisciplinary = COALESCE(?31, interdisciplinary),
+             critical_concerns = COALESCE(?32, critical_concerns),
+             total_score = COALESCE(?33, total_score),
+             priority = COALESCE(?34, priority),
+             full_text = COALESCE(?35, full_text),
+             content_type = CASE WHEN ?35 IS NULL THEN content_type ELSE 'abstract_only' END,
+             updated_at = datetime('now')
+         WHERE uid = ?1",
+        params![
+            candidate.uid(),
+            Some(candidate.url.as_str()),
+            Some(category),
+            Some(title),
+            Some(first_author),
+            authors,
+            pub_date,
+            journal,
+            doi,
+            ai_tech,
+            clinical_domain,
+            ethics_framework,
+            primary_issue,
+            key_stakeholders,
+            practical_impl,
+            secondary_issues,
+            key_argument,
+            main_findings,
+            normative_claims,
+            limitations,
+            theoretical_strengths,
+            theoretical_weaknesses,
+            empirical_strengths,
+            empirical_weaknesses,
+            byline_summary,
+            why_it_matters,
+            scholarly_rigor,
+            novelty,
+            relevance_score,
+            practical_impact,
+            interdisciplinary,
+            critical_concerns,
+            total_score,
+            priority,
+            full_text,
+        ],
+    )
+    .map_err(anyhow::Error::from)
+}
+
+fn parse_arxiv_oai_records(xml: &str) -> Result<ArxivOaiPage> {
+    let mut reader = Reader::from_str(xml);
+    reader.config_mut().trim_text(true);
+
+    let mut buf = Vec::new();
+    let mut page = ArxivOaiPage::default();
+    let mut current = ArxivOaiEntry::default();
+    let mut current_author = ArxivOaiAuthor::default();
+    let mut current_text_tag: Option<Vec<u8>> = None;
+    let mut in_record = false;
+    let mut in_metadata = false;
+    let mut in_arxiv = false;
+    let mut in_author = false;
+    let mut in_resumption_token = false;
+
+    loop {
+        match reader.read_event_into(&mut buf) {
+            Ok(Event::Start(event)) => {
+                let tag = event.local_name().as_ref().to_vec();
+                match tag.as_slice() {
+                    b"record" => {
+                        current = ArxivOaiEntry::default();
+                        in_record = true;
+                    }
+                    b"metadata" if in_record => in_metadata = true,
+                    b"arXiv" if in_metadata => in_arxiv = true,
+                    b"author" if in_arxiv => {
+                        current_author = ArxivOaiAuthor::default();
+                        in_author = true;
+                    }
+                    b"resumptionToken" => {
+                        in_resumption_token = true;
+                        current_text_tag = Some(tag);
+                    }
+                    b"error" => {
+                        for attr in event.attributes().flatten() {
+                            if attr.key.local_name().as_ref() == b"code"
+                                && attr.unescape_value()?.as_ref() == "noRecordsMatch"
+                            {
+                                page.no_records_match = true;
+                            }
+                        }
+                    }
+                    _ if in_arxiv => current_text_tag = Some(tag),
+                    _ => {}
+                }
+            }
+            Ok(Event::Empty(event)) => {
+                if event.local_name().as_ref() == b"error" {
+                    for attr in event.attributes().flatten() {
+                        if attr.key.local_name().as_ref() == b"code"
+                            && attr.unescape_value()?.as_ref() == "noRecordsMatch"
+                        {
+                            page.no_records_match = true;
+                        }
+                    }
+                }
+            }
+            Ok(Event::Text(event)) => {
+                let text = event
+                    .decode()
+                    .context("failed to decode arXiv OAI-PMH XML text")?
+                    .into_owned();
+                if in_resumption_token {
+                    let token = text.trim();
+                    if !token.is_empty() {
+                        page.resumption_token = Some(token.to_string());
+                    }
+                } else if in_arxiv {
+                    apply_arxiv_oai_text(
+                        &mut current,
+                        &mut current_author,
+                        current_text_tag.as_deref(),
+                        in_author,
+                        text.as_str(),
+                    );
+                }
+            }
+            Ok(Event::CData(event)) => {
+                if in_arxiv {
+                    let text = event
+                        .decode()
+                        .context("failed to decode arXiv OAI-PMH XML cdata")?
+                        .into_owned();
+                    apply_arxiv_oai_text(
+                        &mut current,
+                        &mut current_author,
+                        current_text_tag.as_deref(),
+                        in_author,
+                        text.as_str(),
+                    );
+                }
+            }
+            Ok(Event::End(event)) => match event.local_name().as_ref() {
+                b"record" => {
+                    in_record = false;
+                    in_metadata = false;
+                    in_arxiv = false;
+                    in_author = false;
+                    in_resumption_token = false;
+                    current_text_tag = None;
+                    if let Some(candidate) = current.clone().into_candidate() {
+                        page.candidates.push(candidate);
+                    }
+                    current = ArxivOaiEntry::default();
+                }
+                b"metadata" => in_metadata = false,
+                b"arXiv" => {
+                    in_arxiv = false;
+                    current_text_tag = None;
+                }
+                b"author" => {
+                    in_author = false;
+                    current_text_tag = None;
+                    if let Some(author) = current_author.clone().into_author_name() {
+                        current.authors.push(author);
+                    }
+                    current_author = ArxivOaiAuthor::default();
+                }
+                b"resumptionToken" => {
+                    in_resumption_token = false;
+                    current_text_tag = None;
+                }
+                _ => {
+                    current_text_tag = None;
+                }
+            },
+            Ok(Event::Eof) => break,
+            Err(error) => return Err(anyhow!("failed to parse arXiv OAI-PMH feed: {error}")),
+            _ => {}
+        }
+
+        buf.clear();
+    }
+
+    Ok(page)
+}
+
+fn apply_arxiv_oai_text(
+    current: &mut ArxivOaiEntry,
+    current_author: &mut ArxivOaiAuthor,
+    tag: Option<&[u8]>,
+    in_author: bool,
+    text: &str,
+) {
+    let Some(tag) = tag else {
+        return;
+    };
+
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        return;
+    }
+
+    match tag {
+        b"id" => current.id = Some(trimmed.to_string()),
+        b"created" => current.created = Some(trimmed.to_string()),
+        b"updated" => current.updated = Some(trimmed.to_string()),
+        b"title" => current.title = Some(trimmed.to_string()),
+        b"abstract" => current.summary = Some(trimmed.to_string()),
+        b"categories" => current.categories = Some(trimmed.to_string()),
+        b"doi" => current.doi = Some(trimmed.to_string()),
+        b"keyname" if in_author => current_author.keyname = Some(trimmed.to_string()),
+        b"forenames" if in_author => current_author.forenames = Some(trimmed.to_string()),
+        _ => {}
+    }
+}
+
+fn filter_arxiv_oai_candidates(candidates: Vec<ArticleCandidate>) -> Vec<ArticleCandidate> {
+    candidates
+        .into_iter()
+        .filter(arxiv_oai_matches_research_scope)
+        .collect()
+}
+
+fn arxiv_oai_matches_research_scope(candidate: &ArticleCandidate) -> bool {
+    let text = format!(
+        "{} {}",
+        candidate.title,
+        candidate.summary.as_deref().unwrap_or_default()
+    )
+    .to_lowercase();
+
+    has_any_phrase(
+        &text,
+        &[
+            "artificial intelligence",
+            "machine learning",
+            "large language model",
+            "large language models",
+            "llm",
+            "clinical decision support",
+            "algorithmic",
+            "federated learning",
+        ],
+    ) && has_any_phrase(
+        &text,
+        &[
+            "clinical",
+            "healthcare",
+            "health care",
+            "medical",
+            "medicine",
+            "patient",
+            "patients",
+            "hospital",
+            "biomedical",
+            "biomedicine",
+            "public health",
+        ],
+    ) && has_any_phrase(
+        &text,
+        &[
+            "ethics",
+            "ethical",
+            "bias",
+            "fairness",
+            "privacy",
+            "governance",
+            "accountability",
+            "safety",
+            "oversight",
+            "human-in-the-loop",
+            "human in the loop",
+        ],
+    )
+}
+
+fn has_any_phrase(text: &str, phrases: &[&str]) -> bool {
+    phrases.iter().any(|phrase| text.contains(phrase))
 }
 
 fn parse_arxiv_feed(xml: &str) -> Result<Vec<ArticleCandidate>> {
@@ -1932,6 +2546,88 @@ fn category_for_source(source: &str) -> &'static str {
     source_label(source).unwrap_or("Unknown")
 }
 
+#[derive(Debug, Default)]
+struct ArxivOaiPage {
+    candidates: Vec<ArticleCandidate>,
+    resumption_token: Option<String>,
+    no_records_match: bool,
+}
+
+#[derive(Debug, Default, Clone)]
+struct ArxivOaiEntry {
+    id: Option<String>,
+    created: Option<String>,
+    updated: Option<String>,
+    title: Option<String>,
+    summary: Option<String>,
+    categories: Option<String>,
+    authors: Vec<String>,
+    doi: Option<String>,
+}
+
+impl ArxivOaiEntry {
+    fn into_candidate(self) -> Option<ArticleCandidate> {
+        let source_id = self.id?.trim().to_string();
+        let title = self.title.as_deref().map(clean_text)?;
+        if source_id.is_empty() || title.is_empty() {
+            return None;
+        }
+
+        let first_author = self
+            .authors
+            .first()
+            .cloned()
+            .unwrap_or_else(|| "Unknown".to_string());
+        let authors = if self.authors.is_empty() {
+            None
+        } else {
+            Some(self.authors.join(", "))
+        };
+        let pub_date = self.created.or(self.updated);
+        let url = format!("https://arxiv.org/pdf/{source_id}.pdf");
+        let summary = self.summary.as_deref().map(clean_text);
+
+        Some(ArticleCandidate {
+            source: "arxiv".to_string(),
+            source_id,
+            title,
+            summary,
+            first_author,
+            authors,
+            pub_date,
+            journal: Some("arXiv".to_string()),
+            doi: self.doi.map(|value| value.trim().to_string()),
+            url,
+        })
+    }
+}
+
+#[derive(Debug, Default, Clone)]
+struct ArxivOaiAuthor {
+    keyname: Option<String>,
+    forenames: Option<String>,
+}
+
+impl ArxivOaiAuthor {
+    fn into_author_name(self) -> Option<String> {
+        match (self.forenames, self.keyname) {
+            (Some(forenames), Some(keyname)) => {
+                let name = clean_text(format!("{forenames} {keyname}").as_str());
+                (!name.is_empty()).then_some(name)
+            }
+            (None, Some(keyname)) => {
+                let name = clean_text(&keyname);
+                (!name.is_empty()).then_some(name)
+            }
+            (Some(forenames), None) => {
+                let name = clean_text(&forenames);
+                (!name.is_empty()).then_some(name)
+            }
+            (None, None) => None,
+        }
+    }
+}
+
 #[derive(Debug, Default, Clone)]
 struct ArxivEntry {
     id: Option<String>,
@@ -2074,6 +2770,164 @@ mod tests {
             .collect::<Vec<_>>();
 
         assert_eq!(ids, vec!["current", "unknown"]);
+    }
+
+    #[test]
+    fn parses_arxiv_oai_records() {
+        let xml = r#"
+            <OAI-PMH>
+              <ListRecords>
+                <record>
+                  <metadata>
+                    <arXiv>
+                      <id>2605.16113</id>
+                      <created>2026-05-15</created>
+                      <updated>2026-05-18</updated>
+                      <authors>
+                        <author>
+                          <keyname>Chu</keyname>
+                          <forenames>Rui</forenames>
+                        </author>
+                      </authors>
+                      <title>Fair Clinical Large Language Models</title>
+                      <categories>cs.CL cs.AI</categories>
+                      <doi>10.1000/example</doi>
+                      <abstract>Privacy and bias governance for healthcare LLM systems.</abstract>
+                    </arXiv>
+                  </metadata>
+                </record>
+                <resumptionToken>abc123</resumptionToken>
+              </ListRecords>
+            </OAI-PMH>
+        "#;
+
+        let page = parse_arxiv_oai_records(xml).expect("OAI records");
+        assert_eq!(page.resumption_token.as_deref(), Some("abc123"));
+        assert_eq!(page.candidates.len(), 1);
+        let candidate = &page.candidates[0];
+
+        assert_eq!(candidate.uid(), "arxiv:2605.16113");
+        assert_eq!(candidate.first_author, "Rui Chu");
+        assert_eq!(candidate.pub_date.as_deref(), Some("2026-05-15"));
+        assert_eq!(candidate.doi.as_deref(), Some("10.1000/example"));
+        assert!(arxiv_oai_matches_research_scope(candidate));
+    }
+
+    #[test]
+    fn parses_arxiv_oai_no_records_match() {
+        let xml = r#"
+            <OAI-PMH>
+              <error code="noRecordsMatch">No records match.</error>
+            </OAI-PMH>
+        "#;
+
+        let page = parse_arxiv_oai_records(xml).expect("OAI no records");
+
+        assert!(page.no_records_match);
+        assert!(page.candidates.is_empty());
+    }
+
+    #[test]
+    fn parses_retry_after_seconds() {
+        let value = header::HeaderValue::from_static("120");
+
+        assert_eq!(
+            parse_retry_after(Some(&value)),
+            Some(Duration::from_secs(120))
+        );
+    }
+
+    #[test]
+    fn ignores_invalid_retry_after_values() {
+        let value = header::HeaderValue::from_static("not-a-date");
+
+        assert_eq!(parse_retry_after(Some(&value)), None);
+    }
+
+    #[test]
+    fn evaluated_save_updates_existing_metadata_row() {
+        let conn = Connection::open_in_memory().unwrap();
+        create_save_test_table(&conn);
+        let mut candidate = test_candidate("dup");
+        candidate.summary = Some("Abstract text".to_string());
+
+        let metadata_save = save_article_sync(&conn, &candidate, None).unwrap();
+        assert_eq!(metadata_save.saved, 1);
+
+        let evaluation = serde_json::Map::from_iter([
+            ("byline_summary".to_string(), json!("Summary")),
+            ("why_it_matters".to_string(), json!("Why it matters")),
+            ("scholarly_rigor".to_string(), json!(5)),
+            ("novelty".to_string(), json!(4)),
+            ("relevance_score".to_string(), json!(5)),
+            ("practical_impact".to_string(), json!(4)),
+            ("interdisciplinary".to_string(), json!(3)),
+            ("critical_concerns".to_string(), json!(-1)),
+            ("total_score".to_string(), json!(83)),
+            ("priority".to_string(), json!("Tier1")),
+        ]);
+
+        let evaluated_save = save_article_sync(&conn, &candidate, Some(&evaluation)).unwrap();
+        assert_eq!(evaluated_save.saved, 1);
+        assert_eq!(evaluated_save.skipped, 0);
+
+        let scores: (Option<i64>, Option<i64>, Option<String>) = conn
+            .query_row(
+                "SELECT scholarly_rigor, total_score, priority FROM haie_rev WHERE uid = ?1",
+                [candidate.uid()],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+
+        assert_eq!(scores, (Some(5), Some(83), Some("Tier1".to_string())));
+    }
+
+    fn create_save_test_table(conn: &Connection) {
+        conn.execute_batch(
+            r#"
+            CREATE TABLE haie_rev (
+                uid TEXT PRIMARY KEY,
+                url TEXT,
+                category TEXT,
+                reg_date TEXT,
+                title TEXT,
+                first_author TEXT,
+                authors TEXT,
+                pub_date TEXT,
+                journal TEXT,
+                doi TEXT,
+                ai_tech TEXT,
+                clinical_domain TEXT,
+                ethics_framework TEXT,
+                primary_issue TEXT,
+                secondary_issues TEXT,
+                key_stakeholders TEXT,
+                practical_impl TEXT,
+                byline_summary TEXT,
+                why_it_matters TEXT,
+                key_argument TEXT,
+                main_findings TEXT,
+                normative_claims TEXT,
+                limitations TEXT,
+                theoretical_strengths TEXT,
+                theoretical_weaknesses TEXT,
+                empirical_strengths TEXT,
+                empirical_weaknesses TEXT,
+                scholarly_rigor INTEGER,
+                novelty INTEGER,
+                relevance_score INTEGER,
+                practical_impact INTEGER,
+                interdisciplinary INTEGER,
+                critical_concerns INTEGER,
+                total_score INTEGER,
+                priority TEXT,
+                full_text TEXT,
+                content_type TEXT,
+                updated_at TEXT
+            );
+            "#,
+        )
+        .unwrap();
     }
 
     fn test_candidate(source_id: &str) -> ArticleCandidate {

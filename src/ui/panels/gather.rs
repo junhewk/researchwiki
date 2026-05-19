@@ -212,12 +212,14 @@ impl Panel {
                         format!("Started {} gather ({})", label_for(&run.source), run.run_id),
                     ));
                     upsert_job(&mut self.jobs, run);
+                    self.last_refresh = None;
                 }
                 Msg::JobCancelled(run) => {
                     self.action_in_flight = false;
                     self.notice =
                         Some((NoticeKind::Success, format!("Cancelled run {}", run.run_id)));
                     upsert_job(&mut self.jobs, run);
+                    self.last_refresh = None;
                 }
                 Msg::OperationsLoaded(snapshot) => {
                     self.kg_stats = Some(snapshot.stats);
@@ -689,31 +691,23 @@ impl Panel {
         let mut detail_request: Option<String> = None;
         let mut cancel_request: Option<String> = None;
 
-        egui::Grid::new("gather-active-runs-grid")
-            .num_columns(2)
-            .spacing([10.0, 6.0])
-            .striped(true)
-            .show(ui, |ui| {
-                for idx in active {
-                    let Some(job) = self.jobs.get(idx) else {
-                        continue;
-                    };
-                    ui.vertical(|ui| {
+        for idx in active {
+            let Some(job) = self.jobs.get(idx) else {
+                continue;
+            };
+
+            egui::Frame::group(ui.style())
+                .inner_margin(egui::Margin::same(8))
+                .show(ui, |ui| {
+                    ui.set_width(ui.available_width());
+                    ui.horizontal_wrapped(|ui| {
                         ui.strong(format!("{} ({})", label_for(&job.source), job.status));
-                        ui.label(format!("Run: {}", job.run_id));
-                        ui.label(format!(
-                            "Step: {}",
-                            job.current_step.as_deref().unwrap_or("queued")
-                        ));
-                        if let Some(item) = &job.current_item {
-                            ui.add(egui::Label::new(format!("Current: {item}")).truncate());
-                        }
-                    });
-                    ui.vertical(|ui| {
+                        ui.separator();
                         ui.label(format!(
                             "found {} | screened {} | relevant {}",
                             job.candidates_found, job.candidates_screened, job.candidates_relevant
                         ));
+                        ui.separator();
                         ui.label(format!(
                             "fetched {} | evaluated {} | saved {} | skipped {} | errors {}",
                             job.candidates_fetched,
@@ -722,21 +716,36 @@ impl Panel {
                             job.candidates_skipped,
                             job.errors
                         ));
-                        ui.horizontal(|ui| {
-                            if ui.button("Details").clicked() {
-                                detail_request = Some(job.run_id.clone());
-                            }
-                            if ui
-                                .add_enabled(!self.action_in_flight, egui::Button::new("Cancel"))
-                                .clicked()
-                            {
-                                cancel_request = Some(job.run_id.clone());
-                            }
-                        });
                     });
-                    ui.end_row();
-                }
-            });
+
+                    ui.add_space(4.0);
+                    ui.add(egui::Label::new(format!("Run: {}", job.run_id)).wrap());
+                    ui.add(
+                        egui::Label::new(format!(
+                            "Step: {}",
+                            job.current_step.as_deref().unwrap_or("queued")
+                        ))
+                        .wrap(),
+                    );
+                    if let Some(item) = &job.current_item {
+                        ui.add(egui::Label::new(format!("Current: {item}")).wrap());
+                    }
+
+                    ui.add_space(4.0);
+                    ui.horizontal(|ui| {
+                        if ui.button("Details").clicked() {
+                            detail_request = Some(job.run_id.clone());
+                        }
+                        if ui
+                            .add_enabled(!self.action_in_flight, egui::Button::new("Cancel"))
+                            .clicked()
+                        {
+                            cancel_request = Some(job.run_id.clone());
+                        }
+                    });
+                });
+            ui.add_space(6.0);
+        }
 
         if let Some(run_id) = detail_request {
             self.load_detail(ctx, &run_id);
@@ -1254,7 +1263,10 @@ impl Panel {
     }
 
     fn should_poll(&self) -> bool {
-        self.has_active_jobs() || self.has_active_ops() || self.scheduler_test.is_some()
+        self.action_in_flight
+            || self.has_active_jobs()
+            || self.has_active_ops()
+            || self.scheduler_test.is_some()
     }
 
     fn detect_scheduler_run(&mut self) {

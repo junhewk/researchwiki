@@ -61,6 +61,8 @@ impl DesktopApp {
         runtime: DesktopRuntime,
         config: AppConfig,
     ) -> Self {
+        install_system_font_fallbacks(&cc.egui_ctx);
+
         let persistent = cc
             .storage
             .and_then(|storage| eframe::get_value::<PersistentUi>(storage, PERSIST_KEY))
@@ -302,6 +304,29 @@ fn native_window_handle(cc: &eframe::CreationContext<'_>) -> Option<isize> {
 #[cfg(not(target_os = "windows"))]
 fn native_window_handle(_cc: &eframe::CreationContext<'_>) -> Option<isize> {
     None
+}
+
+fn install_system_font_fallbacks(ctx: &egui::Context) {
+    let mut fonts = egui::FontDefinitions::default();
+    add_font_if_available(&mut fonts, "malgun_gothic", r"C:\Windows\Fonts\malgun.ttf");
+    ctx.set_fonts(fonts);
+}
+
+fn add_font_if_available(fonts: &mut egui::FontDefinitions, name: &str, path: &str) {
+    let Ok(bytes) = std::fs::read(path) else {
+        return;
+    };
+
+    fonts
+        .font_data
+        .insert(name.to_string(), egui::FontData::from_owned(bytes).into());
+    for family in [egui::FontFamily::Proportional, egui::FontFamily::Monospace] {
+        fonts
+            .families
+            .entry(family)
+            .or_default()
+            .push(name.to_string());
+    }
 }
 
 /// Create per-user directories and copy bundled prompts into the user copy on first launch.

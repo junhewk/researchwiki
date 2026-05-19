@@ -5,7 +5,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use reqwest::{Client, Response};
+use reqwest::{Client, Response, StatusCode, header};
 use serde_json::{Value, json};
 use tokio::sync::Semaphore;
 use tracing::warn;
@@ -243,6 +243,10 @@ impl LlmService {
         result
     }
 
+    pub fn max_concurrent_requests(&self) -> usize {
+        self.config.max_concurrent_requests.max(1)
+    }
+
     async fn send_with_retries(&self, endpoint: &str, body: &Value) -> Result<Response, AppError> {
         let max_attempts = self.config.max_attempts.max(1);
 
@@ -256,7 +260,32 @@ impl LlmService {
                 .await;
 
             match result {
+                Ok(response)
+                    if should_retry_response(response.status()) && attempt < max_attempts =>
+                {
+                    let status = response.status();
+                    let delay = response_retry_delay(attempt, &response);
+                    warn!(
+                        "local LLM request returned HTTP {status} on attempt {attempt}/{max_attempts}; retrying in {} ms",
+                        delay.as_millis()
+                    );
+                    tokio::time::sleep(delay).await;
+                }
                 Ok(response) => return Ok(response),
+                Err(error) if is_https_plain_http_mismatch(endpoint, &error) => {
+                    let detail = reqwest_error_with_sources(&error);
+                    return Err(AppError::Internal(format!(
+                        "Local LLM endpoint appears to be plain HTTP but base URL uses HTTPS. Change LLM base URL to {}. Original error: {detail}",
+                        http_endpoint_suggestion(endpoint)
+                    )));
+                }
+                Err(error) if error.is_timeout() => {
+                    let detail = reqwest_error_with_sources(&error);
+                    return Err(AppError::Internal(format!(
+                        "Local LLM request timed out after {} seconds; not retrying the same prompt. Reduce the evaluation input, lower pipeline concurrency, or increase the local LLM timeout. Original error: {detail}",
+                        self.config.request_timeout_seconds
+                    )));
+                }
                 Err(error) if attempt < max_attempts => {
                     let detail = reqwest_error_with_sources(&error);
                     let delay = retry_delay(attempt);
@@ -287,6 +316,27 @@ fn retry_delay(attempt: usize) -> Duration {
         2 => Duration::from_secs(2),
         _ => Duration::from_secs(5),
     }
+}
+
+fn should_retry_response(status: StatusCode) -> bool {
+    status == StatusCode::TOO_MANY_REQUESTS || status.is_server_error()
+}
+
+fn response_retry_delay(attempt: usize, response: &Response) -> Duration {
+    parse_retry_after(response.headers().get(header::RETRY_AFTER)).unwrap_or_else(
+        || match attempt {
+            1 => Duration::from_secs(10),
+            2 => Duration::from_secs(30),
+            _ => Duration::from_secs(60),
+        },
+    )
+}
+
+fn parse_retry_after(value: Option<&header::HeaderValue>) -> Option<Duration> {
+    value
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.trim().parse::<u64>().ok())
+        .map(Duration::from_secs)
 }
 
 fn build_messages(instructions: &str, input_text: &str) -> Value {
@@ -320,12 +370,33 @@ fn reqwest_error_with_sources(error: &reqwest::Error) -> String {
     message
 }
 
+fn is_https_plain_http_mismatch(endpoint: &str, error: &reqwest::Error) -> bool {
+    if !endpoint.starts_with("https://") {
+        return false;
+    }
+
+    let detail = reqwest_error_with_sources(error);
+    detail.contains("InvalidContentType") || detail.contains("received corrupt message")
+}
+
+fn http_endpoint_suggestion(endpoint: &str) -> String {
+    endpoint
+        .strip_prefix("https://")
+        .map(|rest| format!("http://{rest}"))
+        .unwrap_or_else(|| endpoint.to_string())
+        .trim_end_matches("/chat/completions")
+        .to_string()
+}
+
 fn build_json_response_format(schema: Option<&serde_yaml::Value>) -> Result<Value, AppError> {
     let mut response_format = json!({
         "type": "json_object",
     });
 
     if let Some(schema) = schema.filter(|value| !matches!(value, serde_yaml::Value::Null)) {
+        // llama-server's OpenAI-compatible chat endpoint accepts schema-constrained JSON
+        // as {"type":"json_object","schema":...}; OpenAI's nested json_schema wrapper
+        // is not portable across llama.cpp versions.
         response_format["schema"] = serde_json::to_value(schema).map_err(|error| {
             AppError::Internal(format!("Invalid JSON schema for prompt: {error}"))
         })?;
@@ -428,4 +499,37 @@ mod tests {
         assert!(truncated.ends_with("..."));
         assert!(truncated.contains('•'));
     }
+}
+
+#[cfg(test)]
+#[test]
+fn llama_server_json_schema_uses_schema_field_under_json_object() {
+    let schema = serde_yaml::to_value(serde_json::json!({
+        "type": "object",
+        "properties": {
+            "score": { "type": "integer" }
+        },
+        "required": ["score"]
+    }))
+    .unwrap();
+
+    let response_format = build_json_response_format(Some(&schema)).unwrap();
+
+    assert_eq!(
+        response_format.get("type"),
+        Some(&serde_json::json!("json_object"))
+    );
+    assert!(response_format.get("schema").is_some());
+    assert!(response_format.get("json_schema").is_none());
+}
+
+#[cfg(test)]
+#[test]
+fn retry_after_parses_seconds() {
+    let value = header::HeaderValue::from_static("42");
+
+    assert_eq!(
+        parse_retry_after(Some(&value)),
+        Some(std::time::Duration::from_secs(42))
+    );
 }

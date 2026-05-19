@@ -76,7 +76,8 @@ impl ArticleScreener {
     }
 
     pub async fn filter_relevant(&self, candidates: &[ArticleCandidate]) -> Vec<ArticleCandidate> {
-        let results = self.screen_batch(candidates, DEFAULT_CONCURRENCY).await;
+        let concurrency = DEFAULT_CONCURRENCY.min(self.llm_service.max_concurrent_requests());
+        let results = self.screen_batch(candidates, concurrency).await;
         candidates
             .iter()
             .zip(results)

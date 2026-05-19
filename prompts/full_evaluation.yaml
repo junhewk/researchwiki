@@ -3,12 +3,17 @@ temperature: 0.5
 structured_output: ArticleEvaluation
 
 system: |
-  You are an expert evaluator of healthcare AI ethics papers. Analyze the provided
+  You are an expert evaluator of scholarly research articles. Analyze the provided
   article and return a structured evaluation in JSON format. All text fields should
   be in Korean unless otherwise specified.
 
 user: |
-  Analyze this healthcare AI ethics paper and provide a comprehensive structured evaluation.
+  Analyze this research article and provide a comprehensive structured evaluation.
+  The current collection focus is healthcare AI ethics, but the Tier score must be
+  a normalized research-value score rather than a domain-specific preference score.
+  The input may be a compact scoring packet with title, abstract, and selected PDF
+  evidence sections such as Results, Discussion, or Conclusion. Do not infer details
+  that are not supported by the provided packet.
 
   ## Article to Analyze
   {article_text}
@@ -41,17 +46,17 @@ user: |
   - empirical_strengths: string - Strong empirical aspects (if applicable)
   - empirical_weaknesses: string - Empirical limitations (if applicable)
   - byline_summary: string - 3-4 sentence elevator pitch summary
-  - why_it_matters: string - Why healthcare AI ethics researchers should read this (3-4 sentences)
+  - why_it_matters: string - Why researchers in the current collection focus should read this (3-4 sentences)
 
-  ## Scoring (provide integer scores)
-  - scholarly_rigor: 0-5 (5=theoretical depth, 0=problematic reasoning)
-  - novelty: 0-5 (5=paradigm-shifting, 0=no novelty)
-  - relevance_score: 0-5 (5=directly addresses healthcare AI ethics, 0=not relevant)
-  - practical_impact: 0-5 (5=actionable recommendations, 0=unclear implications)
-  - interdisciplinary: 0-4 (4=covers ethics+CS+medicine+policy, 0=ethics only)
-  - critical_concerns: -5 to 0 (0=no concerns, -3=major methodological flaws)
-  - total_score: sum of all scores (max 22)
-  - priority: "Tier1" if 18-22, "Tier2" if 9-17, "Tier3" if 0-8
+  ## Scoring (provide integer component scores; the app recomputes total_score and priority)
+  - scholarly_rigor: 0-5 (5=methodologically/theoretically strong, 0=problematic reasoning)
+  - novelty: 0-5 (5=major new contribution, 0=no clear novelty)
+  - relevance_score: 0-5 (5=central to the current collection focus, 0=not relevant)
+  - practical_impact: 0-5 (5=clear actionable implications, 0=unclear implications)
+  - interdisciplinary: 0-4 (4=strongly integrates multiple relevant disciplines, 0=single narrow lens)
+  - critical_concerns: -5 to 0 (0=no major concerns, -5=serious validity/safety/methodological concern)
+  - total_score: normalized 0-100 research-value score. The app recomputes this from component scores.
+  - priority: "Tier1" if total_score >= 75, "Tier2" if 40-74, "Tier3" if 0-39. The app recomputes this.
 
 schema:
   type: object
@@ -124,6 +129,8 @@ schema:
       maximum: 0
     total_score:
       type: integer
+      minimum: 0
+      maximum: 100
     priority:
       type: string
       enum: ["Tier1", "Tier2", "Tier3"]
@@ -131,5 +138,11 @@ schema:
     - title
     - byline_summary
     - why_it_matters
+    - scholarly_rigor
+    - novelty
+    - relevance_score
+    - practical_impact
+    - interdisciplinary
+    - critical_concerns
     - total_score
     - priority

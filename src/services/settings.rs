@@ -127,7 +127,7 @@ impl SettingsService {
         }
 
         let raw = tokio::fs::read_to_string(&self.settings_file).await?;
-        let parsed = serde_json::from_str::<StoredSettings>(&raw)
+        let parsed = serde_json::from_str::<StoredSettings>(strip_utf8_bom(&raw))
             .map_err(|error| AppError::Internal(error.to_string()))?;
         Ok(parsed)
     }
@@ -139,7 +139,7 @@ impl SettingsService {
 
         let raw = serde_json::to_string_pretty(stored)
             .map_err(|error| AppError::Internal(error.to_string()))?;
-        tokio::fs::write(&self.settings_file, raw).await?;
+        tokio::fs::write(&self.settings_file, raw.as_bytes()).await?;
         Ok(())
     }
 }
@@ -152,10 +152,14 @@ pub fn load_overrides_sync(
     let Ok(raw) = std::fs::read_to_string(settings_file) else {
         return (None, None, None);
     };
-    let Ok(stored) = serde_json::from_str::<StoredSettings>(&raw) else {
+    let Ok(stored) = serde_json::from_str::<StoredSettings>(strip_utf8_bom(&raw)) else {
         return (None, None, None);
     };
     (stored.llm, stored.embedding, stored.embedding_dimensions)
+}
+
+fn strip_utf8_bom(raw: &str) -> &str {
+    raw.strip_prefix('\u{feff}').unwrap_or(raw)
 }
 
 fn mask_api_key(key: &str) -> String {
@@ -163,4 +167,15 @@ fn mask_api_key(key: &str) -> String {
         return "***".to_string();
     }
     format!("{}...{}", &key[..4], &key[key.len() - 4..])
+}
+
+#[cfg(test)]
+mod tests {
+    use super::strip_utf8_bom;
+
+    #[test]
+    fn strip_utf8_bom_removes_leading_bom_only() {
+        assert_eq!(strip_utf8_bom("\u{feff}{\"ok\":true}"), "{\"ok\":true}");
+        assert_eq!(strip_utf8_bom("{\"ok\":true}"), "{\"ok\":true}");
+    }
 }
