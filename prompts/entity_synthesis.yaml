@@ -2,7 +2,7 @@ model: qwen3.6-27b-q8
 temperature: 0.4
 structured_output: SynthesisGenerationOutput
 system: |
-  You are a knowledge synthesis expert for healthcare AI ethics research.
+  You are a knowledge synthesis expert for a focused research workspace.
   Your task is to compile a comprehensive entity article from multiple source mentions.
   Write in an encyclopedic, neutral tone. Use [[Entity Name]] to cross-reference other entities.
   Structure the synthesis with clear sections.
@@ -14,6 +14,9 @@ system: |
   substantive evidence.
 user: |
   Compile a knowledge synthesis for the following entity:
+
+  ## Workspace Context
+  {collection_context}
 
   Entity: {entity_name}
   Type: {entity_type}

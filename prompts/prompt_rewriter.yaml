@@ -1,0 +1,26 @@
+model: qwen3.6-27b-q8
+temperature: 0.3
+
+system: |
+  You rewrite an LLM prompt template so it targets a new research topic while
+  preserving the template's structure: its YAML keys, any structured_output
+  declaration, and every variable placeholder (anything in single curly braces
+  such as {title} or {summary}). You change only the topic-specific wording.
+
+user: |
+  Rewrite the following prompt template so it targets the new topic instead of its
+  current subject domain.
+
+  New topic: {topic_descriptor}
+  Primary question: {primary_question}
+  Seed concepts: {seed_concepts}
+
+  Rules:
+  - Keep the YAML structure and all keys (model, temperature, system, user,
+    structured_output, etc.) intact.
+  - Preserve every {placeholder} exactly as written.
+  - Change only wording that describes the subject domain.
+  - Output ONLY the rewritten YAML — no code fences, no commentary.
+
+  Current prompt template:
+  {original_prompt}

@@ -47,6 +47,7 @@ impl ArticleService {
     pub async fn list_articles(
         &self,
         query: ArticleListQuery,
+        workspace_id: Option<i64>,
     ) -> Result<ArticleListResponse, AppError> {
         let database_path = self.database_path.clone();
 
@@ -54,7 +55,7 @@ impl ArticleService {
             let conn = crate::db::open_connection(&*database_path)?;
             let page = query.page.max(1);
             let page_size = query.page_size.clamp(1, 100);
-            let (where_clause, base_params) = article_where_clause(&query);
+            let (where_clause, base_params) = article_where_clause(&query, workspace_id);
 
             let count_sql = format!("SELECT COUNT(*) FROM haie_rev{where_clause}");
             let total: i64 =
@@ -218,30 +219,40 @@ impl ArticleService {
         .map_err(|error| map_anyhow_not_found(error, "Article"))
     }
 
-    pub async fn get_stats(&self) -> Result<ArticleStats, AppError> {
+    pub async fn get_stats(&self, workspace_id: Option<i64>) -> Result<ArticleStats, AppError> {
         let database_path = self.database_path.clone();
         run_blocking(move || {
             let conn = crate::db::open_connection(&*database_path)?;
             let today = Utc::now().date_naive();
             let week_ago = today - Duration::days(7);
 
-            let total_articles: i64 =
-                conn.query_row("SELECT COUNT(uid) FROM haie_rev", [], |row| row.get(0))?;
-            let this_week: i64 = conn.query_row(
-                "SELECT COUNT(uid) FROM haie_rev WHERE reg_date >= ?1",
-                [week_ago.to_string()],
-                |row| row.get(0),
-            )?;
-            let tier1_count: i64 = conn.query_row(
-                "SELECT COUNT(uid) FROM haie_rev WHERE priority = 'Tier1'",
-                [],
-                |row| row.get(0),
-            )?;
-            let pending_review: i64 = conn.query_row(
-                "SELECT COUNT(uid) FROM haie_rev WHERE priority IS NULL OR priority = ''",
-                [],
-                |row| row.get(0),
-            )?;
+            let total_articles: i64 = {
+                let mut sql = String::from("SELECT COUNT(uid) FROM haie_rev");
+                let mut params: Vec<Value> = Vec::new();
+                append_ws(&mut sql, &mut params, workspace_id, false);
+                conn.query_row(&sql, params_from_iter(params.iter()), |row| row.get(0))?
+            };
+            let this_week: i64 = {
+                let mut sql = String::from("SELECT COUNT(uid) FROM haie_rev WHERE reg_date >= ?");
+                let mut params: Vec<Value> = vec![Value::Text(week_ago.to_string())];
+                append_ws(&mut sql, &mut params, workspace_id, true);
+                conn.query_row(&sql, params_from_iter(params.iter()), |row| row.get(0))?
+            };
+            let tier1_count: i64 = {
+                let mut sql =
+                    String::from("SELECT COUNT(uid) FROM haie_rev WHERE priority = 'Tier1'");
+                let mut params: Vec<Value> = Vec::new();
+                append_ws(&mut sql, &mut params, workspace_id, true);
+                conn.query_row(&sql, params_from_iter(params.iter()), |row| row.get(0))?
+            };
+            let pending_review: i64 = {
+                let mut sql = String::from(
+                    "SELECT COUNT(uid) FROM haie_rev WHERE (priority IS NULL OR priority = '')",
+                );
+                let mut params: Vec<Value> = Vec::new();
+                append_ws(&mut sql, &mut params, workspace_id, true);
+                conn.query_row(&sql, params_from_iter(params.iter()), |row| row.get(0))?
+            };
 
             Ok::<_, anyhow::Error>(ArticleStats {
                 total_articles,
@@ -253,7 +264,11 @@ impl ArticleService {
         .await
     }
 
-    pub async fn get_daily_stats(&self, days: u32) -> Result<DailyStatsResponse, AppError> {
+    pub async fn get_daily_stats(
+        &self,
+        days: u32,
+        workspace_id: Option<i64>,
+    ) -> Result<DailyStatsResponse, AppError> {
         let database_path = self.database_path.clone();
         run_blocking(move || {
             let conn = crate::db::open_connection(&*database_path)?;
@@ -261,14 +276,14 @@ impl ArticleService {
             let today = Utc::now().date_naive();
             let start_date = today - Duration::days(i64::from(days.saturating_sub(1)));
 
-            let mut stmt = conn.prepare(
-                "SELECT reg_date, COUNT(uid)
-                 FROM haie_rev
-                 WHERE reg_date >= ?1
-                 GROUP BY reg_date
-                 ORDER BY reg_date",
-            )?;
-            let rows = stmt.query_map([start_date.to_string()], |row| {
+            let mut sql =
+                String::from("SELECT reg_date, COUNT(uid) FROM haie_rev WHERE reg_date >= ?");
+            let mut params: Vec<Value> = vec![Value::Text(start_date.to_string())];
+            append_ws(&mut sql, &mut params, workspace_id, true);
+            sql.push_str(" GROUP BY reg_date ORDER BY reg_date");
+
+            let mut stmt = conn.prepare(&sql)?;
+            let rows = stmt.query_map(params_from_iter(params.iter()), |row| {
                 let reg_date: Option<String> = row.get(0)?;
                 let count: i64 = row.get(1)?;
                 Ok((reg_date, count))
@@ -310,6 +325,7 @@ impl ArticleService {
         days: u32,
         limit: u32,
         min_score: Option<i32>,
+        workspace_id: Option<i64>,
     ) -> Result<Vec<ArticleResponse>, AppError> {
         let database_path = self.database_path.clone();
         run_blocking(move || {
@@ -318,10 +334,11 @@ impl ArticleService {
                 - Duration::days(i64::from(days.clamp(1, 30))))
             .to_string();
 
-            let mut sql = format!("SELECT {ARTICLE_COLUMNS} FROM haie_rev WHERE reg_date >= ?1");
+            let mut sql = format!("SELECT {ARTICLE_COLUMNS} FROM haie_rev WHERE reg_date >= ?");
             let mut params = vec![Value::Text(threshold)];
+            append_ws(&mut sql, &mut params, workspace_id, true);
             if let Some(min_score) = min_score {
-                sql.push_str(" AND total_score >= ?2");
+                sql.push_str(" AND total_score >= ?");
                 params.push(Value::Integer(i64::from(min_score)));
             }
             sql.push_str(" ORDER BY COALESCE(total_score, -999) DESC LIMIT ?");
@@ -339,6 +356,7 @@ impl ArticleService {
         &self,
         days: u32,
         limit: u32,
+        workspace_id: Option<i64>,
     ) -> Result<Vec<ArticleResponse>, AppError> {
         let database_path = self.database_path.clone();
         run_blocking(move || {
@@ -346,16 +364,14 @@ impl ArticleService {
             let threshold = (Utc::now().date_naive()
                 - Duration::days(i64::from(days.clamp(1, 30))))
             .to_string();
-            let sql = format!(
-                "SELECT {ARTICLE_COLUMNS} FROM haie_rev
-                 WHERE reg_date >= ?1
-                 ORDER BY COALESCE(total_score, -999) DESC
-                 LIMIT ?2"
-            );
+            let mut sql = format!("SELECT {ARTICLE_COLUMNS} FROM haie_rev WHERE reg_date >= ?");
+            let mut params = vec![Value::Text(threshold)];
+            append_ws(&mut sql, &mut params, workspace_id, true);
+            sql.push_str(" ORDER BY COALESCE(total_score, -999) DESC LIMIT ?");
+            params.push(Value::Integer(i64::from(limit.clamp(1, 20))));
 
             let mut stmt = conn.prepare(&sql)?;
-            let rows =
-                stmt.query_map([threshold, limit.clamp(1, 20).to_string()], map_article_row)?;
+            let rows = stmt.query_map(params_from_iter(params.iter()), map_article_row)?;
             rows.collect::<Result<Vec<_>, _>>()
                 .context("failed to query top articles")
         })
@@ -512,6 +528,24 @@ impl ArticleService {
     }
 }
 
+/// Appends a workspace scope to a query when an id is provided. `has_where`
+/// chooses `AND` vs `WHERE` depending on whether the SQL already filters.
+fn append_ws(
+    sql: &mut String,
+    params: &mut Vec<Value>,
+    workspace_id: Option<i64>,
+    has_where: bool,
+) {
+    if let Some(id) = workspace_id {
+        sql.push_str(if has_where {
+            " AND workspace_id = ?"
+        } else {
+            " WHERE workspace_id = ?"
+        });
+        params.push(Value::Integer(id));
+    }
+}
+
 fn json_number_to_i64(value: &serde_json::Value) -> Option<i64> {
     match value {
         serde_json::Value::Number(number) => number
@@ -589,10 +623,17 @@ fn map_anyhow_not_found(error: anyhow::Error, entity_name: &str) -> AppError {
     }
 }
 
-fn article_where_clause(query: &ArticleListQuery) -> (String, Vec<Value>) {
+fn article_where_clause(
+    query: &ArticleListQuery,
+    workspace_id: Option<i64>,
+) -> (String, Vec<Value>) {
     let mut conditions = Vec::new();
     let mut params = Vec::new();
 
+    if let Some(id) = workspace_id {
+        conditions.push("workspace_id = ?".to_string());
+        params.push(Value::Integer(id));
+    }
     if let Some(date_from) = query.date_from.as_ref().filter(|value| !value.is_empty()) {
         conditions.push("reg_date >= ?".to_string());
         params.push(Value::Text(date_from.clone()));

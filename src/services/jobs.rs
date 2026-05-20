@@ -11,6 +11,7 @@ use crate::{
     models::{
         job::{JobCreateRequest, JobEventResponse, JobRunDetailResponse, JobRunResponse},
         settings::{SchedulerJob, SchedulerSettings, SchedulerStatusResponse},
+        workspace::WorkspaceResearchContext,
     },
     services::{
         evaluator::ArticleEvaluator,
@@ -24,6 +25,7 @@ use crate::{
         },
         screener::ArticleScreener,
         settings::SettingsService,
+        workspace::WorkspaceService,
     },
 };
 
@@ -45,6 +47,7 @@ pub struct JobService {
     library_service: Arc<LibraryService>,
     kg_service: Arc<KnowledgeGraphService>,
     settings_service: Arc<SettingsService>,
+    workspace_service: Arc<WorkspaceService>,
 }
 
 #[derive(Debug, Default, Clone, Copy)]
@@ -68,6 +71,7 @@ impl JobService {
         http_client: reqwest::Client,
         library_service: Arc<LibraryService>,
         kg_service: Arc<KnowledgeGraphService>,
+        workspace_service: Arc<WorkspaceService>,
     ) -> Self {
         let pipeline_service = PipelineService::new(database_path.clone());
         let screener = ArticleScreener::new(llm_service.clone());
@@ -82,6 +86,7 @@ impl JobService {
             library_service,
             kg_service,
             settings_service,
+            workspace_service,
         }
     }
 
@@ -104,17 +109,25 @@ impl JobService {
         .await
     }
 
-    pub async fn list_jobs(&self, limit: u32) -> Result<Vec<JobRunResponse>, AppError> {
+    pub async fn list_jobs(
+        &self,
+        limit: u32,
+        workspace_id: i64,
+    ) -> Result<Vec<JobRunResponse>, AppError> {
         let database_path = self.database_path.clone();
         run_blocking(move || {
             let conn = crate::db::open_connection(&*database_path)?;
             let mut stmt = conn.prepare(&format!(
                 "SELECT {JOB_RUN_COLUMNS}
                  FROM job_runs
+                 WHERE workspace_id = ?1
                  ORDER BY requested_at DESC
-                 LIMIT ?1",
+                 LIMIT ?2",
             ))?;
-            let rows = stmt.query_map([i64::from(limit.clamp(1, 200))], map_job_row)?;
+            let rows = stmt.query_map(
+                params![workspace_id, i64::from(limit.clamp(1, 200))],
+                map_job_row,
+            )?;
             rows.collect::<Result<Vec<_>, _>>()
                 .context("failed to list job runs")
         })
@@ -163,15 +176,21 @@ impl JobService {
         .map_err(not_found_or_conflict_to_app_error)
     }
 
-    pub async fn enqueue_job(&self, request: JobCreateRequest) -> Result<JobRunResponse, AppError> {
+    pub async fn enqueue_job(
+        &self,
+        request: JobCreateRequest,
+        workspace_id: i64,
+    ) -> Result<JobRunResponse, AppError> {
         let source = normalize_source(&request.source)?;
-        self.enqueue_source(&source, request.days_back).await
+        self.enqueue_source(&source, request.days_back, workspace_id)
+            .await
     }
 
     pub async fn enqueue_source(
         &self,
         source: &str,
         days_back: i32,
+        workspace_id: i64,
     ) -> Result<JobRunResponse, AppError> {
         let source = normalize_source(source)?;
         if let Some((run_id, running_source)) = self.find_conflict(&source).await? {
@@ -182,16 +201,23 @@ impl JobService {
 
         let database_path = self.database_path.clone();
         let run_id = Uuid::new_v4().to_string();
-        let days_back = days_back.clamp(1, 30);
+        // Allow long lookback windows (per-workspace gather backfill); the old
+        // 30-day cap is gone, but keep a sane upper bound.
+        let days_back = days_back.clamp(1, 3650);
         let source_for_insert = source.clone();
         let run_id_for_insert = run_id.clone();
 
         let queued_job = task::spawn_blocking(move || {
             let conn = crate::db::open_connection(&*database_path)?;
             conn.execute(
-                "INSERT INTO job_runs (id, source, days_back, status)
-                 VALUES (?1, ?2, ?3, 'queued')",
-                params![run_id_for_insert, source_for_insert, days_back],
+                "INSERT INTO job_runs (id, source, days_back, status, workspace_id)
+                 VALUES (?1, ?2, ?3, 'queued', ?4)",
+                params![
+                    run_id_for_insert,
+                    source_for_insert,
+                    days_back,
+                    workspace_id
+                ],
             )?;
             conn.execute(
                 "INSERT INTO job_events (run_id, event_type, payload_json)
@@ -225,6 +251,7 @@ impl JobService {
             queued_job.run_id.clone(),
             queued_job.source.clone(),
             queued_job.days_back,
+            workspace_id,
         );
 
         Ok(queued_job)
@@ -367,10 +394,13 @@ impl JobService {
         .await
     }
 
-    fn spawn_worker(&self, run_id: String, source: String, days_back: i32) {
+    fn spawn_worker(&self, run_id: String, source: String, days_back: i32, workspace_id: i64) {
         let service = self.clone();
         tokio::spawn(async move {
-            if let Err(error) = service.run_job(run_id.clone(), source, days_back).await {
+            if let Err(error) = service
+                .run_job(run_id.clone(), source, days_back, workspace_id)
+                .await
+            {
                 tracing::error!(run_id = %run_id, error = %error, "background job failed");
             }
         });
@@ -381,6 +411,7 @@ impl JobService {
         run_id: String,
         source: String,
         days_back: i32,
+        workspace_id: i64,
     ) -> Result<(), AppError> {
         if self.is_cancelled(&run_id).await? {
             return Ok(());
@@ -393,6 +424,13 @@ impl JobService {
             serde_json::json!({ "source": source, "days_back": days_back }),
         )
         .await?;
+
+        // Per-workspace research context, loaded from the registry (meta DB).
+        let context = self
+            .workspace_service
+            .research_context(workspace_id)
+            .await
+            .unwrap_or_default();
 
         let sources = if source == "all" {
             GATHER_SOURCE_IDS.to_vec()
@@ -418,7 +456,7 @@ impl JobService {
 
             let candidates = match self
                 .pipeline_service
-                .list_source(current_source, days_back)
+                .list_source(current_source, days_back, &context)
                 .await
             {
                 Ok(candidates) => candidates,
@@ -487,7 +525,7 @@ impl JobService {
                 counters,
             )
             .await?;
-            let relevant = self.screener.filter_relevant(&candidates).await;
+            let relevant = self.screener.filter_relevant(&candidates, &context).await;
             counters.screened += candidates.len() as i32;
             counters.relevant += relevant.len() as i32;
             self.append_event(
@@ -522,7 +560,13 @@ impl JobService {
                 .await?;
 
                 let save_result = self
-                    .process_single_article(candidate, &mut counters, &mut last_error)
+                    .process_single_article(
+                        candidate,
+                        &mut counters,
+                        &mut last_error,
+                        workspace_id,
+                        &context,
+                    )
                     .await;
 
                 if let Err(error) = save_result {
@@ -604,6 +648,8 @@ impl JobService {
         candidate: &ArticleCandidate,
         counters: &mut JobCounters,
         last_error: &mut Option<String>,
+        workspace_id: i64,
+        context: &WorkspaceResearchContext,
     ) -> Result<(), AppError> {
         // 1. Fetch content.
         let content = self.fetcher.fetch(candidate).await;
@@ -615,7 +661,7 @@ impl JobService {
             *last_error = Some(message);
             let save_result = self
                 .pipeline_service
-                .save_candidates(vec![candidate.clone()])
+                .save_candidates(vec![candidate.clone()], workspace_id)
                 .await
                 .map_err(|error| AppError::Internal(error.to_string()))?;
             apply_save_counters(counters, save_result);
@@ -644,12 +690,12 @@ impl JobService {
         // 3. Save article (with evaluation if available, metadata-only otherwise).
         let save_result = if let Some(ref eval_fields) = evaluation {
             self.pipeline_service
-                .save_evaluated_candidate(candidate, eval_fields)
+                .save_evaluated_candidate(candidate, eval_fields, workspace_id)
                 .await
                 .map_err(|error| AppError::Internal(error.to_string()))?
         } else {
             self.pipeline_service
-                .save_candidates(vec![candidate.clone()])
+                .save_candidates(vec![candidate.clone()], workspace_id)
                 .await
                 .map_err(|error| AppError::Internal(error.to_string()))?
         };
@@ -680,7 +726,11 @@ impl JobService {
             }
 
             if kg_enabled {
-                if let Err(error) = self.kg_service.insert_articles(vec![uid.clone()]).await {
+                if let Err(error) = self
+                    .kg_service
+                    .insert_articles_with_context(vec![uid.clone()], context.clone())
+                    .await
+                {
                     tracing::warn!("KG extraction failed for {uid}: {error}");
                 }
             }

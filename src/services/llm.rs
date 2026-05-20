@@ -115,14 +115,20 @@ impl LlmService {
             }
 
             if matches!(output_mode, LlmOutputMode::Json) {
-                body["response_format"] =
-                    build_json_response_format(prompt_config.schema.as_ref())?;
+                body["response_format"] = build_json_response_format(
+                    prompt_config.schema.as_ref(),
+                    uses_deepseek_chat_api(&self.config),
+                )?;
             }
 
             if self.config.disable_thinking {
-                body["chat_template_kwargs"] = json!({
-                    "enable_thinking": false,
-                });
+                if uses_deepseek_chat_api(&self.config) {
+                    body["thinking"] = json!({ "type": "disabled" });
+                } else {
+                    body["chat_template_kwargs"] = json!({
+                        "enable_thinking": false,
+                    });
+                }
             }
 
             let queue_started = Instant::now();
@@ -388,18 +394,28 @@ fn http_endpoint_suggestion(endpoint: &str) -> String {
         .to_string()
 }
 
-fn build_json_response_format(schema: Option<&serde_yaml::Value>) -> Result<Value, AppError> {
+fn uses_deepseek_chat_api(config: &LlmConfig) -> bool {
+    config.base_url.contains("api.deepseek.com")
+        || config.model.to_ascii_lowercase().starts_with("deepseek-")
+}
+
+fn build_json_response_format(
+    schema: Option<&serde_yaml::Value>,
+    deepseek_compatible: bool,
+) -> Result<Value, AppError> {
     let mut response_format = json!({
         "type": "json_object",
     });
 
-    if let Some(schema) = schema.filter(|value| !matches!(value, serde_yaml::Value::Null)) {
-        // llama-server's OpenAI-compatible chat endpoint accepts schema-constrained JSON
-        // as {"type":"json_object","schema":...}; OpenAI's nested json_schema wrapper
-        // is not portable across llama.cpp versions.
-        response_format["schema"] = serde_json::to_value(schema).map_err(|error| {
-            AppError::Internal(format!("Invalid JSON schema for prompt: {error}"))
-        })?;
+    if !deepseek_compatible {
+        if let Some(schema) = schema.filter(|value| !matches!(value, serde_yaml::Value::Null)) {
+            // llama-server's OpenAI-compatible chat endpoint accepts schema-constrained JSON
+            // as {"type":"json_object","schema":...}; OpenAI's nested json_schema wrapper
+            // is not portable across llama.cpp versions.
+            response_format["schema"] = serde_json::to_value(schema).map_err(|error| {
+                AppError::Internal(format!("Invalid JSON schema for prompt: {error}"))
+            })?;
+        }
     }
 
     Ok(response_format)
@@ -513,7 +529,7 @@ fn llama_server_json_schema_uses_schema_field_under_json_object() {
     }))
     .unwrap();
 
-    let response_format = build_json_response_format(Some(&schema)).unwrap();
+    let response_format = build_json_response_format(Some(&schema), false).unwrap();
 
     assert_eq!(
         response_format.get("type"),
@@ -521,6 +537,25 @@ fn llama_server_json_schema_uses_schema_field_under_json_object() {
     );
     assert!(response_format.get("schema").is_some());
     assert!(response_format.get("json_schema").is_none());
+}
+
+#[cfg(test)]
+#[test]
+fn deepseek_json_format_omits_local_schema_extension() {
+    let schema = serde_yaml::to_value(serde_json::json!({
+        "type": "object",
+        "properties": {
+            "score": { "type": "integer" }
+        }
+    }))
+    .unwrap();
+
+    let response_format = build_json_response_format(Some(&schema), true).unwrap();
+
+    assert_eq!(
+        response_format,
+        serde_json::json!({ "type": "json_object" })
+    );
 }
 
 #[cfg(test)]

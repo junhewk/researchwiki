@@ -74,6 +74,7 @@ impl ContentFetcher {
                 c.source == "arxiv" && has_candidate_summary(c)
             }),
             ("pmc_xml", |c| c.source == "pmc"),
+            ("unpaywall_oa", |c| c.doi.is_some()),
             ("publisher_transform", |c| can_publisher_transform(c)),
             ("pubmed_abstract", |c| {
                 c.source == "pubmed" || c.source == "pmc"
@@ -135,6 +136,7 @@ impl ContentFetcher {
             "arxiv_abstract" => self.fetch_arxiv_abstract(candidate).await,
             "arxiv_pdf" => self.fetch_arxiv_pdf(candidate).await,
             "pmc_xml" => self.fetch_pmc_xml(candidate).await,
+            "unpaywall_oa" => self.fetch_unpaywall_oa(candidate).await,
             "publisher_transform" => self.fetch_publisher_transform(candidate).await,
             "pubmed_abstract" => self.fetch_pubmed_abstract(candidate).await,
             "candidate_summary" => self.fetch_candidate_summary(candidate).await,
@@ -241,6 +243,66 @@ impl ContentFetcher {
             content_type: ContentType::Xml,
             content: ContentData::Text(content),
             fetch_method: "pmc_xml".to_string(),
+        }))
+    }
+
+    /// Unpaywall's real purpose: given a DOI, resolve the best open-access PDF
+    /// location and download it. Works for any DOI-bearing candidate.
+    async fn fetch_unpaywall_oa(
+        &self,
+        candidate: &ArticleCandidate,
+    ) -> Result<Option<FetchedContent>, AppError> {
+        let Some(doi) = candidate.doi.as_deref() else {
+            return Ok(None);
+        };
+        let email =
+            env::var("UNPAYWALL_EMAIL").unwrap_or_else(|_| "junhewk.kim@gmail.com".to_string());
+        let url = format!("https://api.unpaywall.org/v2/{doi}");
+
+        let response = self
+            .client
+            .get(&url)
+            .query(&[("email", email.as_str())])
+            .send()
+            .await
+            .map_err(|error| AppError::Internal(format!("unpaywall lookup failed: {error}")))?;
+        if !response.status().is_success() {
+            return Ok(None);
+        }
+        let body: serde_json::Value = response
+            .json()
+            .await
+            .map_err(|error| AppError::Internal(format!("unpaywall json failed: {error}")))?;
+
+        let location = body.get("best_oa_location");
+        let pdf_url = location.and_then(|loc| {
+            loc.get("url_for_pdf")
+                .and_then(serde_json::Value::as_str)
+                .or_else(|| loc.get("url").and_then(serde_json::Value::as_str))
+                .map(str::to_string)
+        });
+        let Some(pdf_url) = pdf_url else {
+            return Ok(None);
+        };
+
+        let pdf_response =
+            self.client.get(&pdf_url).send().await.map_err(|error| {
+                AppError::Internal(format!("unpaywall PDF fetch failed: {error}"))
+            })?;
+        if !pdf_response.status().is_success() {
+            return Ok(None);
+        }
+        let bytes = pdf_response.bytes().await.map_err(|error| {
+            AppError::Internal(format!("failed to read unpaywall PDF response: {error}"))
+        })?;
+        if bytes.len() < 10 || !bytes[..4].starts_with(b"%PDF") {
+            return Ok(None);
+        }
+
+        Ok(Some(FetchedContent {
+            content_type: ContentType::Pdf,
+            content: ContentData::Binary(bytes.to_vec()),
+            fetch_method: "unpaywall_oa".to_string(),
         }))
     }
 

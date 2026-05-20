@@ -6,6 +6,7 @@ use tracing::warn;
 
 use crate::{
     error::AppError,
+    models::workspace::WorkspaceResearchContext,
     services::{
         llm::{LlmOutputMode, LlmService},
         pipeline::ArticleCandidate,
@@ -31,8 +32,12 @@ impl ArticleScreener {
         Self { llm_service }
     }
 
-    pub async fn screen(&self, candidate: &ArticleCandidate) -> ScreeningResult {
-        match self.screen_inner(candidate).await {
+    pub async fn screen(
+        &self,
+        candidate: &ArticleCandidate,
+        context: &WorkspaceResearchContext,
+    ) -> ScreeningResult {
+        match self.screen_inner(candidate, context).await {
             Ok(result) => result,
             Err(error) => {
                 warn!(
@@ -52,6 +57,7 @@ impl ArticleScreener {
         &self,
         candidates: &[ArticleCandidate],
         concurrency: usize,
+        context: &WorkspaceResearchContext,
     ) -> Vec<ScreeningResult> {
         let semaphore = Arc::new(Semaphore::new(concurrency.max(1)));
         let futures: Vec<_> = candidates
@@ -60,6 +66,7 @@ impl ArticleScreener {
                 let screener = self.clone();
                 let semaphore = semaphore.clone();
                 let candidate = candidate.clone();
+                let context = context.clone();
                 async move {
                     let Ok(_permit) = semaphore.acquire().await else {
                         return ScreeningResult {
@@ -68,16 +75,20 @@ impl ArticleScreener {
                             reasoning: Some("semaphore closed".to_string()),
                         };
                     };
-                    screener.screen(&candidate).await
+                    screener.screen(&candidate, &context).await
                 }
             })
             .collect();
         futures::future::join_all(futures).await
     }
 
-    pub async fn filter_relevant(&self, candidates: &[ArticleCandidate]) -> Vec<ArticleCandidate> {
+    pub async fn filter_relevant(
+        &self,
+        candidates: &[ArticleCandidate],
+        context: &WorkspaceResearchContext,
+    ) -> Vec<ArticleCandidate> {
         let concurrency = DEFAULT_CONCURRENCY.min(self.llm_service.max_concurrent_requests());
-        let results = self.screen_batch(candidates, concurrency).await;
+        let results = self.screen_batch(candidates, concurrency, context).await;
         candidates
             .iter()
             .zip(results)
@@ -89,6 +100,7 @@ impl ArticleScreener {
     async fn screen_inner(
         &self,
         candidate: &ArticleCandidate,
+        context: &WorkspaceResearchContext,
     ) -> Result<ScreeningResult, AppError> {
         let summary = candidate
             .summary
@@ -101,6 +113,27 @@ impl ArticleScreener {
         let mut variables = BTreeMap::new();
         variables.insert("title".to_string(), candidate.title.clone());
         variables.insert("summary".to_string(), summary);
+        variables.insert(
+            "collection_context".to_string(),
+            context.collection_context(),
+        );
+        variables.insert(
+            "topic_descriptor".to_string(),
+            if context.topic_descriptor.trim().is_empty() {
+                "the current research collection focus".to_string()
+            } else {
+                context.topic_descriptor.clone()
+            },
+        );
+        variables.insert(
+            "primary_question".to_string(),
+            empty_placeholder(&context.primary_question),
+        );
+        variables.insert("seed_concepts".to_string(), context.seed_concepts_text());
+        variables.insert(
+            "refined_question".to_string(),
+            empty_placeholder(&context.refined_question),
+        );
 
         let result = self
             .llm_service
@@ -122,6 +155,15 @@ impl ArticleScreener {
             confidence,
             reasoning,
         })
+    }
+}
+
+fn empty_placeholder(value: &str) -> String {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        "(not set)".to_string()
+    } else {
+        trimmed.to_string()
     }
 }
 

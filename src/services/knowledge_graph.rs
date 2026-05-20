@@ -1,5 +1,5 @@
 use std::{
-    collections::{BTreeSet, HashMap},
+    collections::{BTreeMap, BTreeSet, HashMap},
     path::PathBuf,
     sync::{Arc, Mutex},
     time::Duration,
@@ -27,12 +27,21 @@ use crate::{
         KGSynthesisListQuery, KGSynthesisListResponse, KGSynthesisRelatedEntity,
         RelationshipEvidenceOutput, SynthesisGenerationOutput,
     },
+    models::workspace::WorkspaceResearchContext,
     services::{
         embedding::EmbeddingService,
         fts::build_fts_query,
         llm::{LlmOutputMode, LlmService},
+        workspace::WorkspaceService,
     },
 };
+
+/// Subquery (one positional `?` = workspace_id) selecting entity ids that are
+/// mentioned by at least one article in the given workspace. Entities are
+/// globally deduplicated, so workspace membership is resolved via the article
+/// join rather than a column on `kg_entities`.
+const WS_ENTITY_SCOPE: &str = "(SELECT kae.entity_id FROM kg_article_entities kae \
+     JOIN haie_rev h ON h.uid = kae.article_uid WHERE h.workspace_id = ?)";
 
 const KG_TEXT_MAX_CHARS: usize = 8_000;
 const KG_CHUNK_WORDS: usize = 450;
@@ -149,6 +158,8 @@ const WIKI_ENTITY_FILTER_SQL: &str = r#"
 pub struct KnowledgeGraphService {
     database_path: Arc<PathBuf>,
     wiki_export_dir: Arc<PathBuf>,
+    workspace_id: i64,
+    workspace_service: Arc<WorkspaceService>,
     llm_service: Arc<LlmService>,
     embedding_service: Arc<EmbeddingService>,
     backfill_state: Arc<Mutex<KGBackfillStatusResponse>>,
@@ -381,18 +392,29 @@ impl KnowledgeGraphService {
     pub fn new(
         database_path: PathBuf,
         wiki_export_dir: PathBuf,
+        workspace_id: i64,
+        workspace_service: Arc<WorkspaceService>,
         llm_service: Arc<LlmService>,
         embedding_service: Arc<EmbeddingService>,
     ) -> Self {
         Self {
             database_path: Arc::new(database_path),
             wiki_export_dir: Arc::new(wiki_export_dir),
+            workspace_id,
+            workspace_service,
             llm_service,
             embedding_service,
             backfill_state: Arc::new(Mutex::new(KGBackfillStatusResponse::default())),
             synthesis_compile_state: Arc::new(Mutex::new(KGSynthesisCompileStatus::default())),
             full_backfill_state: Arc::new(Mutex::new(KGFullBackfillStatus::default())),
         }
+    }
+
+    async fn research_context(&self) -> WorkspaceResearchContext {
+        self.workspace_service
+            .research_context(self.workspace_id)
+            .await
+            .unwrap_or_default()
     }
 
     pub async fn query(&self, request: KGQueryRequest) -> Result<KGQueryResponse, AppError> {
@@ -435,25 +457,34 @@ impl KnowledgeGraphService {
         .await
     }
 
-    pub async fn get_stats(&self) -> Result<KGStatsResponse, AppError> {
+    pub async fn get_stats(&self, workspace_id: i64) -> Result<KGStatsResponse, AppError> {
         let database_path = self.database_path.clone();
 
         run_blocking(move || {
             let conn = crate::db::open_connection(&*database_path)?;
-            let nodes = conn.query_row("SELECT COUNT(*) FROM kg_entities", [], |row| {
-                row.get::<_, i64>(0)
-            })?;
-            let edges = conn.query_row("SELECT COUNT(*) FROM kg_relationships", [], |row| {
-                row.get::<_, i64>(0)
-            })?;
+            let nodes = conn.query_row(
+                &format!("SELECT COUNT(*) FROM kg_entities WHERE id IN {WS_ENTITY_SCOPE}"),
+                [workspace_id],
+                |row| row.get::<_, i64>(0),
+            )?;
+            let edges = conn.query_row(
+                &format!(
+                    "SELECT COUNT(*) FROM kg_relationships
+                     WHERE source_entity_id IN {WS_ENTITY_SCOPE}
+                       AND target_entity_id IN {WS_ENTITY_SCOPE}"
+                ),
+                [workspace_id, workspace_id],
+                |row| row.get::<_, i64>(0),
+            )?;
 
-            let mut stmt = conn.prepare(
+            let mut stmt = conn.prepare(&format!(
                 "SELECT entity_type, COUNT(*) AS count
                  FROM kg_entities
+                 WHERE id IN {WS_ENTITY_SCOPE}
                  GROUP BY entity_type
-                 ORDER BY entity_type",
-            )?;
-            let rows = stmt.query_map([], |row| {
+                 ORDER BY entity_type"
+            ))?;
+            let rows = stmt.query_map([workspace_id], |row| {
                 let entity_type: Option<String> = row.get(0)?;
                 let count: i64 = row.get(1)?;
                 Ok((entity_type.unwrap_or_else(|| "UNKNOWN".to_string()), count))
@@ -478,6 +509,7 @@ impl KnowledgeGraphService {
     pub async fn get_graph_data(
         &self,
         query: KGGraphDataQuery,
+        workspace_id: i64,
     ) -> Result<KGGraphDataResponse, AppError> {
         let database_path = self.database_path.clone();
 
@@ -487,8 +519,12 @@ impl KnowledgeGraphService {
             let min_degree = i64::from(query.min_degree.min(100));
             let entity_types = parse_entity_types(query.entity_types);
 
-            let mut params = vec![Value::Integer(min_degree)];
-            let mut filters = vec!["COALESCE(d.degree, 0) >= ?".to_string()];
+            // Workspace filter first so its `?` aligns with the leading param.
+            let mut params = vec![Value::Integer(workspace_id), Value::Integer(min_degree)];
+            let mut filters = vec![
+                format!("e.id IN {WS_ENTITY_SCOPE}"),
+                "COALESCE(d.degree, 0) >= ?".to_string(),
+            ];
 
             if !entity_types.is_empty() {
                 let placeholders = (0..entity_types.len())
@@ -706,6 +742,15 @@ impl KnowledgeGraphService {
     }
 
     pub async fn insert_articles(&self, uids: Vec<String>) -> Result<KGInsertResponse, AppError> {
+        let context = self.research_context().await;
+        self.insert_articles_with_context(uids, context).await
+    }
+
+    pub async fn insert_articles_with_context(
+        &self,
+        uids: Vec<String>,
+        context: WorkspaceResearchContext,
+    ) -> Result<KGInsertResponse, AppError> {
         if uids.is_empty() {
             return Ok(KGInsertResponse {
                 total: 0,
@@ -755,7 +800,7 @@ impl KnowledgeGraphService {
             }
 
             match self
-                .insert_article_text(&article.uid, &text, &mut engram)
+                .insert_article_text(&article.uid, &text, &mut engram, &context)
                 .await
             {
                 Ok(outcome) => {
@@ -923,6 +968,7 @@ impl KnowledgeGraphService {
                 return;
             }
         };
+        let context = self.research_context().await;
 
         let total_articles = articles.len() as i64;
         for (article_index, article) in articles.into_iter().enumerate() {
@@ -947,7 +993,7 @@ impl KnowledgeGraphService {
             let result = if text.trim().is_empty() {
                 Err(AppError::BadRequest("No text content".to_string()))
             } else {
-                self.insert_article_text(&article.uid, &text, &mut engram)
+                self.insert_article_text(&article.uid, &text, &mut engram, &context)
                     .await
             };
 
@@ -1232,6 +1278,7 @@ impl KnowledgeGraphService {
         uid: &str,
         text: &str,
         engram: &mut EntityEngram,
+        context: &WorkspaceResearchContext,
     ) -> Result<InsertOutcome, AppError> {
         let chunks = chunk_text_for_kg(text);
         let mut total_entities = 0i64;
@@ -1239,7 +1286,7 @@ impl KnowledgeGraphService {
         let mut session_cache = HashMap::new();
 
         for (chunk_index, chunk_text) in chunks.iter().enumerate() {
-            let extraction = self.extract_chunk(uid, chunk_text).await?;
+            let extraction = self.extract_chunk(uid, chunk_text, context).await?;
             if extraction.entities.is_empty() {
                 continue;
             }
@@ -1304,9 +1351,11 @@ impl KnowledgeGraphService {
         &self,
         uid: &str,
         chunk_text: &str,
+        context: &WorkspaceResearchContext,
     ) -> Result<ChunkExtraction, AppError> {
         let mut variables = std::collections::BTreeMap::new();
         variables.insert("chunk_text".to_string(), chunk_text.to_string());
+        insert_workspace_prompt_vars(&mut variables, context);
         let response = self
             .llm_service
             .execute_prompt(
@@ -2162,6 +2211,7 @@ impl KnowledgeGraphService {
     pub async fn list_syntheses(
         &self,
         query: KGSynthesisListQuery,
+        workspace_id: i64,
     ) -> Result<KGSynthesisListResponse, AppError> {
         let database_path = self.database_path.clone();
 
@@ -2181,6 +2231,8 @@ impl KnowledgeGraphService {
                 WHERE (?1 = 0 OR s.stale = 1)
                   AND (?2 IS NULL OR UPPER(e.entity_type) = UPPER(?2))
                   AND COALESCE(s.source_article_count, 0) >= ?3
+                  AND s.entity_id IN (SELECT kae.entity_id FROM kg_article_entities kae
+                       JOIN haie_rev h ON h.uid = kae.article_uid WHERE h.workspace_id = ?6)
                   AND {WIKI_ENTITY_FILTER_SQL}
                 ORDER BY s.stale DESC, s.source_article_count DESC, e.mention_count DESC
                 LIMIT ?4 OFFSET ?5
@@ -2194,7 +2246,8 @@ impl KnowledgeGraphService {
                         entity_type,
                         WIKI_MIN_SOURCE_ARTICLES,
                         limit,
-                        offset
+                        offset,
+                        workspace_id
                     ],
                     |row| {
                         Ok(KGEntitySynthesisSummary {
@@ -2220,12 +2273,19 @@ impl KnowledgeGraphService {
                 WHERE (?1 = 0 OR s.stale = 1)
                   AND (?2 IS NULL OR UPPER(e.entity_type) = UPPER(?2))
                   AND COALESCE(s.source_article_count, 0) >= ?3
+                  AND s.entity_id IN (SELECT kae.entity_id FROM kg_article_entities kae
+                       JOIN haie_rev h ON h.uid = kae.article_uid WHERE h.workspace_id = ?4)
                   AND {WIKI_ENTITY_FILTER_SQL}
                 "
             );
             let total: i64 = conn.query_row(
                 &total_sql,
-                params![stale_only_flag, entity_type, WIKI_MIN_SOURCE_ARTICLES],
+                params![
+                    stale_only_flag,
+                    entity_type,
+                    WIKI_MIN_SOURCE_ARTICLES,
+                    workspace_id
+                ],
                 |row| row.get(0),
             )?;
 
@@ -2236,11 +2296,16 @@ impl KnowledgeGraphService {
                 JOIN kg_entities e ON e.id = s.entity_id
                 WHERE s.stale = 1
                   AND COALESCE(s.source_article_count, 0) >= ?1
+                  AND s.entity_id IN (SELECT kae.entity_id FROM kg_article_entities kae
+                       JOIN haie_rev h ON h.uid = kae.article_uid WHERE h.workspace_id = ?2)
                   AND {WIKI_ENTITY_FILTER_SQL}
                 "
             );
-            let stale_count: i64 =
-                conn.query_row(&stale_sql, [WIKI_MIN_SOURCE_ARTICLES], |row| row.get(0))?;
+            let stale_count: i64 = conn.query_row(
+                &stale_sql,
+                params![WIKI_MIN_SOURCE_ARTICLES, workspace_id],
+                |row| row.get(0),
+            )?;
 
             Ok(KGSynthesisListResponse {
                 syntheses,
@@ -2298,8 +2363,13 @@ impl KnowledgeGraphService {
         .await
     }
 
-    pub async fn analyze_gaps(&self) -> Result<KGGapAnalysisResponse, AppError> {
+    pub async fn analyze_gaps(&self, workspace_id: i64) -> Result<KGGapAnalysisResponse, AppError> {
         let database_path = self.database_path.clone();
+        let context = self
+            .workspace_service
+            .research_context(workspace_id)
+            .await
+            .unwrap_or_default();
 
         let (
             entity_summaries,
@@ -2310,17 +2380,18 @@ impl KnowledgeGraphService {
         ) = run_blocking(move || {
             let conn = crate::db::open_connection(&*database_path)?;
 
-            let mut stmt = conn.prepare(
+            let mut stmt = conn.prepare(&format!(
                 "
                     SELECT e.canonical_name, e.entity_type,
                            COALESCE(s.summary, e.description, '') as summary
                     FROM kg_entities e
                     LEFT JOIN kg_entity_syntheses s ON s.entity_id = e.id
+                    WHERE e.id IN {WS_ENTITY_SCOPE}
                     ORDER BY e.mention_count DESC
                     LIMIT 30
-                    ",
-            )?;
-            let rows = stmt.query_map([], |row| {
+                    "
+            ))?;
+            let rows = stmt.query_map([workspace_id], |row| {
                 Ok((
                     row.get::<_, String>(0)?,
                     row.get::<_, Option<String>>(1)?
@@ -2341,9 +2412,11 @@ impl KnowledgeGraphService {
                 entity_parts.join("\n")
             };
 
-            let mut stmt =
-                conn.prepare("SELECT entity_type, COUNT(*) FROM kg_entities GROUP BY entity_type")?;
-            let rows = stmt.query_map([], |row| {
+            let mut stmt = conn.prepare(&format!(
+                "SELECT entity_type, COUNT(*) FROM kg_entities
+                 WHERE id IN {WS_ENTITY_SCOPE} GROUP BY entity_type"
+            ))?;
+            let rows = stmt.query_map([workspace_id], |row| {
                 Ok((
                     row.get::<_, Option<String>>(0)?
                         .unwrap_or_else(|| "UNKNOWN".to_string()),
@@ -2361,14 +2434,16 @@ impl KnowledgeGraphService {
                 type_parts.join("\n")
             };
 
-            let mut stmt = conn.prepare(
+            let mut stmt = conn.prepare(&format!(
                 "SELECT relationship_type, COUNT(*)
                      FROM kg_relationships
+                     WHERE source_entity_id IN {WS_ENTITY_SCOPE}
+                       AND target_entity_id IN {WS_ENTITY_SCOPE}
                      GROUP BY relationship_type
                      ORDER BY COUNT(*) DESC
-                     LIMIT 10",
-            )?;
-            let rows = stmt.query_map([], |row| {
+                     LIMIT 10"
+            ))?;
+            let rows = stmt.query_map([workspace_id, workspace_id], |row| {
                 Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
             })?;
             let mut rel_parts = Vec::new();
@@ -2382,17 +2457,18 @@ impl KnowledgeGraphService {
                 rel_parts.join("\n")
             };
 
-            let mut stmt = conn.prepare(
+            let mut stmt = conn.prepare(&format!(
                 "
                     SELECT e.canonical_name FROM kg_entities e
-                    WHERE NOT EXISTS (
+                    WHERE e.id IN {WS_ENTITY_SCOPE}
+                      AND NOT EXISTS (
                         SELECT 1 FROM kg_relationships r
                         WHERE r.source_entity_id = e.id OR r.target_entity_id = e.id
                     )
                     LIMIT 10
-                    ",
-            )?;
-            let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
+                    "
+            ))?;
+            let rows = stmt.query_map([workspace_id], |row| row.get::<_, String>(0))?;
             let mut isolated_parts = Vec::new();
             for row in rows {
                 isolated_parts.push(format!("- {}", row?));
@@ -2418,6 +2494,7 @@ impl KnowledgeGraphService {
         variables.insert("type_distribution".to_string(), type_distribution);
         variables.insert("relationship_stats".to_string(), relationship_stats);
         variables.insert("isolated_entities".to_string(), isolated_entities);
+        insert_workspace_prompt_vars(&mut variables, &context);
 
         let response = self
             .llm_service
@@ -2436,6 +2513,60 @@ impl KnowledgeGraphService {
             issues,
             entities_reviewed,
         })
+    }
+
+    /// The "gap finder": combines the workspace's primary question + gap note
+    /// with the scoped KG gap analysis and asks the LLM for the refined / next
+    /// research question. Persists the result and returns the refined question.
+    pub async fn generate_gap_bridge(
+        &self,
+        workspace_id: i64,
+        primary_question: String,
+        gap_note: String,
+    ) -> Result<String, AppError> {
+        let gaps = self.analyze_gaps(workspace_id).await?;
+        let gap_issues = if gaps.issues.is_empty() {
+            "(no structural gaps detected)".to_string()
+        } else {
+            gaps.issues
+                .iter()
+                .map(|issue| {
+                    format!(
+                        "- {} [{}]: {} (confidence {:.2})",
+                        issue.entity_name, issue.issue_type, issue.suggestion, issue.confidence
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+
+        let mut variables = std::collections::BTreeMap::new();
+        variables.insert("primary_question".to_string(), primary_question);
+        variables.insert("gap_note".to_string(), gap_note);
+        variables.insert("gap_issues".to_string(), gap_issues);
+
+        let response = self
+            .llm_service
+            .execute_prompt("gap_finder", variables, None, LlmOutputMode::Text)
+            .await?;
+        let refined = response.raw_text.trim().to_string();
+
+        let database_path = self.database_path.clone();
+        let refined_for_db = refined.clone();
+        let issues_json = serde_json::to_string(&gaps.issues).unwrap_or_else(|_| "[]".to_string());
+        let entities_reviewed = gaps.entities_reviewed;
+        run_blocking(move || {
+            let conn = crate::db::open_connection(&*database_path)?;
+            conn.execute(
+                "INSERT INTO kg_gap_findings (workspace_id, entities_reviewed, issues_json, refined_question)
+                 VALUES (?1, ?2, ?3, ?4)",
+                rusqlite::params![workspace_id, entities_reviewed, issues_json, refined_for_db],
+            )?;
+            Ok(())
+        })
+        .await?;
+
+        Ok(refined)
     }
 
     // --- Synthesis Compilation ---
@@ -2924,6 +3055,7 @@ impl KnowledgeGraphService {
 
     async fn compile_single_synthesis(&self, entity_id: i64) -> Result<(), AppError> {
         let context = self.gather_synthesis_context(entity_id).await?;
+        let research_context = self.research_context().await;
 
         let mut variables = std::collections::BTreeMap::new();
         variables.insert("entity_name".to_string(), context.entity_name.clone());
@@ -2933,6 +3065,7 @@ impl KnowledgeGraphService {
         variables.insert("relationships".to_string(), context.relationships);
         variables.insert("neighbor_entities".to_string(), context.neighbor_entities);
         variables.insert("current_synthesis".to_string(), context.current_synthesis);
+        insert_workspace_prompt_vars(&mut variables, &research_context);
 
         let response = self
             .llm_service
@@ -3189,6 +3322,8 @@ impl KnowledgeGraphService {
         variables.insert("target_entity".to_string(), target_name);
         variables.insert("relationship_type".to_string(), rel_type);
         variables.insert("article_contexts".to_string(), article_contexts);
+        let research_context = self.research_context().await;
+        insert_workspace_prompt_vars(&mut variables, &research_context);
 
         let response = self
             .llm_service
@@ -3230,6 +3365,42 @@ struct SynthesisContext {
     relationships: String,
     neighbor_entities: String,
     current_synthesis: String,
+}
+
+fn insert_workspace_prompt_vars(
+    variables: &mut BTreeMap<String, String>,
+    context: &WorkspaceResearchContext,
+) {
+    variables.insert(
+        "workspace_name".to_string(),
+        empty_prompt_value(&context.name),
+    );
+    variables.insert(
+        "collection_context".to_string(),
+        context.collection_context(),
+    );
+    variables.insert(
+        "topic_descriptor".to_string(),
+        empty_prompt_value(&context.topic_descriptor),
+    );
+    variables.insert(
+        "primary_question".to_string(),
+        empty_prompt_value(&context.primary_question),
+    );
+    variables.insert("seed_concepts".to_string(), context.seed_concepts_text());
+    variables.insert(
+        "refined_question".to_string(),
+        empty_prompt_value(&context.refined_question),
+    );
+}
+
+fn empty_prompt_value(value: &str) -> String {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        "(not set)".to_string()
+    } else {
+        trimmed.to_string()
+    }
 }
 
 fn query_entities(

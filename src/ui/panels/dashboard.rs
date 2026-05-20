@@ -1,12 +1,147 @@
-use super::PanelCtx;
+use egui_plot::{Bar, BarChart, Plot};
+
+use super::{MsgChannel, PanelCtx};
+use crate::models::article::{ArticleResponse, ArticleStats, DailyStatsResponse};
+
+const CHART_DAYS: u32 = 30;
+const TOP_LIMIT: u32 = 8;
+
+enum Msg {
+    Loaded {
+        stats: ArticleStats,
+        daily: DailyStatsResponse,
+        top: Vec<ArticleResponse>,
+    },
+    Error(String),
+}
 
 #[derive(Default)]
-pub struct Panel;
+pub struct Panel {
+    channel: Option<MsgChannel<Msg>>,
+    loaded_id: Option<i64>,
+    loading: bool,
+    stats: Option<ArticleStats>,
+    daily: Option<DailyStatsResponse>,
+    top: Vec<ArticleResponse>,
+    error: Option<String>,
+}
 
 impl Panel {
-    pub fn show(&mut self, ui: &mut egui::Ui, _ctx: &PanelCtx<'_>) {
-        ui.heading("Dashboard");
+    pub fn show(&mut self, ui: &mut egui::Ui, ctx: &PanelCtx<'_>) {
+        let channel = self.channel.get_or_insert_with(MsgChannel::default);
+        while let Ok(msg) = channel.rx.try_recv() {
+            match msg {
+                Msg::Loaded { stats, daily, top } => {
+                    self.stats = Some(stats);
+                    self.daily = Some(daily);
+                    self.top = top;
+                    self.error = None;
+                    self.loading = false;
+                }
+                Msg::Error(err) => {
+                    self.error = Some(err);
+                    self.loading = false;
+                }
+            }
+        }
+
+        let active = ctx.active_workspace_id;
+        if self.loaded_id != Some(active) && !self.loading {
+            self.refresh(ctx, active);
+        }
+
+        ui.horizontal(|ui| {
+            ui.heading("Dashboard");
+            if ui.button("Refresh").clicked() {
+                self.refresh(ctx, active);
+            }
+            if self.loading {
+                ui.spinner();
+            }
+        });
         ui.separator();
-        ui.label("Article counts, daily stats chart, tier summary tiles — TODO");
+
+        if let Some(err) = &self.error {
+            ui.colored_label(egui::Color32::RED, err);
+        }
+
+        if let Some(stats) = &self.stats {
+            ui.horizontal(|ui| {
+                tile(ui, "Total articles", stats.total_articles);
+                tile(ui, "This week", stats.this_week);
+                tile(ui, "Tier 1", stats.tier1_count);
+                tile(ui, "Pending review", stats.pending_review);
+            });
+        }
+
+        ui.add_space(10.0);
+
+        if let Some(daily) = &self.daily {
+            ui.label(
+                egui::RichText::new(format!("Articles per day (last {CHART_DAYS} days)")).strong(),
+            );
+            let bars: Vec<Bar> = daily
+                .days
+                .iter()
+                .enumerate()
+                .map(|(i, d)| Bar::new(i as f64, d.count as f64))
+                .collect();
+            let chart = BarChart::new("per_day", bars);
+            Plot::new("daily_stats_plot")
+                .height(180.0)
+                .allow_zoom(false)
+                .allow_drag(false)
+                .allow_scroll(false)
+                .show(ui, |plot_ui| plot_ui.bar_chart(chart));
+        }
+
+        ui.add_space(10.0);
+        ui.label(egui::RichText::new("Top articles").strong());
+        egui::ScrollArea::vertical().show(ui, |ui| {
+            if self.top.is_empty() {
+                ui.weak("No scored articles yet for this workspace.");
+            }
+            for article in &self.top {
+                ui.horizontal(|ui| {
+                    let score = article
+                        .total_score
+                        .map(|s| s.to_string())
+                        .unwrap_or_else(|| "—".to_string());
+                    ui.label(egui::RichText::new(format!("[{score}]")).monospace());
+                    ui.label(article.title.as_deref().unwrap_or("(untitled)"));
+                });
+            }
+        });
     }
+
+    fn refresh(&mut self, ctx: &PanelCtx<'_>, workspace_id: i64) {
+        let Some(channel) = self.channel.as_ref() else {
+            return;
+        };
+        self.loading = true;
+        self.loaded_id = Some(workspace_id);
+        let tx = channel.tx.clone();
+        let svc = ctx.state.article_service.clone();
+        let ws = Some(workspace_id);
+        ctx.handle.spawn(async move {
+            let stats = svc.get_stats(ws).await;
+            let daily = svc.get_daily_stats(CHART_DAYS, ws).await;
+            let top = svc.get_top_articles(CHART_DAYS, TOP_LIMIT, ws).await;
+            let _ = match (stats, daily, top) {
+                (Ok(stats), Ok(daily), Ok(top)) => tx.send(Msg::Loaded { stats, daily, top }),
+                (Err(e), _, _) | (_, Err(e), _) | (_, _, Err(e)) => {
+                    tx.send(Msg::Error(format!("Failed to load dashboard: {e}")))
+                }
+            };
+        });
+    }
+}
+
+fn tile(ui: &mut egui::Ui, label: &str, value: i64) {
+    egui::Frame::group(ui.style()).show(ui, |ui| {
+        ui.vertical(|ui| {
+            ui.label(egui::RichText::new(value.to_string()).heading());
+            ui.label(egui::RichText::new(label).weak());
+        });
+    });
 }

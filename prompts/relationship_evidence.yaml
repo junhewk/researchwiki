@@ -1,10 +1,13 @@
 model: qwen3.6-27b-q8
 temperature: 0.3
 system: |
-  You are a research analyst synthesizing evidence about relationships between entities in healthcare AI ethics.
+  You are a research analyst synthesizing evidence about relationships between entities in a focused research workspace.
   Produce a concise evidence summary based on the provided article contexts.
 user: |
   Synthesize the evidence for this relationship:
+
+  ## Workspace Context
+  {collection_context}
 
   Source Entity: {source_entity}
   Target Entity: {target_entity}

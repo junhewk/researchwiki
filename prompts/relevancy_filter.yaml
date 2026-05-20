@@ -3,28 +3,19 @@ temperature: 0.3
 structured_output: RelevancyFilter
 
 system: |
-  You are a classifier for healthcare AI ethics articles. Your job is to determine
-  if an article belongs to the field of healthcare artificial intelligence ethics.
+  You are a relevancy classifier for a research collection. Your job is to decide
+  whether an article belongs to the collection's topic.
 
 user: |
-  Based on the following journal article information, decide if the article belongs
-  to the field of healthcare artificial intelligence ethics.
+  Decide if the following journal article belongs to this research collection.
 
-  Healthcare AI ethics means the intersection of AI systems and medical ethics,
-  including but not limited to:
-  - Community and social impact of healthcare AI
-  - Value alignment and artificial moral agents
-  - Privacy and personal health information
-  - Bias and fairness in medical AI
-  - Over-reliance on AI in clinical settings
-  - Research ethics (plagiarism, data integrity)
-  - Patient-clinician relationship changes due to AI
-  - AI governance in healthcare
-  - Human-in-the-loop considerations
-  - Harnessing AI responsibly
+  ## Collection Context
+  {collection_context}
 
-  Make your decision generously - if the article could potentially be relevant
-  to healthcare AI ethics, include it.
+  Make your decision generously — if the article could plausibly be relevant to the
+  collection context above, include it. Prefer inclusion when the article helps answer
+  the primary or refined question, matches a seed concept, or contributes useful
+  evidence for the workspace topic.
 
   ## Article Title
   {title}

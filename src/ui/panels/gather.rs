@@ -902,8 +902,9 @@ impl Panel {
         self.last_refresh = Some(Instant::now());
         let tx = channel.tx.clone();
         let jobs = ctx.state.job_service.clone();
+        let workspace_id = ctx.active_workspace_id;
         ctx.handle.spawn(async move {
-            let result = jobs.list_jobs(HISTORY_LIMIT).await;
+            let result = jobs.list_jobs(HISTORY_LIMIT, workspace_id).await;
             let _ = match result {
                 Ok(items) => tx.send(Msg::JobsLoaded(items)),
                 Err(err) => tx.send(Msg::Error(format!("Failed to load gather jobs: {err}"))),
@@ -924,8 +925,9 @@ impl Panel {
         let ui_tx = ctx.ui_tx.clone();
         let jobs = ctx.state.job_service.clone();
         let source = source.to_string();
+        let workspace_id = ctx.active_workspace_id;
         ctx.handle.spawn(async move {
-            let result = jobs.enqueue_source(&source, days_back).await;
+            let result = jobs.enqueue_source(&source, days_back, workspace_id).await;
             match result {
                 Ok(run) => {
                     let _ = ui_tx.send(crate::runtime::UiEvent::Status(format!(
@@ -993,8 +995,9 @@ impl Panel {
         self.last_ops_refresh = Some(Instant::now());
         let tx = channel.tx.clone();
         let kg = ctx.state.knowledge_graph_service.clone();
+        let kg_ws = ctx.active_workspace_id;
         ctx.handle.spawn(async move {
-            let result = load_kg_snapshot(&kg).await;
+            let result = load_kg_snapshot(&kg, kg_ws).await;
             let _ = match result {
                 Ok(snapshot) => tx.send(Msg::OperationsLoaded(snapshot)),
                 Err(err) => tx.send(Msg::Error(format!("Failed to load KG status: {err}"))),
@@ -1028,6 +1031,7 @@ impl Panel {
         let tx = channel.tx.clone();
         let ui_tx = ctx.ui_tx.clone();
         let kg = ctx.state.knowledge_graph_service.clone();
+        let kg_ws = ctx.active_workspace_id;
         let batch_size = self.kg_batch_size.max(1) as u32;
         ctx.handle.spawn(async move {
             let result = kg.start_backfill(batch_size, 0).await;
@@ -1035,7 +1039,7 @@ impl Panel {
                 Ok(response) => {
                     let _ = ui_tx.send(crate::runtime::UiEvent::Status(response.message.clone()));
                     let _ = tx.send(Msg::OperationNotice(response.message));
-                    if let Ok(snapshot) = load_kg_snapshot(&kg).await {
+                    if let Ok(snapshot) = load_kg_snapshot(&kg, kg_ws).await {
                         let _ = tx.send(Msg::OperationsLoaded(snapshot));
                     }
                 }
@@ -1054,6 +1058,7 @@ impl Panel {
         let tx = channel.tx.clone();
         let ui_tx = ctx.ui_tx.clone();
         let kg = ctx.state.knowledge_graph_service.clone();
+        let kg_ws = ctx.active_workspace_id;
         let batch_size = self.wiki_batch_size.max(1) as u32;
         ctx.handle.spawn(async move {
             let result = kg
@@ -1067,7 +1072,7 @@ impl Panel {
                     );
                     let _ = ui_tx.send(crate::runtime::UiEvent::Status(message.clone()));
                     let _ = tx.send(Msg::OperationNotice(message));
-                    if let Ok(snapshot) = load_kg_snapshot(&kg).await {
+                    if let Ok(snapshot) = load_kg_snapshot(&kg, kg_ws).await {
                         let _ = tx.send(Msg::OperationsLoaded(snapshot));
                     }
                 }
@@ -1086,6 +1091,7 @@ impl Panel {
         let tx = channel.tx.clone();
         let ui_tx = ctx.ui_tx.clone();
         let kg = ctx.state.knowledge_graph_service.clone();
+        let kg_ws = ctx.active_workspace_id;
         let kg_batch_size = self.kg_batch_size.max(1) as u32;
         let wiki_batch_size = self.wiki_batch_size.max(1) as u32;
         ctx.handle.spawn(async move {
@@ -1094,7 +1100,7 @@ impl Panel {
                 Ok(response) => {
                     let _ = ui_tx.send(crate::runtime::UiEvent::Status(response.message.clone()));
                     let _ = tx.send(Msg::OperationNotice(response.message));
-                    if let Ok(snapshot) = load_kg_snapshot(&kg).await {
+                    if let Ok(snapshot) = load_kg_snapshot(&kg, kg_ws).await {
                         let _ = tx.send(Msg::OperationsLoaded(snapshot));
                     }
                 }
@@ -1113,6 +1119,7 @@ impl Panel {
         let tx = channel.tx.clone();
         let ui_tx = ctx.ui_tx.clone();
         let kg = ctx.state.knowledge_graph_service.clone();
+        let kg_ws = ctx.active_workspace_id;
         ctx.handle.spawn(async move {
             let result = kg.request_full_backfill_stop();
             match result {
@@ -1120,7 +1127,7 @@ impl Panel {
                     let message = "Full backfill stop requested".to_string();
                     let _ = ui_tx.send(crate::runtime::UiEvent::Status(message.clone()));
                     let _ = tx.send(Msg::OperationNotice(message));
-                    if let Ok(snapshot) = load_kg_snapshot(&kg).await {
+                    if let Ok(snapshot) = load_kg_snapshot(&kg, kg_ws).await {
                         let _ = tx.send(Msg::OperationsLoaded(snapshot));
                     }
                 }
@@ -1370,8 +1377,9 @@ fn running_label(running: bool) -> &'static str {
 
 async fn load_kg_snapshot(
     kg: &crate::services::knowledge_graph::KnowledgeGraphService,
+    workspace_id: i64,
 ) -> Result<KgSnapshot, crate::error::AppError> {
-    let stats = kg.get_stats().await?;
+    let stats = kg.get_stats(workspace_id).await?;
     let backfill = kg.get_backfill_status()?;
     let synthesis = kg.get_synthesis_compile_status()?;
     let full = kg.get_full_backfill_status()?;

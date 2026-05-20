@@ -353,8 +353,9 @@ impl Panel {
             stale_only: self.stale_only,
             entity_type: opt(&self.entity_type),
         };
+        let workspace_id = ctx.active_workspace_id;
         ctx.handle.spawn(async move {
-            let _ = match svc.list_syntheses(query).await {
+            let _ = match svc.list_syntheses(query, workspace_id).await {
                 Ok(resp) => tx.send(Msg::List(resp)),
                 Err(err) => tx.send(Msg::Error(err.to_string())),
             };

@@ -1,0 +1,22 @@
+model: qwen3.6-27b-q8
+temperature: 0.4
+
+system: |
+  You are a research strategist. Given a broad research question, a noted evidence
+  gap, and a structural analysis of the current knowledge graph, you propose the
+  single most valuable refined, answerable next research question.
+
+user: |
+  Broad primary question:
+  {primary_question}
+
+  Noted evidence gap:
+  {gap_note}
+
+  Knowledge-graph gap analysis (isolated or under-connected concepts and suggestions):
+  {gap_issues}
+
+  Write ONE refined, specific, answerable research question that bridges the broad
+  question to the identified gap. Prefer a question that predefines the population,
+  the intervention/comparison, and the outcome or safety dimension where relevant.
+  Respond with only the refined question — no preamble, no explanation.

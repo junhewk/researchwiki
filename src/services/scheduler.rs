@@ -18,6 +18,7 @@ const TICK_INTERVAL: std::time::Duration = std::time::Duration::from_secs(30);
 pub async fn run_scheduler_loop(
     job_service: Arc<JobService>,
     settings_service: Arc<SettingsService>,
+    workspace_id: i64,
     mut shutdown_rx: watch::Receiver<bool>,
 ) {
     info!("scheduler loop started");
@@ -76,7 +77,7 @@ pub async fn run_scheduler_loop(
                 "scheduler: triggering scheduled job"
             );
 
-            match job_service.enqueue_source(source, 2).await {
+            match job_service.enqueue_source(source, 2, workspace_id).await {
                 Ok(run) => {
                     info!(
                         job_id,
