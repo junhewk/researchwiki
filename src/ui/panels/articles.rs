@@ -498,8 +498,9 @@ impl Panel {
         let tx = channel.tx.clone();
         let svc = ctx.state.article_service.clone();
         let query = build_query(&self.filters, self.page, self.page_size);
+        let workspace_id = ctx.active_workspace_id;
         ctx.handle.spawn(async move {
-            let result = svc.list_articles(query).await;
+            let result = svc.list_articles(query, Some(workspace_id)).await;
             let _ = match result {
                 Ok(resp) => tx.send(Msg::Page(resp)),
                 Err(err) => tx.send(Msg::Error(err.to_string())),

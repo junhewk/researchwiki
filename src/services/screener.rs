@@ -31,8 +31,12 @@ impl ArticleScreener {
         Self { llm_service }
     }
 
-    pub async fn screen(&self, candidate: &ArticleCandidate) -> ScreeningResult {
-        match self.screen_inner(candidate).await {
+    pub async fn screen(
+        &self,
+        candidate: &ArticleCandidate,
+        topic_descriptor: &str,
+    ) -> ScreeningResult {
+        match self.screen_inner(candidate, topic_descriptor).await {
             Ok(result) => result,
             Err(error) => {
                 warn!(
@@ -52,6 +56,7 @@ impl ArticleScreener {
         &self,
         candidates: &[ArticleCandidate],
         concurrency: usize,
+        topic_descriptor: &str,
     ) -> Vec<ScreeningResult> {
         let semaphore = Arc::new(Semaphore::new(concurrency.max(1)));
         let futures: Vec<_> = candidates
@@ -60,6 +65,7 @@ impl ArticleScreener {
                 let screener = self.clone();
                 let semaphore = semaphore.clone();
                 let candidate = candidate.clone();
+                let topic_descriptor = topic_descriptor.to_string();
                 async move {
                     let Ok(_permit) = semaphore.acquire().await else {
                         return ScreeningResult {
@@ -68,16 +74,22 @@ impl ArticleScreener {
                             reasoning: Some("semaphore closed".to_string()),
                         };
                     };
-                    screener.screen(&candidate).await
+                    screener.screen(&candidate, &topic_descriptor).await
                 }
             })
             .collect();
         futures::future::join_all(futures).await
     }
 
-    pub async fn filter_relevant(&self, candidates: &[ArticleCandidate]) -> Vec<ArticleCandidate> {
+    pub async fn filter_relevant(
+        &self,
+        candidates: &[ArticleCandidate],
+        topic_descriptor: &str,
+    ) -> Vec<ArticleCandidate> {
         let concurrency = DEFAULT_CONCURRENCY.min(self.llm_service.max_concurrent_requests());
-        let results = self.screen_batch(candidates, concurrency).await;
+        let results = self
+            .screen_batch(candidates, concurrency, topic_descriptor)
+            .await;
         candidates
             .iter()
             .zip(results)
@@ -89,6 +101,7 @@ impl ArticleScreener {
     async fn screen_inner(
         &self,
         candidate: &ArticleCandidate,
+        topic_descriptor: &str,
     ) -> Result<ScreeningResult, AppError> {
         let summary = candidate
             .summary
@@ -98,9 +111,16 @@ impl ArticleScreener {
             .take(500)
             .collect::<String>();
 
+        let descriptor = if topic_descriptor.trim().is_empty() {
+            "the current research collection focus".to_string()
+        } else {
+            topic_descriptor.to_string()
+        };
+
         let mut variables = BTreeMap::new();
         variables.insert("title".to_string(), candidate.title.clone());
         variables.insert("summary".to_string(), summary);
+        variables.insert("topic_descriptor".to_string(), descriptor);
 
         let result = self
             .llm_service

@@ -6,7 +6,7 @@ use crate::{
         articles::ArticleService, embedding::EmbeddingService, jobs::JobService,
         knowledge_graph::KnowledgeGraphService, library::LibraryService, llm::LlmService,
         newsletter::NewsletterService, prompts::PromptService, settings::SettingsService,
-        traces::TraceService,
+        traces::TraceService, workspace::WorkspaceService,
     },
 };
 
@@ -23,21 +23,36 @@ pub struct AppState {
     pub prompt_service: std::sync::Arc<PromptService>,
     pub trace_service: std::sync::Arc<TraceService>,
     pub embedding_service: std::sync::Arc<EmbeddingService>,
+    /// Registry of workspaces (lives in the meta DB; not workspace-scoped).
+    pub workspace_service: std::sync::Arc<WorkspaceService>,
     pub http_client: Client,
 }
 
 impl AppState {
-    pub fn new(config: AppConfig) -> Self {
+    /// Builds the service graph for one workspace. `workspace_db_path` is that
+    /// workspace's own data file; the registry/settings/prompts stay global.
+    pub fn new(config: AppConfig, workspace_db_path: std::path::PathBuf) -> Self {
+        let root = config
+            .storage
+            .database_path
+            .parent()
+            .map(std::path::Path::to_path_buf)
+            .unwrap_or_else(|| std::path::PathBuf::from("."));
+        let workspace_service = std::sync::Arc::new(WorkspaceService::new(
+            root.join("meta.db"),
+            root.clone(),
+        ));
+
         let article_service =
-            std::sync::Arc::new(ArticleService::new(config.storage.database_path.clone()));
+            std::sync::Arc::new(ArticleService::new(workspace_db_path.clone()));
         let settings_service =
             std::sync::Arc::new(SettingsService::new(config.storage.settings_file.clone()));
         let prompt_service = std::sync::Arc::new(PromptService::new(
             config.storage.prompts_dir.clone(),
-            config.storage.database_path.clone(),
+            workspace_db_path.clone(),
         ));
         let trace_service =
-            std::sync::Arc::new(TraceService::new(config.storage.database_path.clone()));
+            std::sync::Arc::new(TraceService::new(workspace_db_path.clone()));
         let llm_service = std::sync::Arc::new(LlmService::new(
             prompt_service.clone(),
             trace_service.clone(),
@@ -53,23 +68,24 @@ impl AppState {
             config.embedding.clone(),
         ));
         let knowledge_graph_service = std::sync::Arc::new(KnowledgeGraphService::new(
-            config.storage.database_path.clone(),
+            workspace_db_path.clone(),
             config.storage.wiki_export_dir.clone(),
             llm_service.clone(),
             embedding_service.clone(),
         ));
         let library_service = std::sync::Arc::new(LibraryService::new(
-            config.storage.database_path.clone(),
+            workspace_db_path.clone(),
             embedding_service.clone(),
             llm_service.clone(),
         ));
         let job_service = std::sync::Arc::new(JobService::new(
-            config.storage.database_path.clone(),
+            workspace_db_path.clone(),
             llm_service.clone(),
             settings_service.clone(),
             http_client.clone(),
             library_service.clone(),
             knowledge_graph_service.clone(),
+            workspace_service.clone(),
         ));
         let newsletter_service = std::sync::Arc::new(NewsletterService::new(
             article_service.clone(),
@@ -88,6 +104,7 @@ impl AppState {
             prompt_service,
             trace_service,
             embedding_service,
+            workspace_service,
             http_client,
         }
     }

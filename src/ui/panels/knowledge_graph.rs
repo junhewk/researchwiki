@@ -12,6 +12,9 @@ const MAX_LABELS: usize = 24;
 const MIN_ZOOM: f32 = 0.35;
 const MAX_ZOOM: f32 = 4.0;
 const WHEEL_ZOOM_SPEED: f32 = 0.0015;
+const EDGE_ALPHA: u8 = 72;
+const EDGE_DIM_ALPHA: u8 = 34;
+const EDGE_HIGHLIGHT_ALPHA: u8 = 168;
 
 enum Msg {
     Search(KGQueryResponse),
@@ -284,11 +287,11 @@ impl Panel {
                         stroke_width
                     },
                     if highlighted {
-                        egui::Color32::from_rgb(65, 110, 185)
+                        edge_color(65, 110, 185, EDGE_HIGHLIGHT_ALPHA)
                     } else if selected_idx.is_some() {
-                        egui::Color32::from_gray(100)
+                        edge_color(100, 100, 100, EDGE_DIM_ALPHA)
                     } else {
-                        egui::Color32::from_gray(190)
+                        edge_color(190, 190, 190, EDGE_ALPHA)
                     },
                 ),
             );
@@ -483,8 +486,9 @@ impl Panel {
         };
         let tx = channel.tx.clone();
         let svc = ctx.state.knowledge_graph_service.clone();
+        let workspace_id = ctx.active_workspace_id;
         ctx.handle.spawn(async move {
-            let _ = match svc.get_stats().await {
+            let _ = match svc.get_stats(workspace_id).await {
                 Ok(resp) => tx.send(Msg::Stats(resp)),
                 Err(err) => tx.send(Msg::Error(err.to_string())),
             };
@@ -503,8 +507,9 @@ impl Panel {
             min_degree: self.min_degree,
             entity_types: opt(&self.entity_type),
         };
+        let workspace_id = ctx.active_workspace_id;
         ctx.handle.spawn(async move {
-            let _ = match svc.get_graph_data(query).await {
+            let _ = match svc.get_graph_data(query, workspace_id).await {
                 Ok(resp) => tx.send(Msg::Graph(resp)),
                 Err(err) => tx.send(Msg::Error(err.to_string())),
             };
@@ -620,6 +625,10 @@ fn graph_to_screen(pos: egui::Pos2, center: egui::Pos2, scale: f32) -> egui::Pos
 fn screen_to_graph(pos: egui::Pos2, center: egui::Pos2, scale: f32) -> egui::Pos2 {
     let v = (pos - center) / scale;
     egui::pos2(v.x, v.y)
+}
+
+fn edge_color(r: u8, g: u8, b: u8, alpha: u8) -> egui::Color32 {
+    egui::Color32::from_rgba_unmultiplied(r, g, b, alpha)
 }
 
 fn connected_nodes(selected: usize, edges: &[KgEdgeView], node_count: usize) -> Vec<bool> {

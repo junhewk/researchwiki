@@ -7,3 +7,4 @@ pub mod newsletter;
 pub mod prompt;
 pub mod settings;
 pub mod trace;
+pub mod workspace;

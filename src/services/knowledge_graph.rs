@@ -34,6 +34,13 @@ use crate::{
     },
 };
 
+/// Subquery (one positional `?` = workspace_id) selecting entity ids that are
+/// mentioned by at least one article in the given workspace. Entities are
+/// globally deduplicated, so workspace membership is resolved via the article
+/// join rather than a column on `kg_entities`.
+const WS_ENTITY_SCOPE: &str = "(SELECT kae.entity_id FROM kg_article_entities kae \
+     JOIN haie_rev h ON h.uid = kae.article_uid WHERE h.workspace_id = ?)";
+
 const KG_TEXT_MAX_CHARS: usize = 8_000;
 const KG_CHUNK_WORDS: usize = 450;
 const KG_CHUNK_OVERLAP_WORDS: usize = 60;
@@ -435,25 +442,34 @@ impl KnowledgeGraphService {
         .await
     }
 
-    pub async fn get_stats(&self) -> Result<KGStatsResponse, AppError> {
+    pub async fn get_stats(&self, workspace_id: i64) -> Result<KGStatsResponse, AppError> {
         let database_path = self.database_path.clone();
 
         run_blocking(move || {
             let conn = crate::db::open_connection(&*database_path)?;
-            let nodes = conn.query_row("SELECT COUNT(*) FROM kg_entities", [], |row| {
-                row.get::<_, i64>(0)
-            })?;
-            let edges = conn.query_row("SELECT COUNT(*) FROM kg_relationships", [], |row| {
-                row.get::<_, i64>(0)
-            })?;
+            let nodes = conn.query_row(
+                &format!("SELECT COUNT(*) FROM kg_entities WHERE id IN {WS_ENTITY_SCOPE}"),
+                [workspace_id],
+                |row| row.get::<_, i64>(0),
+            )?;
+            let edges = conn.query_row(
+                &format!(
+                    "SELECT COUNT(*) FROM kg_relationships
+                     WHERE source_entity_id IN {WS_ENTITY_SCOPE}
+                       AND target_entity_id IN {WS_ENTITY_SCOPE}"
+                ),
+                [workspace_id, workspace_id],
+                |row| row.get::<_, i64>(0),
+            )?;
 
-            let mut stmt = conn.prepare(
+            let mut stmt = conn.prepare(&format!(
                 "SELECT entity_type, COUNT(*) AS count
                  FROM kg_entities
+                 WHERE id IN {WS_ENTITY_SCOPE}
                  GROUP BY entity_type
-                 ORDER BY entity_type",
-            )?;
-            let rows = stmt.query_map([], |row| {
+                 ORDER BY entity_type"
+            ))?;
+            let rows = stmt.query_map([workspace_id], |row| {
                 let entity_type: Option<String> = row.get(0)?;
                 let count: i64 = row.get(1)?;
                 Ok((entity_type.unwrap_or_else(|| "UNKNOWN".to_string()), count))
@@ -478,6 +494,7 @@ impl KnowledgeGraphService {
     pub async fn get_graph_data(
         &self,
         query: KGGraphDataQuery,
+        workspace_id: i64,
     ) -> Result<KGGraphDataResponse, AppError> {
         let database_path = self.database_path.clone();
 
@@ -487,8 +504,12 @@ impl KnowledgeGraphService {
             let min_degree = i64::from(query.min_degree.min(100));
             let entity_types = parse_entity_types(query.entity_types);
 
-            let mut params = vec![Value::Integer(min_degree)];
-            let mut filters = vec!["COALESCE(d.degree, 0) >= ?".to_string()];
+            // Workspace filter first so its `?` aligns with the leading param.
+            let mut params = vec![Value::Integer(workspace_id), Value::Integer(min_degree)];
+            let mut filters = vec![
+                format!("e.id IN {WS_ENTITY_SCOPE}"),
+                "COALESCE(d.degree, 0) >= ?".to_string(),
+            ];
 
             if !entity_types.is_empty() {
                 let placeholders = (0..entity_types.len())
@@ -2162,6 +2183,7 @@ impl KnowledgeGraphService {
     pub async fn list_syntheses(
         &self,
         query: KGSynthesisListQuery,
+        workspace_id: i64,
     ) -> Result<KGSynthesisListResponse, AppError> {
         let database_path = self.database_path.clone();
 
@@ -2181,6 +2203,8 @@ impl KnowledgeGraphService {
                 WHERE (?1 = 0 OR s.stale = 1)
                   AND (?2 IS NULL OR UPPER(e.entity_type) = UPPER(?2))
                   AND COALESCE(s.source_article_count, 0) >= ?3
+                  AND s.entity_id IN (SELECT kae.entity_id FROM kg_article_entities kae
+                       JOIN haie_rev h ON h.uid = kae.article_uid WHERE h.workspace_id = ?6)
                   AND {WIKI_ENTITY_FILTER_SQL}
                 ORDER BY s.stale DESC, s.source_article_count DESC, e.mention_count DESC
                 LIMIT ?4 OFFSET ?5
@@ -2194,7 +2218,8 @@ impl KnowledgeGraphService {
                         entity_type,
                         WIKI_MIN_SOURCE_ARTICLES,
                         limit,
-                        offset
+                        offset,
+                        workspace_id
                     ],
                     |row| {
                         Ok(KGEntitySynthesisSummary {
@@ -2220,12 +2245,14 @@ impl KnowledgeGraphService {
                 WHERE (?1 = 0 OR s.stale = 1)
                   AND (?2 IS NULL OR UPPER(e.entity_type) = UPPER(?2))
                   AND COALESCE(s.source_article_count, 0) >= ?3
+                  AND s.entity_id IN (SELECT kae.entity_id FROM kg_article_entities kae
+                       JOIN haie_rev h ON h.uid = kae.article_uid WHERE h.workspace_id = ?4)
                   AND {WIKI_ENTITY_FILTER_SQL}
                 "
             );
             let total: i64 = conn.query_row(
                 &total_sql,
-                params![stale_only_flag, entity_type, WIKI_MIN_SOURCE_ARTICLES],
+                params![stale_only_flag, entity_type, WIKI_MIN_SOURCE_ARTICLES, workspace_id],
                 |row| row.get(0),
             )?;
 
@@ -2236,11 +2263,16 @@ impl KnowledgeGraphService {
                 JOIN kg_entities e ON e.id = s.entity_id
                 WHERE s.stale = 1
                   AND COALESCE(s.source_article_count, 0) >= ?1
+                  AND s.entity_id IN (SELECT kae.entity_id FROM kg_article_entities kae
+                       JOIN haie_rev h ON h.uid = kae.article_uid WHERE h.workspace_id = ?2)
                   AND {WIKI_ENTITY_FILTER_SQL}
                 "
             );
-            let stale_count: i64 =
-                conn.query_row(&stale_sql, [WIKI_MIN_SOURCE_ARTICLES], |row| row.get(0))?;
+            let stale_count: i64 = conn.query_row(
+                &stale_sql,
+                params![WIKI_MIN_SOURCE_ARTICLES, workspace_id],
+                |row| row.get(0),
+            )?;
 
             Ok(KGSynthesisListResponse {
                 syntheses,
@@ -2298,7 +2330,7 @@ impl KnowledgeGraphService {
         .await
     }
 
-    pub async fn analyze_gaps(&self) -> Result<KGGapAnalysisResponse, AppError> {
+    pub async fn analyze_gaps(&self, workspace_id: i64) -> Result<KGGapAnalysisResponse, AppError> {
         let database_path = self.database_path.clone();
 
         let (
@@ -2310,17 +2342,18 @@ impl KnowledgeGraphService {
         ) = run_blocking(move || {
             let conn = crate::db::open_connection(&*database_path)?;
 
-            let mut stmt = conn.prepare(
+            let mut stmt = conn.prepare(&format!(
                 "
                     SELECT e.canonical_name, e.entity_type,
                            COALESCE(s.summary, e.description, '') as summary
                     FROM kg_entities e
                     LEFT JOIN kg_entity_syntheses s ON s.entity_id = e.id
+                    WHERE e.id IN {WS_ENTITY_SCOPE}
                     ORDER BY e.mention_count DESC
                     LIMIT 30
-                    ",
-            )?;
-            let rows = stmt.query_map([], |row| {
+                    "
+            ))?;
+            let rows = stmt.query_map([workspace_id], |row| {
                 Ok((
                     row.get::<_, String>(0)?,
                     row.get::<_, Option<String>>(1)?
@@ -2341,9 +2374,11 @@ impl KnowledgeGraphService {
                 entity_parts.join("\n")
             };
 
-            let mut stmt =
-                conn.prepare("SELECT entity_type, COUNT(*) FROM kg_entities GROUP BY entity_type")?;
-            let rows = stmt.query_map([], |row| {
+            let mut stmt = conn.prepare(&format!(
+                "SELECT entity_type, COUNT(*) FROM kg_entities
+                 WHERE id IN {WS_ENTITY_SCOPE} GROUP BY entity_type"
+            ))?;
+            let rows = stmt.query_map([workspace_id], |row| {
                 Ok((
                     row.get::<_, Option<String>>(0)?
                         .unwrap_or_else(|| "UNKNOWN".to_string()),
@@ -2361,14 +2396,16 @@ impl KnowledgeGraphService {
                 type_parts.join("\n")
             };
 
-            let mut stmt = conn.prepare(
+            let mut stmt = conn.prepare(&format!(
                 "SELECT relationship_type, COUNT(*)
                      FROM kg_relationships
+                     WHERE source_entity_id IN {WS_ENTITY_SCOPE}
+                       AND target_entity_id IN {WS_ENTITY_SCOPE}
                      GROUP BY relationship_type
                      ORDER BY COUNT(*) DESC
-                     LIMIT 10",
-            )?;
-            let rows = stmt.query_map([], |row| {
+                     LIMIT 10"
+            ))?;
+            let rows = stmt.query_map([workspace_id, workspace_id], |row| {
                 Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
             })?;
             let mut rel_parts = Vec::new();
@@ -2382,17 +2419,18 @@ impl KnowledgeGraphService {
                 rel_parts.join("\n")
             };
 
-            let mut stmt = conn.prepare(
+            let mut stmt = conn.prepare(&format!(
                 "
                     SELECT e.canonical_name FROM kg_entities e
-                    WHERE NOT EXISTS (
+                    WHERE e.id IN {WS_ENTITY_SCOPE}
+                      AND NOT EXISTS (
                         SELECT 1 FROM kg_relationships r
                         WHERE r.source_entity_id = e.id OR r.target_entity_id = e.id
                     )
                     LIMIT 10
-                    ",
-            )?;
-            let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
+                    "
+            ))?;
+            let rows = stmt.query_map([workspace_id], |row| row.get::<_, String>(0))?;
             let mut isolated_parts = Vec::new();
             for row in rows {
                 isolated_parts.push(format!("- {}", row?));
@@ -2436,6 +2474,60 @@ impl KnowledgeGraphService {
             issues,
             entities_reviewed,
         })
+    }
+
+    /// The "gap finder": combines the workspace's primary question + gap note
+    /// with the scoped KG gap analysis and asks the LLM for the refined / next
+    /// research question. Persists the result and returns the refined question.
+    pub async fn generate_gap_bridge(
+        &self,
+        workspace_id: i64,
+        primary_question: String,
+        gap_note: String,
+    ) -> Result<String, AppError> {
+        let gaps = self.analyze_gaps(workspace_id).await?;
+        let gap_issues = if gaps.issues.is_empty() {
+            "(no structural gaps detected)".to_string()
+        } else {
+            gaps.issues
+                .iter()
+                .map(|issue| {
+                    format!(
+                        "- {} [{}]: {} (confidence {:.2})",
+                        issue.entity_name, issue.issue_type, issue.suggestion, issue.confidence
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+
+        let mut variables = std::collections::BTreeMap::new();
+        variables.insert("primary_question".to_string(), primary_question);
+        variables.insert("gap_note".to_string(), gap_note);
+        variables.insert("gap_issues".to_string(), gap_issues);
+
+        let response = self
+            .llm_service
+            .execute_prompt("gap_finder", variables, None, LlmOutputMode::Text)
+            .await?;
+        let refined = response.raw_text.trim().to_string();
+
+        let database_path = self.database_path.clone();
+        let refined_for_db = refined.clone();
+        let issues_json = serde_json::to_string(&gaps.issues).unwrap_or_else(|_| "[]".to_string());
+        let entities_reviewed = gaps.entities_reviewed;
+        run_blocking(move || {
+            let conn = crate::db::open_connection(&*database_path)?;
+            conn.execute(
+                "INSERT INTO kg_gap_findings (workspace_id, entities_reviewed, issues_json, refined_question)
+                 VALUES (?1, ?2, ?3, ?4)",
+                rusqlite::params![workspace_id, entities_reviewed, issues_json, refined_for_db],
+            )?;
+            Ok(())
+        })
+        .await?;
+
+        Ok(refined)
     }
 
     // --- Synthesis Compilation ---

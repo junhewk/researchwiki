@@ -12,8 +12,11 @@ use tracing::{info, warn};
 use crate::{
     config::AppConfig,
     db,
+    models::workspace::WorkspaceSummary,
     runtime::{DesktopRuntime, UiEvent},
-    services::{scheduler::run_scheduler_loop, settings::SettingsService},
+    services::{
+        scheduler::run_scheduler_loop, settings::SettingsService, workspace::WorkspaceService,
+    },
     state::AppState,
     tray::{TrayCommand, TrayController},
     ui::{
@@ -27,9 +30,11 @@ use crate::{
 struct PersistentUi {
     schema_version: u32,
     active_tab: Tab,
+    /// Active workspace id; 0 = unset (reconciled against the DB on activate).
+    active_workspace_id: i64,
 }
 
-const PERSIST_SCHEMA: u32 = 1;
+const PERSIST_SCHEMA: u32 = 2;
 const PERSIST_KEY: &str = "researchwiki_ui";
 
 pub struct DesktopApp {
@@ -53,6 +58,8 @@ pub struct DesktopApp {
     panels: Panels,
     persistent: PersistentUi,
     status: Option<String>,
+    workspaces: Vec<WorkspaceSummary>,
+    workspaces_refreshed_at: Option<std::time::Instant>,
 }
 
 impl DesktopApp {
@@ -70,6 +77,7 @@ impl DesktopApp {
             .unwrap_or_else(|| PersistentUi {
                 schema_version: PERSIST_SCHEMA,
                 active_tab: Tab::default(),
+                active_workspace_id: 0,
             });
 
         let mut app = Self {
@@ -91,6 +99,8 @@ impl DesktopApp {
             panels: Panels::default(),
             persistent,
             status: None,
+            workspaces: Vec::new(),
+            workspaces_refreshed_at: None,
         };
 
         if app.config.llm.is_configured() {
@@ -100,8 +110,64 @@ impl DesktopApp {
         app
     }
 
+    fn workspaces_dir(&self) -> std::path::PathBuf {
+        self.config
+            .storage
+            .database_path
+            .parent()
+            .map(Path::to_path_buf)
+            .unwrap_or_else(|| std::path::PathBuf::from("."))
+    }
+
+    fn workspace_registry(&self) -> WorkspaceService {
+        let dir = self.workspaces_dir();
+        WorkspaceService::new(dir.join("meta.db"), dir)
+    }
+
     fn activate(&mut self) {
-        let state = AppState::new(self.config.clone());
+        // Reconcile the active workspace from the registry: keep the persisted
+        // id if it still exists, else the registry's active/default workspace.
+        let registry = self.workspace_registry();
+        let persisted = self.persistent.active_workspace_id;
+        let (workspaces, active_id) = self.handle.block_on(async move {
+            let list = registry.list().await.unwrap_or_default();
+            let valid = persisted > 0 && list.iter().any(|w| w.id == persisted);
+            let active = if valid {
+                persisted
+            } else {
+                registry.active_or_default_id().await.unwrap_or(1)
+            };
+            (list, active)
+        });
+        self.workspaces = workspaces;
+        self.workspaces_refreshed_at = Some(std::time::Instant::now());
+        self.build_state_for_workspace(active_id);
+    }
+
+    /// Builds (or rebuilds) the service graph pointed at `workspace_id`'s data
+    /// file and restarts the scheduler bound to it. Used at startup and on every
+    /// top-bar workspace switch.
+    fn build_state_for_workspace(&mut self, workspace_id: i64) {
+        let registry = self.workspace_registry();
+        let ws_dir = self.workspaces_dir();
+        let default_db = self.config.storage.database_path.clone();
+        let db_path = self.handle.block_on(async move {
+            let _ = registry.set_active(workspace_id).await;
+            match registry.get(workspace_id).await {
+                Ok(ws) => ws_dir.join(ws.db_filename),
+                Err(_) => default_db,
+            }
+        });
+
+        let dims = self.config.embedding_dimensions;
+        if let Err(err) = self
+            .handle
+            .block_on(db::initialize_workspace_db(db_path.clone(), dims))
+        {
+            warn!("workspace db init failed: {err:#}");
+        }
+
+        let state = AppState::new(self.config.clone(), db_path);
 
         let prompt_service = state.prompt_service.clone();
         let job_service = state.job_service.clone();
@@ -116,16 +182,22 @@ impl DesktopApp {
             }
         });
 
+        // Restart the scheduler bound to the now-active workspace.
+        if let Some(old) = self.scheduler.take() {
+            old.abort();
+        }
         let scheduler_job = state.job_service.clone();
         let scheduler_settings = state.settings_service.clone();
         let shutdown_rx = self.shutdown_rx.clone();
         let scheduler = self.handle.spawn(run_scheduler_loop(
             scheduler_job,
             scheduler_settings,
+            workspace_id,
             shutdown_rx,
         ));
-
         self.scheduler = Some(scheduler);
+
+        self.persistent.active_workspace_id = workspace_id;
         self.state = Some(state);
         self.status = Some("Ready.".to_string());
     }
@@ -154,6 +226,26 @@ impl DesktopApp {
                 }
             }
         }
+    }
+
+    /// Reload the workspace list for the top-bar switcher, throttled so we
+    /// don't hit SQLite every frame. Picks up workspaces created in the
+    /// Input Set tab within a couple of seconds.
+    fn maybe_refresh_workspaces(&mut self) {
+        let stale = self
+            .workspaces_refreshed_at
+            .map(|t| t.elapsed() > Duration::from_secs(2))
+            .unwrap_or(true);
+        if !stale {
+            return;
+        }
+        if let Some(state) = &self.state {
+            let ws = state.workspace_service.clone();
+            if let Ok(list) = self.handle.block_on(async move { ws.list().await }) {
+                self.workspaces = list;
+            }
+        }
+        self.workspaces_refreshed_at = Some(std::time::Instant::now());
     }
 
     fn ensure_tray(&mut self, ctx: &egui::Context) {
@@ -251,13 +343,47 @@ impl eframe::App for DesktopApp {
             return;
         }
 
+        self.maybe_refresh_workspaces();
+
+        let mut pending_switch: Option<i64> = None;
+        let workspace_items: Vec<(i64, String)> = self
+            .workspaces
+            .iter()
+            .map(|w| (w.id, w.name.clone()))
+            .collect();
+        let active_ws = self.persistent.active_workspace_id;
+
         egui::TopBottomPanel::top("tabs").show(ctx, |ui| {
+            ui.horizontal(|ui| {
+                ui.label("Workspace:");
+                let mut selected = active_ws;
+                let current = workspace_items
+                    .iter()
+                    .find(|(id, _)| *id == selected)
+                    .map(|(_, name)| name.clone())
+                    .unwrap_or_else(|| "—".to_string());
+                egui::ComboBox::from_id_salt("workspace_switcher")
+                    .selected_text(current)
+                    .show_ui(ui, |ui| {
+                        for (id, name) in &workspace_items {
+                            ui.selectable_value(&mut selected, *id, name);
+                        }
+                    });
+                if selected != active_ws {
+                    pending_switch = Some(selected);
+                }
+            });
+            ui.separator();
             ui.horizontal_wrapped(|ui| {
                 for tab in Tab::ALL {
                     ui.selectable_value(&mut self.persistent.active_tab, tab, tab.label());
                 }
             });
         });
+
+        if let Some(new_id) = pending_switch {
+            self.build_state_for_workspace(new_id);
+        }
 
         egui::TopBottomPanel::bottom("status").show(ctx, |ui| {
             ui.label(self.status.as_deref().unwrap_or(""));
@@ -269,6 +395,7 @@ impl eframe::App for DesktopApp {
                     state,
                     handle: &self.handle,
                     ui_tx: &self.ui_tx,
+                    active_workspace_id: self.persistent.active_workspace_id,
                 };
                 self.panels.show(self.persistent.active_tab, ui, &panel_ctx);
             }
@@ -398,5 +525,22 @@ fn copy_dir_recursive(src: &Path, dst: &Path) -> Result<()> {
 }
 
 pub async fn bootstrap_db(config: &AppConfig) -> Result<()> {
+    // Registry of workspaces (meta DB) + the default workspace's data file
+    // (the existing primary database). Other workspace files are created lazily
+    // when first activated.
+    let root = config
+        .storage
+        .database_path
+        .parent()
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| std::path::PathBuf::from("."));
+    let default_db_filename = config
+        .storage
+        .database_path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("haie.db")
+        .to_string();
+    db::initialize_meta(root.join("meta.db"), default_db_filename).await?;
     db::initialize(config).await
 }

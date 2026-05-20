@@ -20,3 +20,4 @@ pub mod screener;
 pub mod settings;
 pub mod text_extractor;
 pub mod traces;
+pub mod workspace;

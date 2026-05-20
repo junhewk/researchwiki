@@ -86,7 +86,6 @@ pub const GATHER_SOURCE_IDS: &[&str] = &[
     "biorxiv",
     "openalex",
     "crossref",
-    "unpaywall",
     "semantic_scholar",
     "clinical_trials",
 ];
@@ -149,6 +148,26 @@ pub struct SaveCounters {
     pub errors: i32,
 }
 
+/// Per-workspace inputs that drive gather queries and topic-aware screening.
+#[derive(Debug, Clone, Default)]
+pub struct WorkspaceQueryProfile {
+    pub seed_concepts: Vec<String>,
+    pub override_queries: Vec<String>,
+    pub topic_descriptor: String,
+}
+
+impl WorkspaceQueryProfile {
+    /// The concept list used to build per-source queries: explicit overrides
+    /// win, otherwise the seed concepts.
+    pub fn concepts(&self) -> &[String] {
+        if self.override_queries.is_empty() {
+            &self.seed_concepts
+        } else {
+            &self.override_queries
+        }
+    }
+}
+
 impl PipelineService {
     pub fn new(database_path: std::path::PathBuf) -> Self {
         let client = Client::builder()
@@ -164,21 +183,47 @@ impl PipelineService {
         }
     }
 
-    pub async fn list_source(&self, source: &str, days_back: i32) -> Result<Vec<ArticleCandidate>> {
+    pub async fn list_source(
+        &self,
+        source: &str,
+        days_back: i32,
+        profile: &WorkspaceQueryProfile,
+    ) -> Result<Vec<ArticleCandidate>> {
         match source {
-            "arxiv" => self.list_arxiv(days_back).await,
-            "pmc" => self.list_pmc(days_back).await,
-            "pubmed" => self.list_pubmed(days_back).await,
-            "europepmc" => self.list_europe_pmc(days_back).await,
-            "medrxiv" => self.list_rxiv("medrxiv", days_back).await,
-            "biorxiv" => self.list_rxiv("biorxiv", days_back).await,
-            "openalex" => self.list_openalex(days_back).await,
-            "crossref" => self.list_crossref(days_back).await,
-            "unpaywall" => self.list_unpaywall(days_back).await,
-            "semantic_scholar" => self.list_semantic_scholar(days_back).await,
-            "clinical_trials" => self.list_clinical_trials(days_back).await,
+            "arxiv" => self.list_arxiv(days_back, profile).await,
+            "pmc" => self.list_pmc(days_back, profile).await,
+            "pubmed" => self.list_pubmed(days_back, profile).await,
+            "europepmc" => self.list_europe_pmc(days_back, profile).await,
+            "medrxiv" => self.list_rxiv("medrxiv", days_back, profile).await,
+            "biorxiv" => self.list_rxiv("biorxiv", days_back, profile).await,
+            "openalex" => self.list_openalex(days_back, profile).await,
+            "crossref" => self.list_crossref(days_back, profile).await,
+            "unpaywall" => self.list_unpaywall(days_back, profile).await,
+            "semantic_scholar" => self.list_semantic_scholar(days_back, profile).await,
+            "clinical_trials" => self.list_clinical_trials(days_back, profile).await,
             _ => bail!("unsupported source: {source}"),
         }
+    }
+
+    /// Loads the gather/screening profile for a workspace from the DB.
+    pub async fn load_workspace_profile(&self, workspace_id: i64) -> Result<WorkspaceQueryProfile> {
+        let database_path = self.database_path.clone();
+        task::spawn_blocking(move || -> Result<WorkspaceQueryProfile> {
+            let conn = crate::db::open_connection(&*database_path)?;
+            let (seed_json, override_json, descriptor): (String, String, String) = conn.query_row(
+                "SELECT seed_concepts_json, override_queries_json, topic_descriptor
+                 FROM workspaces WHERE id = ?1",
+                [workspace_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )?;
+            Ok(WorkspaceQueryProfile {
+                seed_concepts: serde_json::from_str(&seed_json).unwrap_or_default(),
+                override_queries: serde_json::from_str(&override_json).unwrap_or_default(),
+                topic_descriptor: descriptor,
+            })
+        })
+        .await
+        .context("load workspace profile task failed")?
     }
 
     pub async fn check_duplicates_batch(
@@ -219,10 +264,14 @@ impl PipelineService {
         .context("duplicate check task failed")?
     }
 
-    pub async fn save_candidates(&self, candidates: Vec<ArticleCandidate>) -> Result<SaveCounters> {
+    pub async fn save_candidates(
+        &self,
+        candidates: Vec<ArticleCandidate>,
+        workspace_id: i64,
+    ) -> Result<SaveCounters> {
         let database_path = self.database_path.clone();
 
-        task::spawn_blocking(move || save_candidates_sync(&database_path, candidates))
+        task::spawn_blocking(move || save_candidates_sync(&database_path, candidates, workspace_id))
             .await
             .context("candidate save task failed")?
     }
@@ -231,6 +280,7 @@ impl PipelineService {
         &self,
         candidate: &ArticleCandidate,
         evaluation: &serde_json::Map<String, serde_json::Value>,
+        workspace_id: i64,
     ) -> Result<SaveCounters> {
         let database_path = self.database_path.clone();
         let candidate = candidate.clone();
@@ -240,13 +290,17 @@ impl PipelineService {
             let conn = crate::db::open_connection(&*database_path).with_context(|| {
                 format!("failed to open database at {}", database_path.display())
             })?;
-            save_article_sync(&conn, &candidate, Some(&evaluation))
+            save_article_sync(&conn, &candidate, Some(&evaluation), workspace_id)
         })
         .await
         .context("evaluated candidate save task failed")?
     }
 
-    async fn list_arxiv(&self, days_back: i32) -> Result<Vec<ArticleCandidate>> {
+    async fn list_arxiv(
+        &self,
+        days_back: i32,
+        profile: &WorkspaceQueryProfile,
+    ) -> Result<Vec<ArticleCandidate>> {
         let today = Utc::now().date_naive();
         let start = today
             .checked_sub_days(Days::new(days_back.max(1) as u64))
@@ -261,7 +315,7 @@ impl PipelineService {
             }
         }
 
-        self.list_arxiv_legacy_search(start, today).await
+        self.list_arxiv_legacy_search(start, today, profile).await
     }
 
     async fn list_arxiv_oai(
@@ -346,10 +400,12 @@ impl PipelineService {
         &self,
         start: NaiveDate,
         today: NaiveDate,
+        profile: &WorkspaceQueryProfile,
     ) -> Result<Vec<ArticleCandidate>> {
         let mut merged = std::collections::BTreeMap::<String, ArticleCandidate>::new();
         let mut errors = Vec::new();
-        for (index, query) in ARXIV_QUERIES.iter().enumerate() {
+        let queries = arxiv_queries(profile);
+        for (index, query) in queries.iter().enumerate() {
             if index > 0 {
                 tokio::time::sleep(ARXIV_MIN_REQUEST_INTERVAL).await;
             }
@@ -493,14 +549,18 @@ impl PipelineService {
         limiter.defer_for(delay);
     }
 
-    async fn list_pmc(&self, days_back: i32) -> Result<Vec<ArticleCandidate>> {
+    async fn list_pmc(
+        &self,
+        days_back: i32,
+        profile: &WorkspaceQueryProfile,
+    ) -> Result<Vec<ArticleCandidate>> {
         let ids = self
             .get_ncbi_json(
                 NCBI_ESEARCH_URL,
                 vec![
                     ("db", "pmc".to_string()),
-                    ("term", PMC_QUERY.to_string()),
-                    ("reldate", days_back.clamp(1, 30).to_string()),
+                    ("term", pmc_term(profile)),
+                    ("reldate", days_back.clamp(1, 3650).to_string()),
                     ("retmax", "50".to_string()),
                     ("retmode", "json".to_string()),
                 ],
@@ -632,7 +692,11 @@ impl PipelineService {
         Ok(candidates)
     }
 
-    async fn list_pubmed(&self, days_back: i32) -> Result<Vec<ArticleCandidate>> {
+    async fn list_pubmed(
+        &self,
+        days_back: i32,
+        profile: &WorkspaceQueryProfile,
+    ) -> Result<Vec<ArticleCandidate>> {
         let today = Utc::now().date_naive();
         let max_date = today
             .checked_sub_days(Days::new(1))
@@ -650,7 +714,7 @@ impl PipelineService {
                 NCBI_ESEARCH_URL,
                 vec![
                     ("db", "pubmed".to_string()),
-                    ("term", PUBMED_QUERY.to_string()),
+                    ("term", pubmed_term(profile)),
                     ("retmode", "json".to_string()),
                     ("sort", "pub_date".to_string()),
                     ("mindate", min_date),
@@ -742,12 +806,17 @@ impl PipelineService {
         Ok(candidates)
     }
 
-    async fn list_europe_pmc(&self, days_back: i32) -> Result<Vec<ArticleCandidate>> {
+    async fn list_europe_pmc(
+        &self,
+        days_back: i32,
+        profile: &WorkspaceQueryProfile,
+    ) -> Result<Vec<ArticleCandidate>> {
         let (start, today) = date_window(days_back);
 
         let mut merged = BTreeMap::<String, ArticleCandidate>::new();
         let mut errors = Vec::new();
-        for (index, query) in EUROPE_PMC_QUERIES.iter().enumerate() {
+        let queries = europe_pmc_queries(profile);
+        for (index, query) in queries.iter().enumerate() {
             pause_between_source_queries(index).await;
             match self.fetch_europe_pmc_query(query, start, today).await {
                 Ok(candidates) => merge_candidates(&mut merged, candidates),
@@ -795,11 +864,13 @@ impl PipelineService {
         &self,
         server: &'static str,
         days_back: i32,
+        profile: &WorkspaceQueryProfile,
     ) -> Result<Vec<ArticleCandidate>> {
         let (start, today) = date_window(days_back);
         let collection = self.fetch_rxiv_collection(server, start, today).await?;
         let mut merged = BTreeMap::<String, ArticleCandidate>::new();
-        for query in RXIV_MEDICAL_AI_ETHICS_QUERIES {
+        let queries = free_text_queries(profile, RXIV_MEDICAL_AI_ETHICS_QUERIES);
+        for query in &queries {
             merge_candidates(
                 &mut merged,
                 rxiv_candidates_from_collection(server, &collection, query),
@@ -832,12 +903,17 @@ impl PipelineService {
             .unwrap_or_default())
     }
 
-    async fn list_openalex(&self, days_back: i32) -> Result<Vec<ArticleCandidate>> {
+    async fn list_openalex(
+        &self,
+        days_back: i32,
+        profile: &WorkspaceQueryProfile,
+    ) -> Result<Vec<ArticleCandidate>> {
         let (start, today) = date_window(days_back);
 
         let mut merged = BTreeMap::<String, ArticleCandidate>::new();
         let mut errors = Vec::new();
-        for (index, query) in SCHOLARLY_FREE_TEXT_QUERIES.iter().enumerate() {
+        let queries = free_text_queries(profile, SCHOLARLY_FREE_TEXT_QUERIES);
+        for (index, query) in queries.iter().enumerate() {
             pause_between_source_queries(index).await;
             match self.fetch_openalex_query(query, start, today).await {
                 Ok(candidates) => merge_candidates(&mut merged, candidates),
@@ -890,12 +966,17 @@ impl PipelineService {
             .collect())
     }
 
-    async fn list_crossref(&self, days_back: i32) -> Result<Vec<ArticleCandidate>> {
+    async fn list_crossref(
+        &self,
+        days_back: i32,
+        profile: &WorkspaceQueryProfile,
+    ) -> Result<Vec<ArticleCandidate>> {
         let (start, today) = date_window(days_back);
 
         let mut merged = BTreeMap::<String, ArticleCandidate>::new();
         let mut errors = Vec::new();
-        for (index, query) in SCHOLARLY_FREE_TEXT_QUERIES.iter().enumerate() {
+        let queries = free_text_queries(profile, SCHOLARLY_FREE_TEXT_QUERIES);
+        for (index, query) in queries.iter().enumerate() {
             pause_between_source_queries(index).await;
             match self.fetch_crossref_query(query, start, today).await {
                 Ok(candidates) => merge_candidates(&mut merged, candidates),
@@ -943,11 +1024,16 @@ impl PipelineService {
         Ok(items.iter().filter_map(crossref_candidate).collect())
     }
 
-    async fn list_unpaywall(&self, days_back: i32) -> Result<Vec<ArticleCandidate>> {
+    async fn list_unpaywall(
+        &self,
+        days_back: i32,
+        profile: &WorkspaceQueryProfile,
+    ) -> Result<Vec<ArticleCandidate>> {
         let (start, today) = date_window(days_back);
         let mut merged = BTreeMap::<String, ArticleCandidate>::new();
         let mut errors = Vec::new();
-        for (index, query) in SCHOLARLY_FREE_TEXT_QUERIES.iter().enumerate() {
+        let queries = free_text_queries(profile, SCHOLARLY_FREE_TEXT_QUERIES);
+        for (index, query) in queries.iter().enumerate() {
             pause_between_source_queries(index).await;
             match self.fetch_unpaywall_query(query).await {
                 Ok(candidates) => merge_candidates(&mut merged, candidates),
@@ -986,12 +1072,17 @@ impl PipelineService {
             .collect())
     }
 
-    async fn list_semantic_scholar(&self, days_back: i32) -> Result<Vec<ArticleCandidate>> {
+    async fn list_semantic_scholar(
+        &self,
+        days_back: i32,
+        profile: &WorkspaceQueryProfile,
+    ) -> Result<Vec<ArticleCandidate>> {
         let (start, today) = date_window(days_back);
 
         let mut merged = BTreeMap::<String, ArticleCandidate>::new();
         let mut errors = Vec::new();
-        for (index, query) in SCHOLARLY_FREE_TEXT_QUERIES.iter().enumerate() {
+        let queries = free_text_queries(profile, SCHOLARLY_FREE_TEXT_QUERIES);
+        for (index, query) in queries.iter().enumerate() {
             pause_between_source_queries(index).await;
             match self.fetch_semantic_scholar_query(query, start, today).await {
                 Ok(candidates) => merge_candidates(&mut merged, candidates),
@@ -1043,11 +1134,16 @@ impl PipelineService {
             .collect())
     }
 
-    async fn list_clinical_trials(&self, days_back: i32) -> Result<Vec<ArticleCandidate>> {
+    async fn list_clinical_trials(
+        &self,
+        days_back: i32,
+        profile: &WorkspaceQueryProfile,
+    ) -> Result<Vec<ArticleCandidate>> {
         let (start, today) = date_window(days_back);
         let mut merged = BTreeMap::<String, ArticleCandidate>::new();
         let mut errors = Vec::new();
-        for (index, query) in CLINICAL_TRIAL_QUERIES.iter().enumerate() {
+        let queries = free_text_queries(profile, CLINICAL_TRIAL_QUERIES);
+        for (index, query) in queries.iter().enumerate() {
             pause_between_source_queries(index).await;
             match self.fetch_clinical_trials_query(query).await {
                 Ok(candidates) => merge_candidates(&mut merged, candidates),
@@ -1190,6 +1286,68 @@ impl PipelineService {
 
         bail!("{label} exhausted retries")
     }
+}
+
+/// Builds a free-text query list from the workspace profile, falling back to the
+/// source's default queries when the workspace defines no concepts.
+fn free_text_queries(profile: &WorkspaceQueryProfile, fallback: &[&str]) -> Vec<String> {
+    let concepts = profile.concepts();
+    if concepts.is_empty() {
+        fallback.iter().map(|q| (*q).to_string()).collect()
+    } else {
+        concepts.to_vec()
+    }
+}
+
+fn quoted_or(concepts: &[String], suffix: &str) -> String {
+    concepts
+        .iter()
+        .map(|c| format!("\"{c}\"{suffix}"))
+        .collect::<Vec<_>>()
+        .join(" OR ")
+}
+
+fn pmc_term(profile: &WorkspaceQueryProfile) -> String {
+    let concepts = profile.concepts();
+    if concepts.is_empty() {
+        return PMC_QUERY.to_string();
+    }
+    format!(
+        "({}) AND open access[filter]",
+        quoted_or(concepts, "[All Fields]")
+    )
+}
+
+fn pubmed_term(profile: &WorkspaceQueryProfile) -> String {
+    let concepts = profile.concepts();
+    if concepts.is_empty() {
+        return PUBMED_QUERY.to_string();
+    }
+    format!(
+        "(({}) AND hasabstract[text])",
+        quoted_or(concepts, "[Title/Abstract]")
+    )
+}
+
+fn europe_pmc_queries(profile: &WorkspaceQueryProfile) -> Vec<String> {
+    let concepts = profile.concepts();
+    if concepts.is_empty() {
+        return EUROPE_PMC_QUERIES.iter().map(|q| (*q).to_string()).collect();
+    }
+    vec![format!("({}) AND OPEN_ACCESS:Y", quoted_or(concepts, ""))]
+}
+
+fn arxiv_queries(profile: &WorkspaceQueryProfile) -> Vec<String> {
+    let concepts = profile.concepts();
+    if concepts.is_empty() {
+        return ARXIV_QUERIES.iter().map(|q| (*q).to_string()).collect();
+    }
+    let joined = concepts
+        .iter()
+        .map(|c| format!("all:\"{c}\""))
+        .collect::<Vec<_>>()
+        .join(" OR ");
+    vec![format!("({joined})")]
 }
 
 fn date_window(days_back: i32) -> (NaiveDate, NaiveDate) {
@@ -1849,6 +2007,7 @@ fn clean_text(value: &str) -> String {
 fn save_candidates_sync(
     database_path: &std::path::Path,
     candidates: Vec<ArticleCandidate>,
+    workspace_id: i64,
 ) -> Result<SaveCounters> {
     let conn = crate::db::open_connection(database_path)
         .with_context(|| format!("failed to open database at {}", database_path.display()))?;
@@ -1857,7 +2016,7 @@ fn save_candidates_sync(
     conn.execute_batch("BEGIN")?;
 
     for candidate in &candidates {
-        let result = save_article_sync(&conn, candidate, None)?;
+        let result = save_article_sync(&conn, candidate, None, workspace_id)?;
         counters.saved += result.saved;
         counters.skipped += result.skipped;
         counters.errors += result.errors;
@@ -1872,6 +2031,7 @@ fn save_article_sync(
     conn: &Connection,
     candidate: &ArticleCandidate,
     evaluation: Option<&serde_json::Map<String, serde_json::Value>>,
+    workspace_id: i64,
 ) -> Result<SaveCounters> {
     let mut counters = SaveCounters::default();
     let reg_date = Utc::now().date_naive().format("%Y-%m-%d").to_string();
@@ -1920,7 +2080,7 @@ fn save_article_sync(
             byline_summary, why_it_matters,
             scholarly_rigor, novelty, relevance_score, practical_impact,
             interdisciplinary, critical_concerns, total_score, priority,
-            full_text, content_type
+            full_text, content_type, workspace_id
          ) VALUES (
             ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10,
             ?11, ?12, ?13, ?14, ?15,
@@ -1928,7 +2088,7 @@ fn save_article_sync(
             ?21, ?22, ?23, ?24, ?25,
             ?26, ?27,
             ?28, ?29, ?30, ?31, ?32, ?33, ?34, ?35,
-            ?36, ?37
+            ?36, ?37, ?38
          )",
         params![
             candidate.uid(),
@@ -1968,6 +2128,7 @@ fn save_article_sync(
             get_str("priority"),
             candidate.summary,
             Some("abstract_only".to_string()),
+            workspace_id,
         ],
     );
 
@@ -2851,7 +3012,7 @@ mod tests {
         let mut candidate = test_candidate("dup");
         candidate.summary = Some("Abstract text".to_string());
 
-        let metadata_save = save_article_sync(&conn, &candidate, None).unwrap();
+        let metadata_save = save_article_sync(&conn, &candidate, None, 1).unwrap();
         assert_eq!(metadata_save.saved, 1);
 
         let evaluation = serde_json::Map::from_iter([
@@ -2867,7 +3028,7 @@ mod tests {
             ("priority".to_string(), json!("Tier1")),
         ]);
 
-        let evaluated_save = save_article_sync(&conn, &candidate, Some(&evaluation)).unwrap();
+        let evaluated_save = save_article_sync(&conn, &candidate, Some(&evaluation), 1).unwrap();
         assert_eq!(evaluated_save.saved, 1);
         assert_eq!(evaluated_save.skipped, 0);
 
@@ -2923,6 +3084,7 @@ mod tests {
                 priority TEXT,
                 full_text TEXT,
                 content_type TEXT,
+                workspace_id INTEGER,
                 updated_at TEXT
             );
             "#,

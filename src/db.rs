@@ -1,4 +1,7 @@
-use std::{path::Path, time::Duration};
+use std::{
+    path::{Path, PathBuf},
+    time::Duration,
+};
 
 use anyhow::{Context, Result};
 use rusqlite::Connection;
@@ -16,9 +19,16 @@ pub fn open_connection(path: impl AsRef<Path>) -> rusqlite::Result<Connection> {
 }
 
 pub async fn initialize(config: &AppConfig) -> Result<()> {
-    let database_path = config.storage.database_path.clone();
-    let embedding_dimensions = config.embedding_dimensions;
+    initialize_workspace_db(
+        config.storage.database_path.clone(),
+        config.embedding_dimensions,
+    )
+    .await
+}
 
+/// Initializes a single workspace's database file (full data schema). Each
+/// workspace lives in its own file, so isolation is physical.
+pub async fn initialize_workspace_db(database_path: PathBuf, embedding_dimensions: u32) -> Result<()> {
     if let Some(parent) = database_path.parent() {
         tokio::fs::create_dir_all(parent)
             .await
@@ -28,6 +38,68 @@ pub async fn initialize(config: &AppConfig) -> Result<()> {
     task::spawn_blocking(move || initialize_sync(&database_path, embedding_dimensions))
         .await
         .context("sqlite init task failed")??;
+
+    Ok(())
+}
+
+/// Initializes the meta/registry database that lists workspaces and points at
+/// each one's data file. Seeds a default "Healthcare AI Ethics" workspace that
+/// reuses the existing primary database file.
+pub async fn initialize_meta(meta_path: PathBuf, default_db_filename: String) -> Result<()> {
+    if let Some(parent) = meta_path.parent() {
+        tokio::fs::create_dir_all(parent)
+            .await
+            .with_context(|| format!("failed to create meta directory {parent:?}"))?;
+    }
+
+    task::spawn_blocking(move || initialize_meta_sync(&meta_path, &default_db_filename))
+        .await
+        .context("meta init task failed")??;
+
+    Ok(())
+}
+
+fn initialize_meta_sync(meta_path: &std::path::Path, default_db_filename: &str) -> Result<()> {
+    let conn = Connection::open(meta_path)
+        .with_context(|| format!("failed to open meta database at {}", meta_path.display()))?;
+
+    conn.execute_batch(
+        r#"
+        PRAGMA journal_mode=WAL;
+        PRAGMA busy_timeout=5000;
+
+        CREATE TABLE IF NOT EXISTS workspaces (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            name TEXT NOT NULL,
+            slug TEXT NOT NULL UNIQUE,
+            db_filename TEXT NOT NULL,
+            primary_question TEXT NOT NULL DEFAULT '',
+            gap_note TEXT NOT NULL DEFAULT '',
+            refined_question TEXT NOT NULL DEFAULT '',
+            seed_concepts_json TEXT NOT NULL DEFAULT '[]',
+            override_queries_json TEXT NOT NULL DEFAULT '[]',
+            topic_descriptor TEXT NOT NULL DEFAULT '',
+            lookback_days INTEGER NOT NULL DEFAULT 180,
+            is_active INTEGER NOT NULL DEFAULT 0,
+            created_at TEXT DEFAULT (datetime('now')),
+            updated_at TEXT DEFAULT (datetime('now'))
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_workspaces_slug ON workspaces(slug);
+        "#,
+    )?;
+
+    conn.execute(
+        "INSERT INTO workspaces
+            (name, slug, db_filename, primary_question, topic_descriptor, seed_concepts_json, is_active)
+         SELECT 'Healthcare AI Ethics', 'healthcare-ai-ethics', ?1,
+                'What are the ethical implications of AI in healthcare?',
+                'the ethics of artificial intelligence in healthcare and clinical medicine',
+                '[\"artificial intelligence\",\"clinical decision support\",\"algorithmic fairness\",\"patient privacy\",\"AI governance\"]',
+                1
+         WHERE NOT EXISTS (SELECT 1 FROM workspaces)",
+        [default_db_filename],
+    )?;
 
     Ok(())
 }
@@ -45,6 +117,24 @@ fn initialize_sync(database_path: &std::path::Path, embedding_dimensions: u32) -
         PRAGMA journal_mode=WAL;
         PRAGMA foreign_keys=ON;
         PRAGMA busy_timeout=5000;
+
+        CREATE TABLE IF NOT EXISTS workspaces (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            name TEXT NOT NULL,
+            slug TEXT NOT NULL UNIQUE,
+            primary_question TEXT NOT NULL DEFAULT '',
+            gap_note TEXT NOT NULL DEFAULT '',
+            refined_question TEXT NOT NULL DEFAULT '',
+            seed_concepts_json TEXT NOT NULL DEFAULT '[]',
+            override_queries_json TEXT NOT NULL DEFAULT '[]',
+            topic_descriptor TEXT NOT NULL DEFAULT '',
+            lookback_days INTEGER NOT NULL DEFAULT 180,
+            is_active INTEGER NOT NULL DEFAULT 0,
+            created_at TEXT DEFAULT (datetime('now')),
+            updated_at TEXT DEFAULT (datetime('now'))
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_workspaces_slug ON workspaces(slug);
 
         CREATE TABLE IF NOT EXISTS haie_rev (
             uid TEXT PRIMARY KEY,
@@ -258,6 +348,17 @@ fn initialize_sync(database_path: &std::path::Path, embedding_dimensions: u32) -
         );
 
         CREATE INDEX IF NOT EXISTS idx_kg_entity_syntheses_stale ON kg_entity_syntheses(stale);
+
+        CREATE TABLE IF NOT EXISTS kg_gap_findings (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            workspace_id INTEGER NOT NULL,
+            entities_reviewed INTEGER DEFAULT 0,
+            issues_json TEXT NOT NULL DEFAULT '[]',
+            refined_question TEXT NOT NULL DEFAULT '',
+            created_at TEXT DEFAULT (datetime('now'))
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_kg_gap_findings_ws ON kg_gap_findings(workspace_id);
         "#,
     )?;
 
@@ -289,6 +390,63 @@ fn initialize_sync(database_path: &std::path::Path, embedding_dimensions: u32) -
     ensure_column(&conn, "haie_rev", "content_type", "TEXT")?;
     ensure_column(&conn, "haie_rev", "has_embeddings", "INTEGER DEFAULT 0")?;
     ensure_column(&conn, "haie_rev", "has_kg_entities", "INTEGER DEFAULT 0")?;
+
+    // Multi-workspace: nullable workspace_id on data tables (NULL on
+    // prompt_versions = global default; non-NULL = workspace override).
+    ensure_column(&conn, "haie_rev", "workspace_id", "INTEGER")?;
+    ensure_column(&conn, "job_runs", "workspace_id", "INTEGER")?;
+    ensure_column(&conn, "prompt_versions", "workspace_id", "INTEGER")?;
+    ensure_column(&conn, "prompt_traces", "workspace_id", "INTEGER")?;
+
+    conn.execute_batch(
+        "
+        CREATE INDEX IF NOT EXISTS idx_haie_rev_workspace ON haie_rev(workspace_id);
+        CREATE INDEX IF NOT EXISTS idx_job_runs_workspace ON job_runs(workspace_id);
+        CREATE INDEX IF NOT EXISTS idx_prompt_versions_workspace
+            ON prompt_versions(prompt_name, workspace_id);
+        CREATE INDEX IF NOT EXISTS idx_prompt_traces_workspace ON prompt_traces(workspace_id);
+        ",
+    )?;
+
+    seed_default_workspace_and_backfill(&conn)?;
+
+    Ok(())
+}
+
+/// Seeds the default "Healthcare AI Ethics" workspace on first run and assigns
+/// any pre-existing rows (from the single-topic era) to it. `prompt_versions`
+/// stays NULL = global defaults shared by every workspace until overridden.
+fn seed_default_workspace_and_backfill(conn: &Connection) -> Result<()> {
+    conn.execute(
+        "INSERT INTO workspaces
+            (name, slug, primary_question, topic_descriptor, seed_concepts_json, is_active)
+         SELECT 'Healthcare AI Ethics', 'healthcare-ai-ethics',
+                'What are the ethical implications of AI in healthcare?',
+                'the ethics of artificial intelligence in healthcare and clinical medicine',
+                '[\"artificial intelligence\",\"clinical decision support\",\"algorithmic fairness\",\"patient privacy\",\"AI governance\"]',
+                1
+         WHERE NOT EXISTS (SELECT 1 FROM workspaces)",
+        [],
+    )?;
+
+    let default_id: i64 = conn.query_row(
+        "SELECT id FROM workspaces ORDER BY id LIMIT 1",
+        [],
+        |row| row.get(0),
+    )?;
+
+    conn.execute(
+        "UPDATE haie_rev SET workspace_id = ?1 WHERE workspace_id IS NULL",
+        [default_id],
+    )?;
+    conn.execute(
+        "UPDATE job_runs SET workspace_id = ?1 WHERE workspace_id IS NULL",
+        [default_id],
+    )?;
+    conn.execute(
+        "UPDATE prompt_traces SET workspace_id = ?1 WHERE workspace_id IS NULL",
+        [default_id],
+    )?;
 
     Ok(())
 }

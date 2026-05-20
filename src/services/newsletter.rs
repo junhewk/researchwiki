@@ -39,7 +39,9 @@ impl NewsletterService {
         days: u32,
         limit: u32,
     ) -> Result<Vec<ArticleResponse>, AppError> {
-        self.article_service.get_top_articles(days, limit).await
+        self.article_service
+            .get_top_articles(days, limit, None)
+            .await
     }
 
     pub async fn preview_newsletter(
