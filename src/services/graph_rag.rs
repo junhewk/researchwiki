@@ -124,7 +124,7 @@ pub async fn get_entity_context(
 
 /// Boost scores for chunks from articles mentioning KG entities.
 pub fn boost_graph_results(
-    results: &mut Vec<(i64, f64, String)>,
+    results: &mut [(i64, f64, String)],
     related_uids: &HashSet<String>,
     boost_factor: f64,
 ) {

@@ -163,7 +163,7 @@ impl ArticleEvaluator {
             || fields
                 .get("first_author")
                 .and_then(Value::as_str)
-                .map_or(true, str::is_empty)
+                .is_none_or(str::is_empty)
         {
             fields.insert(
                 "first_author".to_string(),

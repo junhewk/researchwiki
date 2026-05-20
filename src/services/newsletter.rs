@@ -371,7 +371,7 @@ fn generate_newsletter_markdown(
     let title_section = if newsletter_title.trim().is_empty() {
         String::new()
     } else {
-        format!("# {}\n\n", newsletter_title)
+        format!("# {newsletter_title}\n\n")
     };
 
     let highlights_section = if highlights.trim().is_empty() {

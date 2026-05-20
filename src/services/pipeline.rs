@@ -1212,7 +1212,7 @@ fn filter_candidates_by_known_date(
                 .pub_date
                 .as_deref()
                 .and_then(parse_candidate_date)
-                .map_or(true, |date| date >= start && date <= end)
+                .is_none_or(|date| date >= start && date <= end)
         })
         .collect()
 }
@@ -1976,7 +1976,7 @@ fn save_article_sync(
             counters.saved += update_existing_article_sync(
                 conn,
                 candidate,
-                &category,
+                category,
                 &title,
                 &first_author,
                 candidate.authors.as_deref(),

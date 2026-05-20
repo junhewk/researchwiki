@@ -2126,8 +2126,7 @@ impl KnowledgeGraphService {
             )) = row
             else {
                 return Err(anyhow::anyhow!(
-                    "No synthesis found for entity: {}",
-                    entity_name
+                    "No synthesis found for entity: {entity_name}"
                 ));
             };
 
@@ -2333,7 +2332,7 @@ impl KnowledgeGraphService {
             let mut count = 0i64;
             for row in rows {
                 let (name, entity_type, summary) = row?;
-                entity_parts.push(format!("- {} [{}]: {}", name, entity_type, summary));
+                entity_parts.push(format!("- {name} [{entity_type}]: {summary}"));
                 count += 1;
             }
             let entity_summaries = if entity_parts.is_empty() {
@@ -2354,7 +2353,7 @@ impl KnowledgeGraphService {
             let mut type_parts = Vec::new();
             for row in rows {
                 let (entity_type, c) = row?;
-                type_parts.push(format!("- {}: {}", entity_type, c));
+                type_parts.push(format!("- {entity_type}: {c}"));
             }
             let type_distribution = if type_parts.is_empty() {
                 "(no entities)".to_string()
@@ -2375,7 +2374,7 @@ impl KnowledgeGraphService {
             let mut rel_parts = Vec::new();
             for row in rows {
                 let (rel_type, c) = row?;
-                rel_parts.push(format!("- {}: {}", rel_type, c));
+                rel_parts.push(format!("- {rel_type}: {c}"));
             }
             let relationship_stats = if rel_parts.is_empty() {
                 "(no relationships)".to_string()
@@ -2435,7 +2434,7 @@ impl KnowledgeGraphService {
 
         Ok(KGGapAnalysisResponse {
             issues,
-            entities_reviewed: entities_reviewed,
+            entities_reviewed,
         })
     }
 
@@ -2626,7 +2625,6 @@ impl KnowledgeGraphService {
         entity_ids: Option<&[i64]>,
     ) -> Result<i64, AppError> {
         let database_path = self.database_path.clone();
-        let force_all = force_all;
         let entity_ids = entity_ids.map(|ids| ids.to_vec());
 
         run_blocking(move || {
@@ -2840,10 +2838,7 @@ impl KnowledgeGraphService {
                     .or(mention_text)
                     .unwrap_or_else(|| "(no context)".to_string());
 
-                let entry = format!(
-                    "### From \"{}\" ({})\nContext: {}\n\n",
-                    title_str, author_str, context_str
-                );
+                let entry = format!("### From \"{title_str}\" ({author_str})\nContext: {context_str}\n\n");
 
                 if mention_contexts.len() + entry.len() > 6000 {
                     break;
@@ -2882,12 +2877,10 @@ impl KnowledgeGraphService {
             for row in rel_rows {
                 let (neighbor, neighbor_type, rel_type, _weight) = row?;
                 relationships.push_str(&format!(
-                    "- {} -> {} ({})\n",
-                    rel_type.to_uppercase(),
-                    neighbor,
-                    neighbor_type
+                    "- {} -> {neighbor} ({neighbor_type})\n",
+                    rel_type.to_uppercase()
                 ));
-                neighbor_parts.push(format!("{} ({})", neighbor, neighbor_type));
+                neighbor_parts.push(format!("{neighbor} ({neighbor_type})"));
             }
             if relationships.is_empty() {
                 relationships = "(no relationships)".to_string();
@@ -2917,7 +2910,7 @@ impl KnowledgeGraphService {
             Ok(SynthesisContext {
                 entity_name,
                 entity_type: description
-                    .map(|d| format!("{} — {}", entity_type, d))
+                    .map(|d| format!("{entity_type} — {d}"))
                     .unwrap_or(entity_type),
                 aliases: aliases_str,
                 mention_contexts,
@@ -3174,10 +3167,7 @@ impl KnowledgeGraphService {
                 let context_str = context
                     .or(mention)
                     .unwrap_or_else(|| "(no context)".to_string());
-                let entry = format!(
-                    "### From \"{}\" ({})\n{}\n\n",
-                    title_str, author_str, context_str
-                );
+                let entry = format!("### From \"{title_str}\" ({author_str})\n{context_str}\n\n");
                 if article_contexts.len() + entry.len() > 4000 {
                     break;
                 }

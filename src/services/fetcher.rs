@@ -60,13 +60,15 @@ pub struct ContentFetcher {
     client: Client,
 }
 
+type FetchStrategy = (&'static str, fn(&ArticleCandidate) -> bool);
+
 impl ContentFetcher {
     pub fn new(client: Client) -> Self {
         Self { client }
     }
 
     pub async fn fetch(&self, candidate: &ArticleCandidate) -> Option<FetchedContent> {
-        let strategies: &[(&str, fn(&ArticleCandidate) -> bool)] = &[
+        let strategies: &[FetchStrategy] = &[
             ("arxiv_pdf", |c| c.source == "arxiv"),
             ("arxiv_abstract", |c| {
                 c.source == "arxiv" && has_candidate_summary(c)
@@ -257,7 +259,7 @@ impl ContentFetcher {
                 "springer",
             )
         } else if doi_lower.contains("nature") {
-            let suffix = doi.split('/').last().unwrap_or(doi);
+            let suffix = doi.split('/').next_back().unwrap_or(doi);
             (
                 format!("https://www.nature.com/articles/{suffix}.pdf"),
                 "nature",
@@ -689,7 +691,7 @@ fn can_publisher_transform(candidate: &ArticleCandidate) -> bool {
         .doi
         .as_deref()
         .map(str::to_lowercase)
-        .map_or(false, |doi| {
+        .is_some_and(|doi| {
             ["springer", "nature", "biomedcentral", "jmir", "cambridge"]
                 .iter()
                 .any(|publisher| doi.contains(publisher))

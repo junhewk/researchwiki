@@ -9,6 +9,9 @@ use super::{MsgChannel, PanelCtx};
 
 const GRAPH_PADDING: f32 = 28.0;
 const MAX_LABELS: usize = 24;
+const MIN_ZOOM: f32 = 0.35;
+const MAX_ZOOM: f32 = 4.0;
+const WHEEL_ZOOM_SPEED: f32 = 0.0015;
 
 enum Msg {
     Search(KGQueryResponse),
@@ -36,6 +39,9 @@ pub struct Panel {
     edges: Vec<KgEdgeView>,
     graph_loading: bool,
     selected_entity: Option<String>,
+    view_zoom: f32,
+    view_pan: egui::Vec2,
+    dragged_node: Option<usize>,
 
     // Stats header + selected-entity detail.
     stats: Option<KGStatsResponse>,
@@ -70,6 +76,7 @@ impl Panel {
             self.initialized = true;
             self.limit = 200;
             self.min_degree = 0;
+            self.reset_view_transform();
             self.load_stats(ctx);
             self.load_graph(ctx);
         }
@@ -168,6 +175,15 @@ impl Panel {
             if self.graph_loading {
                 ui.spinner();
             }
+            ui.separator();
+            ui.add(
+                egui::Slider::new(&mut self.view_zoom, MIN_ZOOM..=MAX_ZOOM)
+                    .logarithmic(true)
+                    .text("Zoom"),
+            );
+            if ui.button("Reset view").clicked() {
+                self.reset_view();
+            }
             if let Some(stats) = &self.stats {
                 ui.separator();
                 ui.label(format!("{} nodes · {} edges", stats.nodes, stats.edges));
@@ -187,14 +203,64 @@ impl Panel {
         }
 
         let desired = ui.available_size().max(egui::vec2(360.0, 360.0));
-        let (rect, response) = ui.allocate_exact_size(desired, egui::Sense::click());
+        let (rect, response) = ui.allocate_exact_size(desired, egui::Sense::click_and_drag());
         let painter = ui.painter_at(rect);
         painter.rect_filled(rect, 0.0, ui.visuals().extreme_bg_color);
 
         let graph_rect = rect.shrink(GRAPH_PADDING);
-        let scale = graph_rect.width().min(graph_rect.height()) * 0.5;
-        let center = graph_rect.center();
-        let to_screen = |pos: egui::Pos2| center + egui::vec2(pos.x * scale, pos.y * scale);
+        let base_scale = graph_rect.width().min(graph_rect.height()) * 0.5;
+        self.view_zoom = self.view_zoom.clamp(MIN_ZOOM, MAX_ZOOM);
+
+        if response.hovered() {
+            let wheel_delta = ui.input(|i| i.smooth_scroll_delta.y);
+            if wheel_delta.abs() > f32::EPSILON {
+                let cursor = response.hover_pos().unwrap_or_else(|| graph_rect.center());
+                let center = graph_rect.center() + self.view_pan;
+                let old_scale = base_scale * self.view_zoom;
+                let graph_cursor = screen_to_graph(cursor, center, old_scale);
+                let zoom_factor = (wheel_delta * WHEEL_ZOOM_SPEED).exp();
+                self.view_zoom = (self.view_zoom * zoom_factor).clamp(MIN_ZOOM, MAX_ZOOM);
+                let new_scale = base_scale * self.view_zoom;
+                let new_center =
+                    cursor - egui::vec2(graph_cursor.x * new_scale, graph_cursor.y * new_scale);
+                self.view_pan = new_center - graph_rect.center();
+            }
+        }
+
+        let mut scale = base_scale * self.view_zoom;
+        let mut center = graph_rect.center() + self.view_pan;
+        let hovered = response
+            .hover_pos()
+            .and_then(|cursor| self.node_at(cursor, center, scale));
+
+        if response.drag_started_by(egui::PointerButton::Primary) {
+            self.dragged_node = hovered;
+        }
+        if response.dragged_by(egui::PointerButton::Primary) {
+            let delta = response.drag_delta();
+            if let Some(idx) = self.dragged_node {
+                if let Some(node) = self.nodes.get_mut(idx) {
+                    node.pos += delta / scale;
+                }
+            } else {
+                self.view_pan += delta;
+                center = graph_rect.center() + self.view_pan;
+            }
+        }
+        if response.drag_stopped() {
+            self.dragged_node = None;
+        }
+        if response.double_clicked() && hovered.is_none() {
+            self.reset_view();
+            scale = base_scale * self.view_zoom;
+            center = graph_rect.center() + self.view_pan;
+        }
+
+        let selected_idx = self
+            .selected_entity
+            .as_deref()
+            .and_then(|name| self.nodes.iter().position(|node| node.name == name));
+        let connected = selected_idx.map(|idx| connected_nodes(idx, &self.edges, self.nodes.len()));
 
         for edge in &self.edges {
             let Some(source) = self.nodes.get(edge.source) else {
@@ -204,16 +270,31 @@ impl Panel {
                 continue;
             };
             let stroke_width = (edge.weight as f32).sqrt().clamp(0.7, 2.2);
+            let highlighted =
+                selected_idx.is_some_and(|idx| edge.source == idx || edge.target == idx);
             painter.line_segment(
-                [to_screen(source.pos), to_screen(target.pos)],
-                egui::Stroke::new(stroke_width, egui::Color32::from_gray(190)),
+                [
+                    graph_to_screen(source.pos, center, scale),
+                    graph_to_screen(target.pos, center, scale),
+                ],
+                egui::Stroke::new(
+                    if highlighted {
+                        stroke_width + 0.8
+                    } else {
+                        stroke_width
+                    },
+                    if highlighted {
+                        egui::Color32::from_rgb(65, 110, 185)
+                    } else if selected_idx.is_some() {
+                        egui::Color32::from_gray(100)
+                    } else {
+                        egui::Color32::from_gray(190)
+                    },
+                ),
             );
         }
 
-        let hovered = response
-            .hover_pos()
-            .and_then(|cursor| self.node_at(cursor, &to_screen));
-        if response.clicked() {
+        if response.clicked() && !response.double_clicked() {
             if let Some(idx) = hovered {
                 if let Some(name) = self.nodes.get(idx).map(|node| node.name.clone()) {
                     self.load_entity(ctx, &name);
@@ -223,11 +304,18 @@ impl Panel {
 
         let max_degree = self.nodes.iter().map(|node| node.degree).max().unwrap_or(1);
         for (idx, node) in self.nodes.iter().enumerate() {
-            let screen = to_screen(node.pos);
+            let screen = graph_to_screen(node.pos, center, scale);
             let selected = self.selected_entity.as_deref() == Some(node.name.as_str());
             let hovered = hovered == Some(idx);
             let radius = node_radius(node, max_degree);
-            let color = entity_color(&node.entity_type);
+            let dimmed = connected
+                .as_ref()
+                .is_some_and(|connected| !connected[idx] && !hovered);
+            let color = if dimmed {
+                entity_color(&node.entity_type).gamma_multiply(0.38)
+            } else {
+                entity_color(&node.entity_type)
+            };
             painter.circle_filled(screen, radius, color);
             painter.circle_stroke(
                 screen,
@@ -242,7 +330,7 @@ impl Panel {
                 ),
             );
 
-            if selected || hovered || idx < MAX_LABELS {
+            if selected || hovered || idx < MAX_LABELS || self.view_zoom > 1.6 {
                 painter.text(
                     screen + egui::vec2(radius + 3.0, -radius - 2.0),
                     egui::Align2::LEFT_TOP,
@@ -259,6 +347,11 @@ impl Panel {
                 "{}\n{} | degree {} | mentions {}",
                 node.name, node.entity_type, node.degree, node.mention_count
             ));
+        }
+        if hovered.is_some() || self.dragged_node.is_some() {
+            response.on_hover_and_drag_cursor(egui::CursorIcon::Grab);
+        } else if response.hovered() {
+            response.on_hover_and_drag_cursor(egui::CursorIcon::Move);
         }
     }
 
@@ -381,6 +474,7 @@ impl Panel {
         self.nodes = nodes;
         self.edges = edges;
         self.selected_entity = None;
+        self.reset_view_transform();
     }
 
     fn load_stats(&mut self, ctx: &PanelCtx<'_>) {
@@ -456,17 +550,13 @@ impl Panel {
         });
     }
 
-    fn node_at(
-        &self,
-        cursor: egui::Pos2,
-        to_screen: &impl Fn(egui::Pos2) -> egui::Pos2,
-    ) -> Option<usize> {
+    fn node_at(&self, cursor: egui::Pos2, center: egui::Pos2, scale: f32) -> Option<usize> {
         let max_degree = self.nodes.iter().map(|node| node.degree).max().unwrap_or(1);
         self.nodes
             .iter()
             .enumerate()
             .filter_map(|(idx, node)| {
-                let screen = to_screen(node.pos);
+                let screen = graph_to_screen(node.pos, center, scale);
                 let radius = node_radius(node, max_degree) + 4.0;
                 let dist = screen.distance(cursor);
                 (dist <= radius).then_some((idx, dist))
@@ -477,6 +567,17 @@ impl Panel {
                     .unwrap_or(std::cmp::Ordering::Equal)
             })
             .map(|(idx, _)| idx)
+    }
+
+    fn reset_view(&mut self) {
+        self.reset_view_transform();
+        layout_nodes(&mut self.nodes);
+    }
+
+    fn reset_view_transform(&mut self) {
+        self.view_zoom = 1.0;
+        self.view_pan = egui::Vec2::ZERO;
+        self.dragged_node = None;
     }
 }
 
@@ -510,6 +611,31 @@ fn layout_nodes(nodes: &mut [KgNodeView]) {
         let angle = idx as f32 * 2.399_963_1;
         node.pos = egui::pos2(radius * angle.cos(), radius * angle.sin());
     }
+}
+
+fn graph_to_screen(pos: egui::Pos2, center: egui::Pos2, scale: f32) -> egui::Pos2 {
+    center + egui::vec2(pos.x * scale, pos.y * scale)
+}
+
+fn screen_to_graph(pos: egui::Pos2, center: egui::Pos2, scale: f32) -> egui::Pos2 {
+    let v = (pos - center) / scale;
+    egui::pos2(v.x, v.y)
+}
+
+fn connected_nodes(selected: usize, edges: &[KgEdgeView], node_count: usize) -> Vec<bool> {
+    let mut connected = vec![false; node_count];
+    if selected < node_count {
+        connected[selected] = true;
+    }
+    for edge in edges {
+        if edge.source == selected && edge.target < node_count {
+            connected[edge.target] = true;
+        }
+        if edge.target == selected && edge.source < node_count {
+            connected[edge.source] = true;
+        }
+    }
+    connected
 }
 
 fn node_radius(node: &KgNodeView, max_degree: i64) -> f32 {

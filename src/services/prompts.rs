@@ -514,6 +514,7 @@ fn render_template(
     Ok(rendered)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn insert_prompt_version(
     conn: &Connection,
     prompt_name: &str,
