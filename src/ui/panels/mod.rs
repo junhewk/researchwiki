@@ -2,7 +2,6 @@ pub mod articles;
 pub mod dashboard;
 pub mod gather;
 pub mod knowledge_graph;
-pub mod newsletter;
 pub mod prompts;
 pub mod settings;
 pub mod traces;
@@ -21,20 +20,18 @@ pub enum Tab {
     Gather,
     KnowledgeGraph,
     Wiki,
-    Newsletter,
     Prompts,
     Settings,
     Traces,
 }
 
 impl Tab {
-    pub const ALL: [Tab; 9] = [
+    pub const ALL: [Tab; 8] = [
         Tab::Dashboard,
         Tab::Articles,
         Tab::Gather,
         Tab::KnowledgeGraph,
         Tab::Wiki,
-        Tab::Newsletter,
         Tab::Prompts,
         Tab::Settings,
         Tab::Traces,
@@ -47,7 +44,6 @@ impl Tab {
             Tab::Gather => "Gather",
             Tab::KnowledgeGraph => "Knowledge Graph",
             Tab::Wiki => "Wiki",
-            Tab::Newsletter => "Newsletter",
             Tab::Prompts => "Prompts",
             Tab::Settings => "Settings",
             Tab::Traces => "Traces",
@@ -84,7 +80,6 @@ pub struct Panels {
     pub gather: gather::Panel,
     pub knowledge_graph: knowledge_graph::Panel,
     pub wiki: wiki::Panel,
-    pub newsletter: newsletter::Panel,
     pub prompts: prompts::Panel,
     pub settings: settings::Panel,
     pub traces: traces::Panel,
@@ -98,7 +93,6 @@ impl Panels {
             Tab::Gather => self.gather.show(ui, ctx),
             Tab::KnowledgeGraph => self.knowledge_graph.show(ui, ctx),
             Tab::Wiki => self.wiki.show(ui, ctx),
-            Tab::Newsletter => self.newsletter.show(ui, ctx),
             Tab::Prompts => self.prompts.show(ui, ctx),
             Tab::Settings => self.settings.show(ui, ctx),
             Tab::Traces => self.traces.show(ui, ctx),
