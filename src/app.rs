@@ -167,7 +167,7 @@ impl DesktopApp {
             warn!("workspace db init failed: {err:#}");
         }
 
-        let state = AppState::new(self.config.clone(), db_path);
+        let state = AppState::new(self.config.clone(), db_path, workspace_id);
 
         let prompt_service = state.prompt_service.clone();
         let job_service = state.job_service.clone();

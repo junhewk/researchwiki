@@ -31,28 +31,28 @@ pub struct AppState {
 impl AppState {
     /// Builds the service graph for one workspace. `workspace_db_path` is that
     /// workspace's own data file; the registry/settings/prompts stay global.
-    pub fn new(config: AppConfig, workspace_db_path: std::path::PathBuf) -> Self {
+    pub fn new(
+        config: AppConfig,
+        workspace_db_path: std::path::PathBuf,
+        workspace_id: i64,
+    ) -> Self {
         let root = config
             .storage
             .database_path
             .parent()
             .map(std::path::Path::to_path_buf)
             .unwrap_or_else(|| std::path::PathBuf::from("."));
-        let workspace_service = std::sync::Arc::new(WorkspaceService::new(
-            root.join("meta.db"),
-            root.clone(),
-        ));
+        let workspace_service =
+            std::sync::Arc::new(WorkspaceService::new(root.join("meta.db"), root.clone()));
 
-        let article_service =
-            std::sync::Arc::new(ArticleService::new(workspace_db_path.clone()));
+        let article_service = std::sync::Arc::new(ArticleService::new(workspace_db_path.clone()));
         let settings_service =
             std::sync::Arc::new(SettingsService::new(config.storage.settings_file.clone()));
         let prompt_service = std::sync::Arc::new(PromptService::new(
             config.storage.prompts_dir.clone(),
             workspace_db_path.clone(),
         ));
-        let trace_service =
-            std::sync::Arc::new(TraceService::new(workspace_db_path.clone()));
+        let trace_service = std::sync::Arc::new(TraceService::new(workspace_db_path.clone()));
         let llm_service = std::sync::Arc::new(LlmService::new(
             prompt_service.clone(),
             trace_service.clone(),
@@ -70,6 +70,8 @@ impl AppState {
         let knowledge_graph_service = std::sync::Arc::new(KnowledgeGraphService::new(
             workspace_db_path.clone(),
             config.storage.wiki_export_dir.clone(),
+            workspace_id,
+            workspace_service.clone(),
             llm_service.clone(),
             embedding_service.clone(),
         ));

@@ -12,6 +12,8 @@ use rusqlite::{Connection, params};
 use serde_json::Value;
 use tokio::{sync::Mutex, task};
 
+use crate::models::workspace::WorkspaceResearchContext;
+
 const ARXIV_API_URL: &str = "https://export.arxiv.org/api/query";
 const ARXIV_OAI_URL: &str = "https://oaipmh.arxiv.org/oai";
 const ARXIV_MIN_REQUEST_INTERVAL: Duration = Duration::from_secs(3);
@@ -148,26 +150,6 @@ pub struct SaveCounters {
     pub errors: i32,
 }
 
-/// Per-workspace inputs that drive gather queries and topic-aware screening.
-#[derive(Debug, Clone, Default)]
-pub struct WorkspaceQueryProfile {
-    pub seed_concepts: Vec<String>,
-    pub override_queries: Vec<String>,
-    pub topic_descriptor: String,
-}
-
-impl WorkspaceQueryProfile {
-    /// The concept list used to build per-source queries: explicit overrides
-    /// win, otherwise the seed concepts.
-    pub fn concepts(&self) -> &[String] {
-        if self.override_queries.is_empty() {
-            &self.seed_concepts
-        } else {
-            &self.override_queries
-        }
-    }
-}
-
 impl PipelineService {
     pub fn new(database_path: std::path::PathBuf) -> Self {
         let client = Client::builder()
@@ -187,7 +169,7 @@ impl PipelineService {
         &self,
         source: &str,
         days_back: i32,
-        profile: &WorkspaceQueryProfile,
+        profile: &WorkspaceResearchContext,
     ) -> Result<Vec<ArticleCandidate>> {
         match source {
             "arxiv" => self.list_arxiv(days_back, profile).await,
@@ -203,27 +185,6 @@ impl PipelineService {
             "clinical_trials" => self.list_clinical_trials(days_back, profile).await,
             _ => bail!("unsupported source: {source}"),
         }
-    }
-
-    /// Loads the gather/screening profile for a workspace from the DB.
-    pub async fn load_workspace_profile(&self, workspace_id: i64) -> Result<WorkspaceQueryProfile> {
-        let database_path = self.database_path.clone();
-        task::spawn_blocking(move || -> Result<WorkspaceQueryProfile> {
-            let conn = crate::db::open_connection(&*database_path)?;
-            let (seed_json, override_json, descriptor): (String, String, String) = conn.query_row(
-                "SELECT seed_concepts_json, override_queries_json, topic_descriptor
-                 FROM workspaces WHERE id = ?1",
-                [workspace_id],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
-            )?;
-            Ok(WorkspaceQueryProfile {
-                seed_concepts: serde_json::from_str(&seed_json).unwrap_or_default(),
-                override_queries: serde_json::from_str(&override_json).unwrap_or_default(),
-                topic_descriptor: descriptor,
-            })
-        })
-        .await
-        .context("load workspace profile task failed")?
     }
 
     pub async fn check_duplicates_batch(
@@ -299,7 +260,7 @@ impl PipelineService {
     async fn list_arxiv(
         &self,
         days_back: i32,
-        profile: &WorkspaceQueryProfile,
+        profile: &WorkspaceResearchContext,
     ) -> Result<Vec<ArticleCandidate>> {
         let today = Utc::now().date_naive();
         let start = today
@@ -400,7 +361,7 @@ impl PipelineService {
         &self,
         start: NaiveDate,
         today: NaiveDate,
-        profile: &WorkspaceQueryProfile,
+        profile: &WorkspaceResearchContext,
     ) -> Result<Vec<ArticleCandidate>> {
         let mut merged = std::collections::BTreeMap::<String, ArticleCandidate>::new();
         let mut errors = Vec::new();
@@ -552,7 +513,7 @@ impl PipelineService {
     async fn list_pmc(
         &self,
         days_back: i32,
-        profile: &WorkspaceQueryProfile,
+        profile: &WorkspaceResearchContext,
     ) -> Result<Vec<ArticleCandidate>> {
         let ids = self
             .get_ncbi_json(
@@ -695,7 +656,7 @@ impl PipelineService {
     async fn list_pubmed(
         &self,
         days_back: i32,
-        profile: &WorkspaceQueryProfile,
+        profile: &WorkspaceResearchContext,
     ) -> Result<Vec<ArticleCandidate>> {
         let today = Utc::now().date_naive();
         let max_date = today
@@ -809,7 +770,7 @@ impl PipelineService {
     async fn list_europe_pmc(
         &self,
         days_back: i32,
-        profile: &WorkspaceQueryProfile,
+        profile: &WorkspaceResearchContext,
     ) -> Result<Vec<ArticleCandidate>> {
         let (start, today) = date_window(days_back);
 
@@ -864,7 +825,7 @@ impl PipelineService {
         &self,
         server: &'static str,
         days_back: i32,
-        profile: &WorkspaceQueryProfile,
+        profile: &WorkspaceResearchContext,
     ) -> Result<Vec<ArticleCandidate>> {
         let (start, today) = date_window(days_back);
         let collection = self.fetch_rxiv_collection(server, start, today).await?;
@@ -906,7 +867,7 @@ impl PipelineService {
     async fn list_openalex(
         &self,
         days_back: i32,
-        profile: &WorkspaceQueryProfile,
+        profile: &WorkspaceResearchContext,
     ) -> Result<Vec<ArticleCandidate>> {
         let (start, today) = date_window(days_back);
 
@@ -969,7 +930,7 @@ impl PipelineService {
     async fn list_crossref(
         &self,
         days_back: i32,
-        profile: &WorkspaceQueryProfile,
+        profile: &WorkspaceResearchContext,
     ) -> Result<Vec<ArticleCandidate>> {
         let (start, today) = date_window(days_back);
 
@@ -1027,7 +988,7 @@ impl PipelineService {
     async fn list_unpaywall(
         &self,
         days_back: i32,
-        profile: &WorkspaceQueryProfile,
+        profile: &WorkspaceResearchContext,
     ) -> Result<Vec<ArticleCandidate>> {
         let (start, today) = date_window(days_back);
         let mut merged = BTreeMap::<String, ArticleCandidate>::new();
@@ -1075,7 +1036,7 @@ impl PipelineService {
     async fn list_semantic_scholar(
         &self,
         days_back: i32,
-        profile: &WorkspaceQueryProfile,
+        profile: &WorkspaceResearchContext,
     ) -> Result<Vec<ArticleCandidate>> {
         let (start, today) = date_window(days_back);
 
@@ -1137,7 +1098,7 @@ impl PipelineService {
     async fn list_clinical_trials(
         &self,
         days_back: i32,
-        profile: &WorkspaceQueryProfile,
+        profile: &WorkspaceResearchContext,
     ) -> Result<Vec<ArticleCandidate>> {
         let (start, today) = date_window(days_back);
         let mut merged = BTreeMap::<String, ArticleCandidate>::new();
@@ -1290,8 +1251,8 @@ impl PipelineService {
 
 /// Builds a free-text query list from the workspace profile, falling back to the
 /// source's default queries when the workspace defines no concepts.
-fn free_text_queries(profile: &WorkspaceQueryProfile, fallback: &[&str]) -> Vec<String> {
-    let concepts = profile.concepts();
+fn free_text_queries(profile: &WorkspaceResearchContext, fallback: &[&str]) -> Vec<String> {
+    let concepts = profile.query_terms();
     if concepts.is_empty() {
         fallback.iter().map(|q| (*q).to_string()).collect()
     } else {
@@ -1307,8 +1268,8 @@ fn quoted_or(concepts: &[String], suffix: &str) -> String {
         .join(" OR ")
 }
 
-fn pmc_term(profile: &WorkspaceQueryProfile) -> String {
-    let concepts = profile.concepts();
+fn pmc_term(profile: &WorkspaceResearchContext) -> String {
+    let concepts = profile.query_terms();
     if concepts.is_empty() {
         return PMC_QUERY.to_string();
     }
@@ -1318,8 +1279,8 @@ fn pmc_term(profile: &WorkspaceQueryProfile) -> String {
     )
 }
 
-fn pubmed_term(profile: &WorkspaceQueryProfile) -> String {
-    let concepts = profile.concepts();
+fn pubmed_term(profile: &WorkspaceResearchContext) -> String {
+    let concepts = profile.query_terms();
     if concepts.is_empty() {
         return PUBMED_QUERY.to_string();
     }
@@ -1329,16 +1290,19 @@ fn pubmed_term(profile: &WorkspaceQueryProfile) -> String {
     )
 }
 
-fn europe_pmc_queries(profile: &WorkspaceQueryProfile) -> Vec<String> {
-    let concepts = profile.concepts();
+fn europe_pmc_queries(profile: &WorkspaceResearchContext) -> Vec<String> {
+    let concepts = profile.query_terms();
     if concepts.is_empty() {
-        return EUROPE_PMC_QUERIES.iter().map(|q| (*q).to_string()).collect();
+        return EUROPE_PMC_QUERIES
+            .iter()
+            .map(|q| (*q).to_string())
+            .collect();
     }
     vec![format!("({}) AND OPEN_ACCESS:Y", quoted_or(concepts, ""))]
 }
 
-fn arxiv_queries(profile: &WorkspaceQueryProfile) -> Vec<String> {
-    let concepts = profile.concepts();
+fn arxiv_queries(profile: &WorkspaceResearchContext) -> Vec<String> {
+    let concepts = profile.query_terms();
     if concepts.is_empty() {
         return ARXIV_QUERIES.iter().map(|q| (*q).to_string()).collect();
     }

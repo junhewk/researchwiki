@@ -11,6 +11,7 @@ use crate::{
     models::{
         job::{JobCreateRequest, JobEventResponse, JobRunDetailResponse, JobRunResponse},
         settings::{SchedulerJob, SchedulerSettings, SchedulerStatusResponse},
+        workspace::WorkspaceResearchContext,
     },
     services::{
         evaluator::ArticleEvaluator,
@@ -211,7 +212,12 @@ impl JobService {
             conn.execute(
                 "INSERT INTO job_runs (id, source, days_back, status, workspace_id)
                  VALUES (?1, ?2, ?3, 'queued', ?4)",
-                params![run_id_for_insert, source_for_insert, days_back, workspace_id],
+                params![
+                    run_id_for_insert,
+                    source_for_insert,
+                    days_back,
+                    workspace_id
+                ],
             )?;
             conn.execute(
                 "INSERT INTO job_events (run_id, event_type, payload_json)
@@ -419,11 +425,10 @@ impl JobService {
         )
         .await?;
 
-        // Per-workspace gather/screening profile (seed concepts, topic
-        // descriptor), loaded from the registry (meta DB).
-        let profile = self
+        // Per-workspace research context, loaded from the registry (meta DB).
+        let context = self
             .workspace_service
-            .query_profile(workspace_id)
+            .research_context(workspace_id)
             .await
             .unwrap_or_default();
 
@@ -451,7 +456,7 @@ impl JobService {
 
             let candidates = match self
                 .pipeline_service
-                .list_source(current_source, days_back, &profile)
+                .list_source(current_source, days_back, &context)
                 .await
             {
                 Ok(candidates) => candidates,
@@ -520,10 +525,7 @@ impl JobService {
                 counters,
             )
             .await?;
-            let relevant = self
-                .screener
-                .filter_relevant(&candidates, &profile.topic_descriptor)
-                .await;
+            let relevant = self.screener.filter_relevant(&candidates, &context).await;
             counters.screened += candidates.len() as i32;
             counters.relevant += relevant.len() as i32;
             self.append_event(
@@ -563,6 +565,7 @@ impl JobService {
                         &mut counters,
                         &mut last_error,
                         workspace_id,
+                        &context,
                     )
                     .await;
 
@@ -646,6 +649,7 @@ impl JobService {
         counters: &mut JobCounters,
         last_error: &mut Option<String>,
         workspace_id: i64,
+        context: &WorkspaceResearchContext,
     ) -> Result<(), AppError> {
         // 1. Fetch content.
         let content = self.fetcher.fetch(candidate).await;
@@ -722,7 +726,11 @@ impl JobService {
             }
 
             if kg_enabled {
-                if let Err(error) = self.kg_service.insert_articles(vec![uid.clone()]).await {
+                if let Err(error) = self
+                    .kg_service
+                    .insert_articles_with_context(vec![uid.clone()], context.clone())
+                    .await
+                {
                     tracing::warn!("KG extraction failed for {uid}: {error}");
                 }
             }

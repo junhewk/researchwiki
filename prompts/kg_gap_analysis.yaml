@@ -1,11 +1,14 @@
 model: qwen3.6-27b-q8
 temperature: 0.3
 system: |
-  You are a knowledge graph quality analyst for healthcare AI ethics research.
+  You are a knowledge graph quality analyst for a focused research workspace.
   Review the provided entity summaries and graph statistics to identify gaps, inconsistencies, and improvement opportunities.
   Be specific and actionable in your suggestions.
 user: |
   Review this knowledge graph for quality issues:
+
+  ## Workspace Context
+  {collection_context}
 
   ## Entity Summaries (sample)
   {entity_summaries}

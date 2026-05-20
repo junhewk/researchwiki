@@ -1,14 +1,12 @@
-use std::{
-    path::PathBuf,
-    sync::Arc,
-};
+use std::{path::PathBuf, sync::Arc};
 
 use rusqlite::{Connection, OptionalExtension, params};
 
 use crate::{
     error::{AppError, run_blocking_db},
-    models::workspace::{Workspace, WorkspaceCreate, WorkspaceSummary, WorkspaceUpdate},
-    services::pipeline::WorkspaceQueryProfile,
+    models::workspace::{
+        Workspace, WorkspaceCreate, WorkspaceResearchContext, WorkspaceSummary, WorkspaceUpdate,
+    },
 };
 
 const WORKSPACE_COLUMNS: &str = "id, name, slug, db_filename, primary_question, gap_note, \
@@ -87,24 +85,12 @@ impl WorkspaceService {
         .await
     }
 
-    /// Inputs that drive gather queries + topic-aware screening for a workspace.
-    pub async fn query_profile(&self, id: i64) -> Result<WorkspaceQueryProfile, AppError> {
-        let meta_path = self.meta_path.clone();
-        run_blocking_db(move || {
-            let conn = crate::db::open_connection(&*meta_path)?;
-            let (seed_json, override_json, descriptor): (String, String, String) = conn.query_row(
-                "SELECT seed_concepts_json, override_queries_json, topic_descriptor
-                 FROM workspaces WHERE id = ?1",
-                [id],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
-            )?;
-            Ok(WorkspaceQueryProfile {
-                seed_concepts: serde_json::from_str(&seed_json).unwrap_or_default(),
-                override_queries: serde_json::from_str(&override_json).unwrap_or_default(),
-                topic_descriptor: descriptor,
-            })
-        })
-        .await
+    /// Canonical research context that drives gather, screening, KG extraction,
+    /// wiki synthesis, and Gap Bridge framing.
+    pub async fn research_context(&self, id: i64) -> Result<WorkspaceResearchContext, AppError> {
+        self.get(id)
+            .await
+            .map(|workspace| WorkspaceResearchContext::from_workspace(&workspace))
     }
 
     pub async fn create(&self, request: WorkspaceCreate) -> Result<Workspace, AppError> {
@@ -290,5 +276,64 @@ fn unique_slug(conn: &Connection, base: &str) -> Result<String, rusqlite::Error>
         }
         candidate = format!("{base}-{suffix}");
         suffix += 1;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn research_context_loads_full_registry_row() {
+        let root = std::env::temp_dir().join(format!(
+            "researchwiki-workspace-test-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let meta_path = root.join("meta.db");
+        crate::db::initialize_meta(meta_path.clone(), "haie.db".to_string())
+            .await
+            .expect("meta init");
+        let service = WorkspaceService::new(meta_path, root.clone());
+
+        let workspace = service
+            .create(WorkspaceCreate {
+                name: "Diabetes chatbot evidence map".to_string(),
+                primary_question: "Do chatbots improve self-management?".to_string(),
+                gap_note: "Separate older chatbots from LLM counseling.".to_string(),
+                topic_descriptor: "diabetes chatbot self-management".to_string(),
+                seed_concepts: vec!["type 2 diabetes".to_string(), "HbA1c".to_string()],
+                override_queries: vec!["diabetes chatbot HbA1c".to_string()],
+                lookback_days: 365,
+            })
+            .await
+            .expect("create workspace");
+
+        let context = service
+            .research_context(workspace.id)
+            .await
+            .expect("research context");
+
+        assert_eq!(context.name, "Diabetes chatbot evidence map");
+        assert_eq!(
+            context.primary_question,
+            "Do chatbots improve self-management?"
+        );
+        assert_eq!(
+            context.gap_note,
+            "Separate older chatbots from LLM counseling."
+        );
+        assert_eq!(context.refined_question, "");
+        assert_eq!(
+            context.seed_concepts,
+            vec!["type 2 diabetes".to_string(), "HbA1c".to_string()]
+        );
+        assert_eq!(
+            context.override_queries,
+            vec!["diabetes chatbot HbA1c".to_string()]
+        );
+        assert_eq!(context.topic_descriptor, "diabetes chatbot self-management");
+        assert_eq!(context.lookback_days, 365);
+
+        let _ = std::fs::remove_dir_all(root);
     }
 }

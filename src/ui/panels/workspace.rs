@@ -1,9 +1,12 @@
 use super::{MsgChannel, PanelCtx};
-use crate::models::workspace::{Workspace, WorkspaceCreate, WorkspaceUpdate};
+use crate::models::workspace::{
+    Workspace, WorkspaceCreate, WorkspaceResearchContext, WorkspaceUpdate,
+};
 
 enum Msg {
     Loaded(Workspace),
     Saved(Workspace),
+    GatherStarted(Workspace, String),
     Status(String),
     Error(String),
 }
@@ -42,6 +45,12 @@ impl Panel {
                     if matches!(self.status.as_deref(), Some(s) if s.starts_with("Saving")) {
                         self.status = Some("Saved.".to_string());
                     }
+                }
+                Msg::GatherStarted(ws, text) => {
+                    self.form = form_from(&ws);
+                    self.loaded_id = Some(ws.id);
+                    self.status = Some(text);
+                    self.busy = false;
                 }
                 Msg::Status(text) => {
                     self.status = Some(text);
@@ -124,13 +133,18 @@ impl Panel {
                 ui.label(&self.form.refined_question);
             }
 
+            self.show_wiring_preview(ui);
+
             ui.add_space(10.0);
             ui.horizontal(|ui| {
                 if ui.add_enabled(!self.busy, egui::Button::new("Save")).clicked() {
                     self.save(ctx, active);
                 }
                 if ui
-                    .add_enabled(!self.busy, egui::Button::new("Run gather (all sources)"))
+                    .add_enabled(
+                        !self.busy,
+                        egui::Button::new("Save and run gather (all sources)"),
+                    )
                     .clicked()
                 {
                     self.run_gather(ctx, active);
@@ -185,16 +199,7 @@ impl Panel {
         self.status = Some("Saving…".to_string());
         let tx = channel.tx.clone();
         let svc = ctx.state.workspace_service.clone();
-        let update = WorkspaceUpdate {
-            name: Some(self.form.name.clone()),
-            primary_question: Some(self.form.primary_question.clone()),
-            gap_note: Some(self.form.gap_note.clone()),
-            refined_question: None,
-            topic_descriptor: Some(self.form.topic_descriptor.clone()),
-            seed_concepts: Some(lines(&self.form.seed_concepts_text)),
-            override_queries: Some(lines(&self.form.override_queries_text)),
-            lookback_days: Some(self.form.lookback_days.max(1)),
-        };
+        let update = self.update_request();
         ctx.handle.spawn(async move {
             let _ = match svc.update(id, update).await {
                 Ok(ws) => tx.send(Msg::Saved(ws)),
@@ -238,22 +243,86 @@ impl Panel {
 
     fn run_gather(&mut self, ctx: &PanelCtx<'_>, id: i64) {
         self.busy = true;
-        self.status = Some("Starting gather…".to_string());
+        self.status = Some("Saving input set before gather…".to_string());
         let Some(channel) = self.channel.as_ref() else {
             return;
         };
         let tx = channel.tx.clone();
+        let svc = ctx.state.workspace_service.clone();
         let jobs = ctx.state.job_service.clone();
-        let days = self.form.lookback_days.max(1);
+        let update = self.update_request();
         ctx.handle.spawn(async move {
-            let _ = match jobs.enqueue_source("all", days, id).await {
-                Ok(run) => tx.send(Msg::Status(format!(
-                    "Gather started for all sources (run {}).",
-                    run.run_id
-                ))),
+            let result = async {
+                let ws = svc.update(id, update).await?;
+                let run = jobs
+                    .enqueue_source("all", ws.lookback_days.max(1), id)
+                    .await?;
+                Ok::<_, crate::error::AppError>((ws, run.run_id))
+            }
+            .await;
+            let _ = match result {
+                Ok((ws, run_id)) => tx.send(Msg::GatherStarted(
+                    ws,
+                    format!("Saved input set, then started gather for all sources (run {run_id})."),
+                )),
                 Err(err) => tx.send(Msg::Error(err.to_string())),
             };
         });
+    }
+
+    fn update_request(&self) -> WorkspaceUpdate {
+        WorkspaceUpdate {
+            name: Some(self.form.name.clone()),
+            primary_question: Some(self.form.primary_question.clone()),
+            gap_note: Some(self.form.gap_note.clone()),
+            refined_question: None,
+            topic_descriptor: Some(self.form.topic_descriptor.clone()),
+            seed_concepts: Some(lines(&self.form.seed_concepts_text)),
+            override_queries: Some(lines(&self.form.override_queries_text)),
+            lookback_days: Some(self.form.lookback_days.max(1)),
+        }
+    }
+
+    fn show_wiring_preview(&self, ui: &mut egui::Ui) {
+        let context = context_from_form(&self.form);
+        ui.add_space(10.0);
+        egui::CollapsingHeader::new("Wiring preview")
+            .default_open(true)
+            .show(ui, |ui| {
+                egui::Grid::new("workspace_wiring_preview")
+                    .num_columns(2)
+                    .spacing([12.0, 6.0])
+                    .striped(true)
+                    .show(ui, |ui| {
+                        ui.label("Gather search");
+                        ui.label(format!(
+                            "{}: {}",
+                            context.query_source_label(),
+                            context.query_preview(6)
+                        ));
+                        ui.end_row();
+
+                        ui.label("Gather window");
+                        ui.label(format!("{} days", context.lookback_days.max(1)));
+                        ui.end_row();
+
+                        ui.label("Screening");
+                        ui.label("topic descriptor + primary question + seed/refined question");
+                        ui.end_row();
+
+                        ui.label("Fetcher");
+                        ui.label("runs after topic-aware prompt screening selects candidates");
+                        ui.end_row();
+
+                        ui.label("KG/wiki");
+                        ui.label("saved articles + workspace research context");
+                        ui.end_row();
+
+                        ui.label("Gap Bridge");
+                        ui.label("primary question + gap note + KG gaps");
+                        ui.end_row();
+                    });
+            });
     }
 }
 
@@ -275,4 +344,17 @@ fn lines(text: &str) -> Vec<String> {
         .map(|line| line.trim().to_string())
         .filter(|line| !line.is_empty())
         .collect()
+}
+
+fn context_from_form(form: &Form) -> WorkspaceResearchContext {
+    WorkspaceResearchContext {
+        name: form.name.clone(),
+        primary_question: form.primary_question.clone(),
+        gap_note: form.gap_note.clone(),
+        refined_question: form.refined_question.clone(),
+        seed_concepts: lines(&form.seed_concepts_text),
+        override_queries: lines(&form.override_queries_text),
+        topic_descriptor: form.topic_descriptor.clone(),
+        lookback_days: form.lookback_days.max(1),
+    }
 }

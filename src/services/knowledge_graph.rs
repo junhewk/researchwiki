@@ -1,5 +1,5 @@
 use std::{
-    collections::{BTreeSet, HashMap},
+    collections::{BTreeMap, BTreeSet, HashMap},
     path::PathBuf,
     sync::{Arc, Mutex},
     time::Duration,
@@ -27,10 +27,12 @@ use crate::{
         KGSynthesisListQuery, KGSynthesisListResponse, KGSynthesisRelatedEntity,
         RelationshipEvidenceOutput, SynthesisGenerationOutput,
     },
+    models::workspace::WorkspaceResearchContext,
     services::{
         embedding::EmbeddingService,
         fts::build_fts_query,
         llm::{LlmOutputMode, LlmService},
+        workspace::WorkspaceService,
     },
 };
 
@@ -156,6 +158,8 @@ const WIKI_ENTITY_FILTER_SQL: &str = r#"
 pub struct KnowledgeGraphService {
     database_path: Arc<PathBuf>,
     wiki_export_dir: Arc<PathBuf>,
+    workspace_id: i64,
+    workspace_service: Arc<WorkspaceService>,
     llm_service: Arc<LlmService>,
     embedding_service: Arc<EmbeddingService>,
     backfill_state: Arc<Mutex<KGBackfillStatusResponse>>,
@@ -388,18 +392,29 @@ impl KnowledgeGraphService {
     pub fn new(
         database_path: PathBuf,
         wiki_export_dir: PathBuf,
+        workspace_id: i64,
+        workspace_service: Arc<WorkspaceService>,
         llm_service: Arc<LlmService>,
         embedding_service: Arc<EmbeddingService>,
     ) -> Self {
         Self {
             database_path: Arc::new(database_path),
             wiki_export_dir: Arc::new(wiki_export_dir),
+            workspace_id,
+            workspace_service,
             llm_service,
             embedding_service,
             backfill_state: Arc::new(Mutex::new(KGBackfillStatusResponse::default())),
             synthesis_compile_state: Arc::new(Mutex::new(KGSynthesisCompileStatus::default())),
             full_backfill_state: Arc::new(Mutex::new(KGFullBackfillStatus::default())),
         }
+    }
+
+    async fn research_context(&self) -> WorkspaceResearchContext {
+        self.workspace_service
+            .research_context(self.workspace_id)
+            .await
+            .unwrap_or_default()
     }
 
     pub async fn query(&self, request: KGQueryRequest) -> Result<KGQueryResponse, AppError> {
@@ -727,6 +742,15 @@ impl KnowledgeGraphService {
     }
 
     pub async fn insert_articles(&self, uids: Vec<String>) -> Result<KGInsertResponse, AppError> {
+        let context = self.research_context().await;
+        self.insert_articles_with_context(uids, context).await
+    }
+
+    pub async fn insert_articles_with_context(
+        &self,
+        uids: Vec<String>,
+        context: WorkspaceResearchContext,
+    ) -> Result<KGInsertResponse, AppError> {
         if uids.is_empty() {
             return Ok(KGInsertResponse {
                 total: 0,
@@ -776,7 +800,7 @@ impl KnowledgeGraphService {
             }
 
             match self
-                .insert_article_text(&article.uid, &text, &mut engram)
+                .insert_article_text(&article.uid, &text, &mut engram, &context)
                 .await
             {
                 Ok(outcome) => {
@@ -944,6 +968,7 @@ impl KnowledgeGraphService {
                 return;
             }
         };
+        let context = self.research_context().await;
 
         let total_articles = articles.len() as i64;
         for (article_index, article) in articles.into_iter().enumerate() {
@@ -968,7 +993,7 @@ impl KnowledgeGraphService {
             let result = if text.trim().is_empty() {
                 Err(AppError::BadRequest("No text content".to_string()))
             } else {
-                self.insert_article_text(&article.uid, &text, &mut engram)
+                self.insert_article_text(&article.uid, &text, &mut engram, &context)
                     .await
             };
 
@@ -1253,6 +1278,7 @@ impl KnowledgeGraphService {
         uid: &str,
         text: &str,
         engram: &mut EntityEngram,
+        context: &WorkspaceResearchContext,
     ) -> Result<InsertOutcome, AppError> {
         let chunks = chunk_text_for_kg(text);
         let mut total_entities = 0i64;
@@ -1260,7 +1286,7 @@ impl KnowledgeGraphService {
         let mut session_cache = HashMap::new();
 
         for (chunk_index, chunk_text) in chunks.iter().enumerate() {
-            let extraction = self.extract_chunk(uid, chunk_text).await?;
+            let extraction = self.extract_chunk(uid, chunk_text, context).await?;
             if extraction.entities.is_empty() {
                 continue;
             }
@@ -1325,9 +1351,11 @@ impl KnowledgeGraphService {
         &self,
         uid: &str,
         chunk_text: &str,
+        context: &WorkspaceResearchContext,
     ) -> Result<ChunkExtraction, AppError> {
         let mut variables = std::collections::BTreeMap::new();
         variables.insert("chunk_text".to_string(), chunk_text.to_string());
+        insert_workspace_prompt_vars(&mut variables, context);
         let response = self
             .llm_service
             .execute_prompt(
@@ -2252,7 +2280,12 @@ impl KnowledgeGraphService {
             );
             let total: i64 = conn.query_row(
                 &total_sql,
-                params![stale_only_flag, entity_type, WIKI_MIN_SOURCE_ARTICLES, workspace_id],
+                params![
+                    stale_only_flag,
+                    entity_type,
+                    WIKI_MIN_SOURCE_ARTICLES,
+                    workspace_id
+                ],
                 |row| row.get(0),
             )?;
 
@@ -2332,6 +2365,11 @@ impl KnowledgeGraphService {
 
     pub async fn analyze_gaps(&self, workspace_id: i64) -> Result<KGGapAnalysisResponse, AppError> {
         let database_path = self.database_path.clone();
+        let context = self
+            .workspace_service
+            .research_context(workspace_id)
+            .await
+            .unwrap_or_default();
 
         let (
             entity_summaries,
@@ -2456,6 +2494,7 @@ impl KnowledgeGraphService {
         variables.insert("type_distribution".to_string(), type_distribution);
         variables.insert("relationship_stats".to_string(), relationship_stats);
         variables.insert("isolated_entities".to_string(), isolated_entities);
+        insert_workspace_prompt_vars(&mut variables, &context);
 
         let response = self
             .llm_service
@@ -3016,6 +3055,7 @@ impl KnowledgeGraphService {
 
     async fn compile_single_synthesis(&self, entity_id: i64) -> Result<(), AppError> {
         let context = self.gather_synthesis_context(entity_id).await?;
+        let research_context = self.research_context().await;
 
         let mut variables = std::collections::BTreeMap::new();
         variables.insert("entity_name".to_string(), context.entity_name.clone());
@@ -3025,6 +3065,7 @@ impl KnowledgeGraphService {
         variables.insert("relationships".to_string(), context.relationships);
         variables.insert("neighbor_entities".to_string(), context.neighbor_entities);
         variables.insert("current_synthesis".to_string(), context.current_synthesis);
+        insert_workspace_prompt_vars(&mut variables, &research_context);
 
         let response = self
             .llm_service
@@ -3281,6 +3322,8 @@ impl KnowledgeGraphService {
         variables.insert("target_entity".to_string(), target_name);
         variables.insert("relationship_type".to_string(), rel_type);
         variables.insert("article_contexts".to_string(), article_contexts);
+        let research_context = self.research_context().await;
+        insert_workspace_prompt_vars(&mut variables, &research_context);
 
         let response = self
             .llm_service
@@ -3322,6 +3365,42 @@ struct SynthesisContext {
     relationships: String,
     neighbor_entities: String,
     current_synthesis: String,
+}
+
+fn insert_workspace_prompt_vars(
+    variables: &mut BTreeMap<String, String>,
+    context: &WorkspaceResearchContext,
+) {
+    variables.insert(
+        "workspace_name".to_string(),
+        empty_prompt_value(&context.name),
+    );
+    variables.insert(
+        "collection_context".to_string(),
+        context.collection_context(),
+    );
+    variables.insert(
+        "topic_descriptor".to_string(),
+        empty_prompt_value(&context.topic_descriptor),
+    );
+    variables.insert(
+        "primary_question".to_string(),
+        empty_prompt_value(&context.primary_question),
+    );
+    variables.insert("seed_concepts".to_string(), context.seed_concepts_text());
+    variables.insert(
+        "refined_question".to_string(),
+        empty_prompt_value(&context.refined_question),
+    );
+}
+
+fn empty_prompt_value(value: &str) -> String {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        "(not set)".to_string()
+    } else {
+        trimmed.to_string()
+    }
 }
 
 fn query_entities(

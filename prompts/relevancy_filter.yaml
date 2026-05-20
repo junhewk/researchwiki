@@ -9,10 +9,13 @@ system: |
 user: |
   Decide if the following journal article belongs to this research collection.
 
-  Collection focus: {topic_descriptor}
+  ## Collection Context
+  {collection_context}
 
   Make your decision generously — if the article could plausibly be relevant to the
-  collection focus above, include it.
+  collection context above, include it. Prefer inclusion when the article helps answer
+  the primary or refined question, matches a seed concept, or contributes useful
+  evidence for the workspace topic.
 
   ## Article Title
   {title}

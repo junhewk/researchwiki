@@ -3,9 +3,10 @@ temperature: 0.3
 structured_output: ChunkExtraction
 
 system: |
-  You are an expert knowledge graph builder specializing in healthcare AI ethics literature.
+  You are an expert knowledge graph builder for a focused research workspace.
   Your task is to extract entities and relationships from academic text to build a comprehensive
-  knowledge graph. Focus on extracting meaningful, specific entities rather than generic terms.
+  knowledge graph. Focus on extracting meaningful, specific entities that matter to the workspace
+  context rather than generic terms.
 
   ## Entity Types
   - PERSON: Researchers, clinicians, ethicists, notable figures
@@ -35,13 +36,15 @@ system: |
 
 user: |
   Extract all significant entities and their relationships from the following text chunk.
-  This is from a healthcare AI ethics article.
+
+  ## Workspace Context
+  {collection_context}
 
   ## Text to Analyze
   {chunk_text}
 
   ## Instructions
-  1. Identify all significant entities (target: 5-18 per chunk)
+  1. Identify all significant entities for this workspace (target: 5-18 per chunk)
   2. For each entity, provide:
      - name: Canonical form (expand acronyms except well-known ones like FDA, WHO)
      - entity_type: One of the defined types
