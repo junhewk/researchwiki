@@ -7,7 +7,7 @@ use std::{
 use tokio::sync::RwLock;
 
 use crate::{
-    config::{EmbeddingConfig, LlmConfig},
+    config::{EmbeddingConfig, LlmConfig, normalize_api_key},
     error::AppError,
     models::settings::{
         AiProvider, ApiKeyStatus, SettingsResponse, SettingsUpdate, StoredSettings,
@@ -81,7 +81,7 @@ impl SettingsService {
     pub async fn set_llm_config(&self, llm: LlmConfig) -> Result<(), AppError> {
         let _guard = self.lock.write().await;
         let mut stored = self.load().await?;
-        stored.llm = Some(llm);
+        stored.llm = Some(sanitize_llm_config(llm));
         self.save(&stored).await
     }
 
@@ -93,7 +93,7 @@ impl SettingsService {
     pub async fn set_embedding_config(&self, embedding: EmbeddingConfig) -> Result<(), AppError> {
         let _guard = self.lock.write().await;
         let mut stored = self.load().await?;
-        stored.embedding = Some(embedding);
+        stored.embedding = Some(sanitize_embedding_config(embedding));
         self.save(&stored).await
     }
 
@@ -127,8 +127,9 @@ impl SettingsService {
         }
 
         let raw = tokio::fs::read_to_string(&self.settings_file).await?;
-        let parsed = serde_json::from_str::<StoredSettings>(strip_utf8_bom(&raw))
+        let mut parsed = serde_json::from_str::<StoredSettings>(strip_utf8_bom(&raw))
             .map_err(|error| AppError::Internal(error.to_string()))?;
+        sanitize_stored_settings(&mut parsed);
         Ok(parsed)
     }
 
@@ -152,14 +153,37 @@ pub fn load_overrides_sync(
     let Ok(raw) = std::fs::read_to_string(settings_file) else {
         return (None, None, None);
     };
-    let Ok(stored) = serde_json::from_str::<StoredSettings>(strip_utf8_bom(&raw)) else {
+    let Ok(mut stored) = serde_json::from_str::<StoredSettings>(strip_utf8_bom(&raw)) else {
         return (None, None, None);
     };
+    sanitize_stored_settings(&mut stored);
     (stored.llm, stored.embedding, stored.embedding_dimensions)
 }
 
 fn strip_utf8_bom(raw: &str) -> &str {
     raw.strip_prefix('\u{feff}').unwrap_or(raw)
+}
+
+fn sanitize_stored_settings(stored: &mut StoredSettings) {
+    for value in stored.api_keys.values_mut() {
+        *value = normalize_api_key(&*value);
+    }
+    if let Some(llm) = stored.llm.take() {
+        stored.llm = Some(sanitize_llm_config(llm));
+    }
+    if let Some(embedding) = stored.embedding.take() {
+        stored.embedding = Some(sanitize_embedding_config(embedding));
+    }
+}
+
+fn sanitize_llm_config(mut llm: LlmConfig) -> LlmConfig {
+    llm.api_key = normalize_api_key(&llm.api_key);
+    llm
+}
+
+fn sanitize_embedding_config(mut embedding: EmbeddingConfig) -> EmbeddingConfig {
+    embedding.api_key = normalize_api_key(&embedding.api_key);
+    embedding
 }
 
 fn mask_api_key(key: &str) -> String {

@@ -79,7 +79,7 @@ impl Panel {
             });
 
         egui::CentralPanel::default().show_inside(ui, |ui| {
-            self.show_detail(ui);
+            self.show_detail(ui, ctx);
         });
     }
 
@@ -130,7 +130,11 @@ impl Panel {
         if !self.compiling {
             return;
         }
-        match ctx.state.knowledge_graph_service.get_synthesis_compile_status() {
+        match ctx
+            .state
+            .knowledge_graph_service
+            .get_synthesis_compile_status()
+        {
             Ok(status) => {
                 let running = status.running;
                 self.compile_status = Some(status);
@@ -205,7 +209,10 @@ impl Panel {
             }
         });
 
-        ui.label(format!("{} entities · {} stale", self.total, self.stale_count));
+        ui.label(format!(
+            "{} entities · {} stale",
+            self.total, self.stale_count
+        ));
     }
 
     fn show_list(&mut self, ui: &mut egui::Ui, ctx: &PanelCtx<'_>) {
@@ -241,12 +248,18 @@ impl Panel {
             ui.separator();
             ui.horizontal(|ui| {
                 let has_prev = self.offset >= self.limit;
-                if ui.add_enabled(has_prev, egui::Button::new("◀ Prev")).clicked() {
+                if ui
+                    .add_enabled(has_prev, egui::Button::new("◀ Prev"))
+                    .clicked()
+                {
                     self.offset = self.offset.saturating_sub(self.limit);
                     self.fetch_list(ctx);
                 }
                 let has_next = i64::from(self.offset) + i64::from(self.limit) < self.total;
-                if ui.add_enabled(has_next, egui::Button::new("Next ▶")).clicked() {
+                if ui
+                    .add_enabled(has_next, egui::Button::new("Next ▶"))
+                    .clicked()
+                {
                     self.offset += self.limit;
                     self.fetch_list(ctx);
                 }
@@ -257,7 +270,8 @@ impl Panel {
         }
     }
 
-    fn show_detail(&mut self, ui: &mut egui::Ui) {
+    fn show_detail(&mut self, ui: &mut egui::Ui, ctx: &PanelCtx<'_>) {
+        let mut navigate: Option<String> = None;
         egui::ScrollArea::vertical()
             .auto_shrink([false, false])
             .show(ui, |ui| {
@@ -273,7 +287,11 @@ impl Panel {
                     if syn.stale { " · stale" } else { "" },
                 ));
                 if let Some(compiled_at) = &syn.compiled_at {
-                    ui.label(egui::RichText::new(format!("Compiled: {compiled_at}")).weak().small());
+                    ui.label(
+                        egui::RichText::new(format!("Compiled: {compiled_at}"))
+                            .weak()
+                            .small(),
+                    );
                 }
                 ui.separator();
                 if !syn.summary.is_empty() {
@@ -283,7 +301,18 @@ impl Panel {
                 if syn.synthesis.is_empty() {
                     ui.label(egui::RichText::new("(no synthesis compiled yet)").weak());
                 } else {
-                    CommonMarkViewer::new().show(ui, &mut self.md_cache, &syn.synthesis);
+                    let (linked_markdown, link_targets) =
+                        markdown_with_entity_links(&syn.synthesis);
+                    self.md_cache.link_hooks_clear();
+                    for (destination, _) in &link_targets {
+                        self.md_cache.add_link_hook(destination.clone());
+                    }
+                    CommonMarkViewer::new().show(ui, &mut self.md_cache, &linked_markdown);
+                    for (destination, target) in link_targets {
+                        if self.md_cache.get_link_hook(&destination) == Some(true) {
+                            navigate = Some(target);
+                        }
+                    }
                 }
                 if !syn.key_aspects.is_empty() {
                     ui.add_space(8.0);
@@ -300,9 +329,15 @@ impl Panel {
                             "• {} — {} ({})",
                             rel.relationship_type, rel.name, rel.entity_type,
                         ));
+                        if ui.link(format!("Open {}", rel.name)).clicked() {
+                            navigate = Some(rel.name.clone());
+                        }
                     }
                 }
             });
+        if let Some(name) = navigate {
+            self.load_detail(ctx, &name);
+        }
     }
 
     fn fetch_list(&mut self, ctx: &PanelCtx<'_>) {
@@ -384,4 +419,53 @@ fn opt(s: &str) -> Option<String> {
     } else {
         Some(t.to_string())
     }
+}
+
+fn markdown_with_entity_links(markdown: &str) -> (String, Vec<(String, String)>) {
+    let mut rendered = String::with_capacity(markdown.len());
+    let mut targets = Vec::new();
+    let mut rest = markdown;
+
+    while let Some(start) = rest.find("[[") {
+        rendered.push_str(&rest[..start]);
+        let after_start = &rest[start + 2..];
+        let Some(end) = after_start.find("]]") else {
+            rendered.push_str(&rest[start..]);
+            return (rendered, targets);
+        };
+
+        let raw = &after_start[..end];
+        let (target, label) = raw
+            .split_once('|')
+            .map(|(target, label)| (target.trim(), label.trim()))
+            .unwrap_or_else(|| {
+                let target = raw.trim();
+                (target, target)
+            });
+
+        if target.is_empty() {
+            rendered.push_str("[[]]");
+        } else {
+            let destination = entity_link_destination(target);
+            rendered.push_str(&format!(
+                "[{}]({})",
+                escape_markdown_link_label(label),
+                destination
+            ));
+            targets.push((destination, target.to_string()));
+        }
+
+        rest = &after_start[end + 2..];
+    }
+
+    rendered.push_str(rest);
+    (rendered, targets)
+}
+
+fn entity_link_destination(entity_name: &str) -> String {
+    format!("rw-entity:{}", urlencoding::encode(entity_name))
+}
+
+fn escape_markdown_link_label(value: &str) -> String {
+    value.replace('[', "\\[").replace(']', "\\]")
 }

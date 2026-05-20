@@ -1,4 +1,4 @@
-use crate::config::{EmbeddingConfig, LlmConfig};
+use crate::config::{EmbeddingConfig, LlmConfig, normalize_api_key};
 
 pub struct FirstRunForm {
     pub llm_base_url: String,
@@ -112,7 +112,7 @@ impl FirstRunForm {
     fn validate(&self) -> Result<(LlmConfig, EmbeddingConfig), String> {
         let llm_base_url = self.llm_base_url.trim().trim_end_matches('/').to_string();
         let llm_model = self.llm_model.trim().to_string();
-        let llm_api_key = self.llm_api_key.trim().to_string();
+        let llm_api_key = normalize_api_key(&self.llm_api_key);
 
         if llm_base_url.is_empty() {
             return Err("LLM Base URL is required.".to_string());
@@ -126,7 +126,7 @@ impl FirstRunForm {
 
         let embed_base_url = self.embed_base_url.trim().trim_end_matches('/').to_string();
         let embed_model = self.embed_model.trim().to_string();
-        let embed_api_key = self.embed_api_key.trim().to_string();
+        let embed_api_key = normalize_api_key(&self.embed_api_key);
 
         if embed_base_url.is_empty() {
             return Err("Embedding Base URL is required.".to_string());

@@ -3041,7 +3041,7 @@ impl KnowledgeGraphService {
             entity_markdown_filename(payload.entity.entity_id, &payload.entity.entity_name);
         tokio::fs::write(
             entities_dir.join(&entity_file),
-            render_entity_markdown(&payload.entity, &payload.sources),
+            render_entity_markdown(&payload.entity, &payload.sources, &payload.index),
         )
         .await?;
 
@@ -3622,7 +3622,11 @@ fn map_wiki_source_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<WikiSourceAr
     })
 }
 
-fn render_entity_markdown(entity: &WikiEntityPage, sources: &[WikiSourceArticle]) -> String {
+fn render_entity_markdown(
+    entity: &WikiEntityPage,
+    sources: &[WikiSourceArticle],
+    index: &[KGEntitySynthesisSummary],
+) -> String {
     let mut out = String::new();
     out.push_str("---\n");
     out.push_str("type: entity\n");
@@ -3662,19 +3666,31 @@ fn render_entity_markdown(entity: &WikiEntityPage, sources: &[WikiSourceArticle]
 
     if !entity.synthesis.trim().is_empty() {
         out.push_str("## Synthesis\n\n");
-        out.push_str(&clean_markdown_text(entity.synthesis.trim()));
+        let linked_synthesis = export_wiki_links(entity.synthesis.trim(), index);
+        out.push_str(&clean_markdown_text(&linked_synthesis));
         out.push_str("\n\n");
     }
 
     if !entity.related_entities.is_empty() {
         out.push_str("## Related Entities\n\n");
         for related in &entity.related_entities {
-            out.push_str(&format!(
-                "- [[{}]] - {} ({})\n",
-                clean_markdown_text(&related.name),
-                clean_markdown_text(&related.relationship_type),
-                clean_markdown_text(&related.entity_type)
-            ));
+            let label = escape_markdown_link_label(&related.name);
+            if let Some(filename) = entity_link_filename(index, &related.name) {
+                out.push_str(&format!(
+                    "- [{}]({}) - {} ({})\n",
+                    label,
+                    filename,
+                    clean_markdown_text(&related.relationship_type),
+                    clean_markdown_text(&related.entity_type)
+                ));
+            } else {
+                out.push_str(&format!(
+                    "- [[{}]] - {} ({})\n",
+                    clean_markdown_text(&related.name),
+                    clean_markdown_text(&related.relationship_type),
+                    clean_markdown_text(&related.entity_type)
+                ));
+            }
         }
         out.push('\n');
     }
@@ -3849,6 +3865,54 @@ fn clean_markdown_text(value: &str) -> String {
         .chars()
         .filter(|character| !character.is_control() || matches!(*character, '\n' | '\r' | '\t'))
         .collect()
+}
+
+fn export_wiki_links(markdown: &str, index: &[KGEntitySynthesisSummary]) -> String {
+    let mut rendered = String::with_capacity(markdown.len());
+    let mut rest = markdown;
+
+    while let Some(start) = rest.find("[[") {
+        rendered.push_str(&rest[..start]);
+        let after_start = &rest[start + 2..];
+        let Some(end) = after_start.find("]]") else {
+            rendered.push_str(&rest[start..]);
+            return rendered;
+        };
+
+        let raw = &after_start[..end];
+        let (target, label) = raw
+            .split_once('|')
+            .map(|(target, label)| (target.trim(), label.trim()))
+            .unwrap_or_else(|| {
+                let target = raw.trim();
+                (target, target)
+            });
+
+        if target.is_empty() {
+            rendered.push_str("[[]]");
+        } else if let Some(filename) = entity_link_filename(index, target) {
+            rendered.push_str(&format!(
+                "[{}]({})",
+                escape_markdown_link_label(label),
+                filename
+            ));
+        } else {
+            rendered.push_str(&format!("[[{}]]", clean_markdown_text(raw)));
+        }
+
+        rest = &after_start[end + 2..];
+    }
+
+    rendered.push_str(rest);
+    rendered
+}
+
+fn entity_link_filename(index: &[KGEntitySynthesisSummary], entity_name: &str) -> Option<String> {
+    let target = normalize_name(entity_name);
+    index
+        .iter()
+        .find(|item| normalize_name(&item.entity_name) == target)
+        .map(|item| entity_markdown_filename(item.entity_id, &item.entity_name))
 }
 
 fn query_graph_edges(

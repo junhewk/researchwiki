@@ -1,5 +1,5 @@
 use crate::{
-    config::{EmbeddingConfig, LlmConfig},
+    config::{EmbeddingConfig, LlmConfig, normalize_api_key},
     models::settings::{NewsletterSettings, SchedulerSettings, SettingsUpdate},
 };
 
@@ -431,7 +431,7 @@ impl Panel {
         let mut new_llm: LlmConfig = ctx.state.config.llm.clone();
         new_llm.base_url = self.llm_base_url.trim().trim_end_matches('/').to_string();
         new_llm.model = self.llm_model.trim().to_string();
-        new_llm.api_key = self.llm_api_key.clone();
+        new_llm.api_key = normalize_api_key(&self.llm_api_key);
         let svc = ctx.state.settings_service.clone();
         ctx.handle.spawn(async move {
             let result = svc.set_llm_config(new_llm).await;
@@ -450,7 +450,7 @@ impl Panel {
         let new_embed = EmbeddingConfig {
             base_url: self.embed_base_url.trim().trim_end_matches('/').to_string(),
             model: self.embed_model.trim().to_string(),
-            api_key: self.embed_api_key.clone(),
+            api_key: normalize_api_key(&self.embed_api_key),
         };
         let svc = ctx.state.settings_service.clone();
         ctx.handle.spawn(async move {

@@ -1,11 +1,5 @@
 use std::collections::HashMap;
 
-use egui_graphs::{
-    DefaultEdgeShape, DefaultNodeShape, FruchtermanReingold, FruchtermanReingoldState, Graph,
-    GraphView, LayoutForceDirected, SettingsInteraction, SettingsNavigation,
-};
-use petgraph::stable_graph::{NodeIndex, StableGraph};
-
 use crate::models::knowledge_graph::{
     KGEntityResponse, KGGraphDataQuery, KGGraphDataResponse, KGQueryRequest, KGQueryResponse,
     KGSearchEntity, KGStatsResponse,
@@ -13,20 +7,8 @@ use crate::models::knowledge_graph::{
 
 use super::{MsgChannel, PanelCtx};
 
-/// `GraphView` with all generics pinned: `String` node/edge payloads and a
-/// force-directed (Fruchterman-Reingold) layout. The struct's default generics
-/// are not applied during `new()` inference, so they must be named explicitly.
-type KgGraphView<'a> = GraphView<
-    'a,
-    String,
-    String,
-    petgraph::Directed,
-    u32,
-    DefaultNodeShape,
-    DefaultEdgeShape,
-    FruchtermanReingoldState,
-    LayoutForceDirected<FruchtermanReingold>,
->;
+const GRAPH_PADDING: f32 = 28.0;
+const MAX_LABELS: usize = 24;
 
 enum Msg {
     Search(KGQueryResponse),
@@ -50,16 +32,32 @@ pub struct Panel {
     limit: u32,
     min_degree: u32,
     entity_type: String,
-    graph: Option<Graph<String, String>>,
-    node_names: HashMap<NodeIndex, String>,
+    nodes: Vec<KgNodeView>,
+    edges: Vec<KgEdgeView>,
     graph_loading: bool,
-    last_selected: Option<NodeIndex>,
+    selected_entity: Option<String>,
 
     // Stats header + selected-entity detail.
     stats: Option<KGStatsResponse>,
     detail: Option<KGEntityResponse>,
 
     error: Option<String>,
+}
+
+#[derive(Clone, Debug)]
+struct KgNodeView {
+    name: String,
+    entity_type: String,
+    degree: i64,
+    mention_count: i64,
+    pos: egui::Pos2,
+}
+
+#[derive(Clone, Debug)]
+struct KgEdgeView {
+    source: usize,
+    target: usize,
+    weight: f64,
 }
 
 impl Panel {
@@ -151,7 +149,11 @@ impl Panel {
 
         ui.horizontal_wrapped(|ui| {
             ui.label("Graph nodes ≤");
-            ui.add(egui::DragValue::new(&mut self.limit).range(10..=1000).speed(2.0));
+            ui.add(
+                egui::DragValue::new(&mut self.limit)
+                    .range(10..=1000)
+                    .speed(2.0),
+            );
             ui.label("Min degree");
             ui.add(egui::DragValue::new(&mut self.min_degree).range(0..=20));
             ui.label("Type");
@@ -174,7 +176,7 @@ impl Panel {
     }
 
     fn show_graph(&mut self, ui: &mut egui::Ui, ctx: &PanelCtx<'_>) {
-        if self.graph.is_none() || self.node_names.is_empty() {
+        if self.nodes.is_empty() {
             ui.centered_and_justified(|ui| {
                 ui.label(
                     "No graph data. Adjust the filters and click \"Load graph\", or populate \
@@ -184,33 +186,79 @@ impl Panel {
             return;
         }
 
-        let selected = {
-            let graph = self.graph.as_mut().unwrap();
-            ui.add(
-                &mut KgGraphView::new(graph)
-                    .with_interactions(
-                        &SettingsInteraction::default()
-                            .with_dragging_enabled(true)
-                            .with_node_selection_enabled(true),
-                    )
-                    .with_navigations(
-                        &SettingsNavigation::default()
-                            .with_fit_to_screen_enabled(false)
-                            .with_zoom_and_pan_enabled(true),
-                    ),
-            );
-            // Keep stepping the force-directed layout while the tab is visible.
-            ui.ctx().request_repaint();
-            graph.selected_nodes().first().copied()
-        };
+        let desired = ui.available_size().max(egui::vec2(360.0, 360.0));
+        let (rect, response) = ui.allocate_exact_size(desired, egui::Sense::click());
+        let painter = ui.painter_at(rect);
+        painter.rect_filled(rect, 0.0, ui.visuals().extreme_bg_color);
 
-        if let Some(sel) = selected {
-            if self.last_selected != Some(sel) {
-                self.last_selected = Some(sel);
-                if let Some(name) = self.node_names.get(&sel).cloned() {
+        let graph_rect = rect.shrink(GRAPH_PADDING);
+        let scale = graph_rect.width().min(graph_rect.height()) * 0.5;
+        let center = graph_rect.center();
+        let to_screen = |pos: egui::Pos2| center + egui::vec2(pos.x * scale, pos.y * scale);
+
+        for edge in &self.edges {
+            let Some(source) = self.nodes.get(edge.source) else {
+                continue;
+            };
+            let Some(target) = self.nodes.get(edge.target) else {
+                continue;
+            };
+            let stroke_width = (edge.weight as f32).sqrt().clamp(0.7, 2.2);
+            painter.line_segment(
+                [to_screen(source.pos), to_screen(target.pos)],
+                egui::Stroke::new(stroke_width, egui::Color32::from_gray(190)),
+            );
+        }
+
+        let hovered = response
+            .hover_pos()
+            .and_then(|cursor| self.node_at(cursor, &to_screen));
+        if response.clicked() {
+            if let Some(idx) = hovered {
+                if let Some(name) = self.nodes.get(idx).map(|node| node.name.clone()) {
                     self.load_entity(ctx, &name);
                 }
             }
+        }
+
+        let max_degree = self.nodes.iter().map(|node| node.degree).max().unwrap_or(1);
+        for (idx, node) in self.nodes.iter().enumerate() {
+            let screen = to_screen(node.pos);
+            let selected = self.selected_entity.as_deref() == Some(node.name.as_str());
+            let hovered = hovered == Some(idx);
+            let radius = node_radius(node, max_degree);
+            let color = entity_color(&node.entity_type);
+            painter.circle_filled(screen, radius, color);
+            painter.circle_stroke(
+                screen,
+                radius,
+                egui::Stroke::new(
+                    if selected || hovered { 2.0 } else { 1.0 },
+                    if selected || hovered {
+                        egui::Color32::BLACK
+                    } else {
+                        egui::Color32::from_gray(80)
+                    },
+                ),
+            );
+
+            if selected || hovered || idx < MAX_LABELS {
+                painter.text(
+                    screen + egui::vec2(radius + 3.0, -radius - 2.0),
+                    egui::Align2::LEFT_TOP,
+                    &node.name,
+                    egui::FontId::proportional(11.0),
+                    ui.visuals().text_color(),
+                );
+            }
+        }
+
+        if let Some(idx) = hovered.and_then(|idx| self.nodes.get(idx).map(|_| idx)) {
+            let node = &self.nodes[idx];
+            response.clone().on_hover_text(format!(
+                "{}\n{} | degree {} | mentions {}",
+                node.name, node.entity_type, node.degree, node.mention_count
+            ));
         }
     }
 
@@ -275,9 +323,8 @@ impl Panel {
     }
 
     fn build_graph(&mut self, resp: KGGraphDataResponse) {
-        let mut stable: StableGraph<String, String> = StableGraph::new();
-        let mut idx_by_id: HashMap<String, NodeIndex> = HashMap::new();
-        let mut node_names: HashMap<NodeIndex, String> = HashMap::new();
+        let mut nodes = Vec::new();
+        let mut idx_by_id: HashMap<String, usize> = HashMap::new();
 
         for node in &resp.nodes {
             let name = node
@@ -286,36 +333,54 @@ impl Panel {
                 .and_then(|v| v.as_str())
                 .map(str::to_string)
                 .unwrap_or_else(|| node.id.clone());
-            let idx = stable.add_node(name.clone());
+            let entity_type = node
+                .properties
+                .get("entity_type")
+                .and_then(|v| v.as_str())
+                .unwrap_or("UNKNOWN")
+                .to_string();
+            let degree = node
+                .properties
+                .get("degree")
+                .and_then(|v| v.as_i64())
+                .unwrap_or(0);
+            let mention_count = node
+                .properties
+                .get("mention_count")
+                .and_then(|v| v.as_i64())
+                .unwrap_or(0);
+            let idx = nodes.len();
             idx_by_id.insert(node.id.clone(), idx);
-            node_names.insert(idx, name);
+            nodes.push(KgNodeView {
+                name,
+                entity_type,
+                degree,
+                mention_count,
+                pos: egui::pos2(0.0, 0.0),
+            });
         }
+        layout_nodes(&mut nodes);
+
+        let mut edges = Vec::new();
         for edge in &resp.edges {
-            if let (Some(&s), Some(&t)) =
-                (idx_by_id.get(&edge.source), idx_by_id.get(&edge.target))
+            if let (Some(&s), Some(&t)) = (idx_by_id.get(&edge.source), idx_by_id.get(&edge.target))
             {
-                let rel = edge
+                let weight = edge
                     .properties
-                    .get("relationship")
-                    .or_else(|| edge.properties.get("type"))
-                    .and_then(|v| v.as_str())
-                    .unwrap_or_default()
-                    .to_string();
-                stable.add_edge(s, t, rel);
+                    .get("weight")
+                    .and_then(|v| v.as_f64())
+                    .unwrap_or(1.0);
+                edges.push(KgEdgeView {
+                    source: s,
+                    target: t,
+                    weight,
+                });
             }
         }
 
-        // egui_graphs labels nodes by index by default; relabel to entity names.
-        let mut graph: Graph<String, String> = Graph::from(&stable);
-        for (&idx, name) in &node_names {
-            if let Some(node) = graph.node_mut(idx) {
-                node.set_label(name.clone());
-            }
-        }
-
-        self.graph = Some(graph);
-        self.node_names = node_names;
-        self.last_selected = None;
+        self.nodes = nodes;
+        self.edges = edges;
+        self.selected_entity = None;
     }
 
     fn load_stats(&mut self, ctx: &PanelCtx<'_>) {
@@ -376,6 +441,7 @@ impl Panel {
     }
 
     fn load_entity(&mut self, ctx: &PanelCtx<'_>, name: &str) {
+        self.selected_entity = Some(name.to_string());
         let Some(channel) = self.channel.as_ref() else {
             return;
         };
@@ -389,6 +455,29 @@ impl Panel {
             };
         });
     }
+
+    fn node_at(
+        &self,
+        cursor: egui::Pos2,
+        to_screen: &impl Fn(egui::Pos2) -> egui::Pos2,
+    ) -> Option<usize> {
+        let max_degree = self.nodes.iter().map(|node| node.degree).max().unwrap_or(1);
+        self.nodes
+            .iter()
+            .enumerate()
+            .filter_map(|(idx, node)| {
+                let screen = to_screen(node.pos);
+                let radius = node_radius(node, max_degree) + 4.0;
+                let dist = screen.distance(cursor);
+                (dist <= radius).then_some((idx, dist))
+            })
+            .min_by(|left, right| {
+                left.1
+                    .partial_cmp(&right.1)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            })
+            .map(|(idx, _)| idx)
+    }
 }
 
 fn opt(s: &str) -> Option<String> {
@@ -397,5 +486,47 @@ fn opt(s: &str) -> Option<String> {
         None
     } else {
         Some(t.to_string())
+    }
+}
+
+fn layout_nodes(nodes: &mut [KgNodeView]) {
+    let count = nodes.len();
+    if count == 0 {
+        return;
+    }
+    if count == 1 {
+        nodes[0].pos = egui::pos2(0.0, 0.0);
+        return;
+    }
+
+    let max_ring = (count as f32).sqrt().ceil().max(2.0);
+    for (idx, node) in nodes.iter_mut().enumerate() {
+        if idx == 0 {
+            node.pos = egui::pos2(0.0, 0.0);
+            continue;
+        }
+        let ring = ((idx as f32).sqrt().floor() + 1.0).min(max_ring);
+        let radius = (ring / max_ring).clamp(0.18, 0.96);
+        let angle = idx as f32 * 2.399_963_1;
+        node.pos = egui::pos2(radius * angle.cos(), radius * angle.sin());
+    }
+}
+
+fn node_radius(node: &KgNodeView, max_degree: i64) -> f32 {
+    let degree = node.degree.max(0) as f32;
+    let max_degree = max_degree.max(1) as f32;
+    4.5 + 8.0 * (degree / max_degree).sqrt()
+}
+
+fn entity_color(entity_type: &str) -> egui::Color32 {
+    match entity_type.to_ascii_uppercase().as_str() {
+        "CONCEPT" => egui::Color32::from_rgb(95, 146, 220),
+        "TECHNOLOGY" => egui::Color32::from_rgb(80, 170, 132),
+        "METHODOLOGY" => egui::Color32::from_rgb(202, 143, 61),
+        "DATASET" => egui::Color32::from_rgb(165, 124, 205),
+        "ORGANIZATION" => egui::Color32::from_rgb(210, 118, 112),
+        "REGULATION" => egui::Color32::from_rgb(118, 156, 92),
+        "MEDICAL_CONDITION" => egui::Color32::from_rgb(188, 111, 153),
+        _ => egui::Color32::from_rgb(130, 150, 165),
     }
 }

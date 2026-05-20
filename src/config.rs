@@ -140,7 +140,9 @@ impl AppConfig {
                 .map(|v| v.trim_end_matches('/').to_string())
                 .unwrap_or(base.llm.base_url),
             model: env::var("LLM_MODEL").unwrap_or(base.llm.model),
-            api_key: env::var("LLM_API_KEY").unwrap_or(base.llm.api_key),
+            api_key: env::var("LLM_API_KEY")
+                .map(normalize_api_key)
+                .unwrap_or(base.llm.api_key),
             disable_thinking: env_bool("LLM_DISABLE_THINKING", base.llm.disable_thinking),
             connect_timeout_seconds: env_parse(
                 "LLM_CONNECT_TIMEOUT_SECONDS",
@@ -169,6 +171,7 @@ impl AppConfig {
             // break — embedding endpoint defaults to OpenAI anyway.
             api_key: env::var("EMBEDDING_API_KEY")
                 .or_else(|_| env::var("OPENAI_API_KEY"))
+                .map(normalize_api_key)
                 .unwrap_or(base.embedding.api_key),
         };
 
@@ -184,6 +187,14 @@ impl AppConfig {
             embedding_dimensions,
         })
     }
+}
+
+pub fn normalize_api_key(value: impl AsRef<str>) -> String {
+    value
+        .as_ref()
+        .chars()
+        .filter(|ch| !ch.is_whitespace())
+        .collect()
 }
 
 fn default_data_root() -> Result<PathBuf> {
