@@ -22,6 +22,7 @@ use crate::{
     ui::{
         first_run::{FirstRunForm, FirstRunOutcome},
         panels::{PanelCtx, Panels, Tab},
+        style,
     },
 };
 
@@ -69,6 +70,7 @@ impl DesktopApp {
         config: AppConfig,
     ) -> Self {
         install_system_font_fallbacks(&cc.egui_ctx);
+        style::apply_app_style(&cc.egui_ctx);
 
         let persistent = cc
             .storage

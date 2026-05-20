@@ -1,6 +1,9 @@
 use egui_extras::{Column, TableBuilder};
 
-use crate::models::article::{ArticleListQuery, ArticleListResponse, ArticleResponse};
+use crate::{
+    models::article::{ArticleListQuery, ArticleListResponse, ArticleResponse},
+    ui::style,
+};
 
 use super::{MsgChannel, PanelCtx};
 
@@ -67,8 +70,7 @@ impl Panel {
             self.fetch(ctx);
         }
 
-        ui.heading("Articles");
-        ui.separator();
+        style::panel_header(ui, "Articles", None);
 
         self.show_filters(ui, ctx);
         ui.add_space(4.0);

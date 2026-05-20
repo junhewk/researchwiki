@@ -16,6 +16,7 @@ use crate::{
         settings::{SchedulerSettings, SchedulerStatusResponse, SettingsUpdate},
     },
     services::pipeline::{GATHER_SOURCE_IDS, source_label},
+    ui::style,
 };
 
 use super::{MsgChannel, PanelCtx};
@@ -127,29 +128,28 @@ impl Panel {
             self.refresh_operations(ctx);
         }
 
-        ui.heading("Gather");
-        ui.separator();
+        style::panel_header(ui, "Gather", None);
 
         egui::ScrollArea::vertical()
             .auto_shrink([false, false])
             .show(ui, |ui| {
-                self.show_pipeline_test(ui, ctx);
-                ui.add_space(8.0);
-                ui.separator();
-                self.show_kg_ops(ui, ctx);
-                ui.add_space(8.0);
-                ui.separator();
-                self.show_scheduler_check(ui, ctx);
-                ui.add_space(8.0);
-                ui.separator();
+                style::section_heading(ui, "Run gather");
                 self.show_controls(ui, ctx);
-                ui.add_space(8.0);
                 self.show_notice(ui);
-                ui.separator();
+                style::section_break(ui);
                 self.show_active_runs(ui, ctx);
-                ui.add_space(8.0);
-                ui.separator();
+                style::section_break(ui);
                 self.show_history(ui, ctx);
+                style::section_break(ui);
+                self.show_kg_ops(ui, ctx);
+                style::section_break(ui);
+                egui::CollapsingHeader::new("Advanced diagnostics")
+                    .default_open(false)
+                    .show(ui, |ui| {
+                        self.show_pipeline_test(ui, ctx);
+                        style::section_break(ui);
+                        self.show_scheduler_check(ui, ctx);
+                    });
             });
 
         if self.detail.is_some() {
@@ -278,7 +278,7 @@ impl Panel {
     }
 
     fn show_pipeline_test(&mut self, ui: &mut egui::Ui, ctx: &PanelCtx<'_>) {
-        ui.heading("Pipeline smoke test");
+        style::section_heading(ui, "Pipeline smoke test");
         ui.horizontal_wrapped(|ui| {
             ui.label("Source");
             source_combo(
@@ -314,7 +314,7 @@ impl Panel {
     }
 
     fn show_kg_ops(&mut self, ui: &mut egui::Ui, ctx: &PanelCtx<'_>) {
-        ui.heading("Knowledge graph ops");
+        style::section_heading(ui, "Knowledge graph / wiki backfill");
 
         ui.horizontal_wrapped(|ui| {
             ui.label("KG batch");
@@ -399,7 +399,7 @@ impl Panel {
     }
 
     fn show_scheduler_check(&mut self, ui: &mut egui::Ui, ctx: &PanelCtx<'_>) {
-        ui.heading("Scheduler check");
+        style::section_heading(ui, "Scheduler check");
 
         ui.horizontal_wrapped(|ui| {
             ui.label("Scheduled source");
@@ -515,11 +515,7 @@ impl Panel {
         let Some((kind, msg)) = &self.notice else {
             return;
         };
-        let color = match kind {
-            NoticeKind::Success => egui::Color32::from_rgb(0, 130, 0),
-            NoticeKind::Error => egui::Color32::RED,
-        };
-        ui.colored_label(color, msg);
+        style::status_notice(ui, matches!(kind, NoticeKind::Success), msg);
     }
 
     fn show_kg_stats(&self, ui: &mut egui::Ui) {
@@ -674,7 +670,7 @@ impl Panel {
     }
 
     fn show_active_runs(&mut self, ui: &mut egui::Ui, ctx: &PanelCtx<'_>) {
-        ui.heading("Active runs");
+        style::section_heading(ui, "Active runs");
         let active = self
             .jobs
             .iter()
@@ -756,7 +752,7 @@ impl Panel {
     }
 
     fn show_history(&mut self, ui: &mut egui::Ui, ctx: &PanelCtx<'_>) {
-        ui.heading("Run history");
+        style::section_heading(ui, "Run history");
         let text_height = egui::TextStyle::Body.resolve(ui.style()).size + 8.0;
         let rows = self.jobs.len();
         let max_scroll_height = ui.available_height().max(180.0);

@@ -1,8 +1,11 @@
 use std::collections::HashMap;
 
-use crate::models::knowledge_graph::{
-    KGEntityResponse, KGGraphDataQuery, KGGraphDataResponse, KGQueryRequest, KGQueryResponse,
-    KGSearchEntity, KGStatsResponse,
+use crate::{
+    models::knowledge_graph::{
+        KGEntityResponse, KGGraphDataQuery, KGGraphDataResponse, KGQueryRequest, KGQueryResponse,
+        KGSearchEntity, KGStatsResponse,
+    },
+    ui::style,
 };
 
 use super::{MsgChannel, PanelCtx};
@@ -84,11 +87,10 @@ impl Panel {
             self.load_graph(ctx);
         }
 
-        ui.heading("Knowledge Graph");
-        ui.separator();
+        style::panel_header(ui, "Knowledge Graph", None);
 
         self.show_controls(ui, ctx);
-        ui.add_space(4.0);
+        ui.add_space(8.0);
 
         if let Some(err) = &self.error {
             ui.colored_label(egui::Color32::RED, err);
@@ -141,6 +143,7 @@ impl Panel {
     }
 
     fn show_controls(&mut self, ui: &mut egui::Ui, ctx: &PanelCtx<'_>) {
+        style::section_heading(ui, "Entity search");
         ui.horizontal_wrapped(|ui| {
             ui.label("Search");
             let resp = ui.add(
@@ -157,6 +160,8 @@ impl Panel {
             }
         });
 
+        ui.add_space(8.0);
+        style::section_heading(ui, "Graph view");
         ui.horizontal_wrapped(|ui| {
             ui.label("Graph nodes ≤");
             ui.add(
@@ -197,7 +202,8 @@ impl Panel {
     fn show_graph(&mut self, ui: &mut egui::Ui, ctx: &PanelCtx<'_>) {
         if self.nodes.is_empty() {
             ui.centered_and_justified(|ui| {
-                ui.label(
+                style::body_label(
+                    ui,
                     "No graph data. Adjust the filters and click \"Load graph\", or populate \
                      the knowledge graph from the Gather tab (Run gather + KG smoke test).",
                 );
@@ -338,7 +344,7 @@ impl Panel {
                     screen + egui::vec2(radius + 3.0, -radius - 2.0),
                     egui::Align2::LEFT_TOP,
                     &node.name,
-                    egui::FontId::proportional(11.0),
+                    egui::FontId::proportional(style::GRAPH_LABEL_TEXT_SIZE),
                     ui.visuals().text_color(),
                 );
             }
@@ -388,7 +394,7 @@ impl Panel {
                     }
                     if let Some(desc) = &detail.description {
                         ui.add_space(2.0);
-                        ui.label(desc);
+                        style::body_label(ui, desc.as_str());
                     }
                     if !detail.neighbors.is_empty() {
                         ui.separator();
@@ -405,12 +411,16 @@ impl Panel {
                                 navigate = Some(neighbor.entity.clone());
                             }
                             if let Some(evidence) = &neighbor.evidence_summary {
-                                ui.label(egui::RichText::new(evidence).weak().small());
+                                style::muted_label(ui, evidence.as_str());
+                                ui.add_space(4.0);
                             }
                         }
                     }
                 } else {
-                    ui.label("Click a graph node or a search result to see entity details.");
+                    style::body_label(
+                        ui,
+                        "Click a graph node or a search result to see entity details.",
+                    );
                 }
                 if let Some(name) = navigate {
                     self.load_entity(ctx, &name);

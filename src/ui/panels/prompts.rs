@@ -6,6 +6,7 @@ use crate::models::prompt::{
     PromptCreate, PromptFileConfig, PromptResponse, PromptVersionResponse,
 };
 use crate::services::llm::LlmOutputMode;
+use crate::ui::style;
 
 enum Msg {
     List(Vec<PromptResponse>),
@@ -74,9 +75,11 @@ impl Panel {
             }
         }
 
-        ui.heading("Prompts");
-        ui.label("Edit prompt templates (YAML). Saving creates a new version.");
-        ui.separator();
+        style::panel_header(
+            ui,
+            "Prompts",
+            Some("Edit prompt templates (YAML). Saving creates a new version."),
+        );
 
         let names: Vec<(String, i64)> = self
             .prompts

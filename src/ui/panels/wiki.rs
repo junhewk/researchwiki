@@ -2,9 +2,12 @@ use std::time::Duration;
 
 use egui_commonmark::{CommonMarkCache, CommonMarkViewer};
 
-use crate::models::knowledge_graph::{
-    KGEntitySynthesis, KGEntitySynthesisSummary, KGSynthesisCompileStatus, KGSynthesisListQuery,
-    KGSynthesisListResponse,
+use crate::{
+    models::knowledge_graph::{
+        KGEntitySynthesis, KGEntitySynthesisSummary, KGSynthesisCompileStatus,
+        KGSynthesisListQuery, KGSynthesisListResponse,
+    },
+    ui::style,
 };
 
 use super::{MsgChannel, PanelCtx};
@@ -61,11 +64,10 @@ impl Panel {
         }
         self.poll_compile(ui, ctx);
 
-        ui.heading("Wiki");
-        ui.separator();
+        style::panel_header(ui, "Wiki", None);
 
         self.show_controls(ui, ctx);
-        ui.add_space(4.0);
+        ui.add_space(8.0);
 
         if let Some(err) = &self.error {
             ui.colored_label(egui::Color32::RED, err);
@@ -155,6 +157,7 @@ impl Panel {
     }
 
     fn show_controls(&mut self, ui: &mut egui::Ui, ctx: &PanelCtx<'_>) {
+        style::section_heading(ui, "Search syntheses");
         ui.horizontal_wrapped(|ui| {
             ui.label("Search");
             let resp = ui.add(
@@ -176,6 +179,8 @@ impl Panel {
             }
         });
 
+        ui.add_space(8.0);
+        style::section_heading(ui, "Filters and compilation");
         ui.horizontal_wrapped(|ui| {
             ui.label("Type");
             ui.add(
@@ -209,10 +214,10 @@ impl Panel {
             }
         });
 
-        ui.label(format!(
-            "{} entities · {} stale",
-            self.total, self.stale_count
-        ));
+        style::muted_label(
+            ui,
+            format!("{} entities · {} stale", self.total, self.stale_count),
+        );
     }
 
     fn show_list(&mut self, ui: &mut egui::Ui, ctx: &PanelCtx<'_>) {
@@ -221,7 +226,8 @@ impl Panel {
             .max_height(ui.available_height() - 36.0)
             .show(ui, |ui| {
                 if self.list.is_empty() {
-                    ui.label(
+                    style::body_label(
+                        ui,
                         "No syntheses yet. Populate the knowledge graph (Gather tab), then \
                          click \"Compile syntheses\". Only entities cited by ≥3 articles appear.",
                     );
@@ -276,30 +282,40 @@ impl Panel {
             .auto_shrink([false, false])
             .show(ui, |ui| {
                 let Some(syn) = &self.selected else {
-                    ui.label("Select an entity to view its synthesis.");
+                    style::body_label(ui, "Select an entity to view its synthesis.");
                     return;
                 };
                 ui.heading(&syn.entity_name);
-                ui.label(format!(
-                    "{} · {} sources{}",
-                    syn.entity_type,
-                    syn.source_article_count,
-                    if syn.stale { " · stale" } else { "" },
-                ));
+                style::muted_label(
+                    ui,
+                    format!(
+                        "{} · {} sources{}",
+                        syn.entity_type,
+                        syn.source_article_count,
+                        if syn.stale { " · stale" } else { "" },
+                    ),
+                );
                 if let Some(compiled_at) = &syn.compiled_at {
                     ui.label(
                         egui::RichText::new(format!("Compiled: {compiled_at}"))
                             .weak()
-                            .small(),
+                            .size(style::HELP_TEXT_SIZE),
                     );
                 }
                 ui.separator();
                 if !syn.summary.is_empty() {
-                    ui.label(egui::RichText::new(&syn.summary).italics());
+                    ui.add(
+                        egui::Label::new(
+                            egui::RichText::new(&syn.summary)
+                                .italics()
+                                .size(style::BODY_TEXT_SIZE),
+                        )
+                        .wrap(),
+                    );
                     ui.add_space(6.0);
                 }
                 if syn.synthesis.is_empty() {
-                    ui.label(egui::RichText::new("(no synthesis compiled yet)").weak());
+                    style::muted_label(ui, "(no synthesis compiled yet)");
                 } else {
                     let (linked_markdown, link_targets) =
                         markdown_with_entity_links(&syn.synthesis);
@@ -307,7 +323,20 @@ impl Panel {
                     for (destination, _) in &link_targets {
                         self.md_cache.add_link_hook(destination.clone());
                     }
-                    CommonMarkViewer::new().show(ui, &mut self.md_cache, &linked_markdown);
+                    ui.scope(|ui| {
+                        ui.style_mut().text_styles.insert(
+                            egui::TextStyle::Body,
+                            egui::FontId::new(
+                                style::BODY_TEXT_SIZE,
+                                egui::FontFamily::Proportional,
+                            ),
+                        );
+                        ui.style_mut().text_styles.insert(
+                            egui::TextStyle::Monospace,
+                            egui::FontId::new(14.0, egui::FontFamily::Monospace),
+                        );
+                        CommonMarkViewer::new().show(ui, &mut self.md_cache, &linked_markdown);
+                    });
                     for (destination, target) in link_targets {
                         if self.md_cache.get_link_hook(&destination) == Some(true) {
                             navigate = Some(target);
@@ -318,17 +347,20 @@ impl Panel {
                     ui.add_space(8.0);
                     ui.strong("Key aspects");
                     for aspect in &syn.key_aspects {
-                        ui.label(format!("• {aspect}"));
+                        style::body_label(ui, format!("• {aspect}"));
                     }
                 }
                 if !syn.related_entities.is_empty() {
                     ui.add_space(8.0);
                     ui.strong("Related entities");
                     for rel in &syn.related_entities {
-                        ui.label(format!(
-                            "• {} — {} ({})",
-                            rel.relationship_type, rel.name, rel.entity_type,
-                        ));
+                        style::body_label(
+                            ui,
+                            format!(
+                                "• {} — {} ({})",
+                                rel.relationship_type, rel.name, rel.entity_type,
+                            ),
+                        );
                         if ui.link(format!("Open {}", rel.name)).clicked() {
                             navigate = Some(rel.name.clone());
                         }

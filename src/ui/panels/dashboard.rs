@@ -1,7 +1,10 @@
 use egui_plot::{Bar, BarChart, Plot};
 
 use super::{MsgChannel, PanelCtx};
-use crate::models::article::{ArticleResponse, ArticleStats, DailyStatsResponse};
+use crate::{
+    models::article::{ArticleResponse, ArticleStats, DailyStatsResponse},
+    ui::style,
+};
 
 const CHART_DAYS: u32 = 30;
 const TOP_LIMIT: u32 = 8;
@@ -59,7 +62,9 @@ impl Panel {
                 ui.spinner();
             }
         });
+        ui.add_space(6.0);
         ui.separator();
+        ui.add_space(8.0);
 
         if let Some(err) = &self.error {
             ui.colored_label(egui::Color32::RED, err);
@@ -96,10 +101,10 @@ impl Panel {
         }
 
         ui.add_space(10.0);
-        ui.label(egui::RichText::new("Top articles").strong());
+        style::section_heading(ui, "Top articles");
         egui::ScrollArea::vertical().show(ui, |ui| {
             if self.top.is_empty() {
-                ui.weak("No scored articles yet for this workspace.");
+                style::muted_label(ui, "No scored articles yet for this workspace.");
             }
             for article in &self.top {
                 ui.horizontal(|ui| {

@@ -1,4 +1,7 @@
-use crate::config::{EmbeddingConfig, LlmConfig, normalize_api_key};
+use crate::{
+    config::{EmbeddingConfig, LlmConfig, normalize_api_key},
+    ui::style,
+};
 
 pub struct FirstRunForm {
     pub llm_base_url: String,
@@ -42,12 +45,18 @@ impl FirstRunForm {
             .resizable(false)
             .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
             .show(ctx, |ui| {
-                ui.label("Configure the two OpenAI-compatible endpoints ResearchWiki uses.");
-                ui.label("You can change either later in Settings.");
+                style::body_label(
+                    ui,
+                    "Configure the two OpenAI-compatible endpoints ResearchWiki uses.",
+                );
+                style::muted_label(ui, "You can change either later in Settings.");
                 ui.add_space(10.0);
 
-                ui.heading("LLM endpoint");
-                ui.label("Used for evaluation, screening, knowledge-graph extraction, etc.");
+                style::section_heading(ui, "LLM endpoint");
+                style::muted_label(
+                    ui,
+                    "Used for evaluation, screening, knowledge-graph extraction, etc.",
+                );
                 egui::Grid::new("first-run-llm-grid")
                     .num_columns(2)
                     .spacing([8.0, 6.0])
@@ -66,8 +75,11 @@ impl FirstRunForm {
                     });
 
                 ui.add_space(12.0);
-                ui.heading("Embedding endpoint");
-                ui.label("Used to embed article chunks for semantic + hybrid search.");
+                style::section_heading(ui, "Embedding endpoint");
+                style::muted_label(
+                    ui,
+                    "Used to embed article chunks for semantic + hybrid search.",
+                );
                 egui::Grid::new("first-run-embed-grid")
                     .num_columns(2)
                     .spacing([8.0, 6.0])

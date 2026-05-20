@@ -1,6 +1,7 @@
 use super::{MsgChannel, PanelCtx};
-use crate::models::workspace::{
-    Workspace, WorkspaceCreate, WorkspaceResearchContext, WorkspaceUpdate,
+use crate::{
+    models::workspace::{Workspace, WorkspaceCreate, WorkspaceResearchContext, WorkspaceUpdate},
+    ui::style,
 };
 
 enum Msg {
@@ -69,19 +70,31 @@ impl Panel {
             self.load(ctx, active);
         }
 
-        ui.heading("Input Set");
-        ui.label("Create or edit a research workspace. Seed concepts drive the gather queries; the gap note feeds the Gap Bridge.");
-        ui.separator();
+        style::panel_header(
+            ui,
+            "Input Set",
+            Some(
+                "Create or edit a research workspace. Seed concepts drive gather queries; the gap note feeds Gap Bridge.",
+            ),
+        );
 
         egui::ScrollArea::vertical().show(ui, |ui| {
-            egui::Grid::new("workspace_form")
+            style::section_heading(ui, "Workspace");
+            egui::Grid::new("workspace_identity")
                 .num_columns(2)
                 .spacing([12.0, 8.0])
                 .show(ui, |ui| {
                     ui.label("Name");
                     ui.text_edit_singleline(&mut self.form.name);
                     ui.end_row();
+                });
 
+            style::section_break(ui);
+            style::section_heading(ui, "Research context");
+            egui::Grid::new("workspace_research_context")
+                .num_columns(2)
+                .spacing([12.0, 8.0])
+                .show(ui, |ui| {
                     ui.label("Primary question");
                     ui.add(
                         egui::TextEdit::multiline(&mut self.form.primary_question)
@@ -98,18 +111,25 @@ impl Panel {
                     );
                     ui.end_row();
 
-                    ui.label("Seed concepts\n(one per line)");
-                    ui.add(
-                        egui::TextEdit::multiline(&mut self.form.seed_concepts_text)
-                            .desired_rows(6)
-                            .desired_width(f32::INFINITY),
-                    );
-                    ui.end_row();
-
                     ui.label("Gap note");
                     ui.add(
                         egui::TextEdit::multiline(&mut self.form.gap_note)
                             .desired_rows(3)
+                            .desired_width(f32::INFINITY),
+                    );
+                    ui.end_row();
+                });
+
+            style::section_break(ui);
+            style::section_heading(ui, "Gather inputs");
+            egui::Grid::new("workspace_gather_inputs")
+                .num_columns(2)
+                .spacing([12.0, 8.0])
+                .show(ui, |ui| {
+                    ui.label("Seed concepts\n(one per line)");
+                    ui.add(
+                        egui::TextEdit::multiline(&mut self.form.seed_concepts_text)
+                            .desired_rows(6)
                             .desired_width(f32::INFINITY),
                     );
                     ui.end_row();
@@ -127,15 +147,8 @@ impl Panel {
                     ui.end_row();
                 });
 
-            if !self.form.refined_question.is_empty() {
-                ui.add_space(6.0);
-                ui.label(egui::RichText::new("Refined question (from Gap Bridge):").strong());
-                ui.label(&self.form.refined_question);
-            }
-
-            self.show_wiring_preview(ui);
-
-            ui.add_space(10.0);
+            style::section_break(ui);
+            style::section_heading(ui, "Actions");
             ui.horizontal(|ui| {
                 if ui.add_enabled(!self.busy, egui::Button::new("Save")).clicked() {
                     self.save(ctx, active);
@@ -151,19 +164,6 @@ impl Panel {
                 }
             });
 
-            ui.add_space(14.0);
-            ui.separator();
-            ui.label(egui::RichText::new("Create a new workspace").strong());
-            ui.horizontal(|ui| {
-                ui.text_edit_singleline(&mut self.new_name);
-                if ui
-                    .add_enabled(!self.busy && !self.new_name.trim().is_empty(), egui::Button::new("Create"))
-                    .clicked()
-                {
-                    self.create(ctx);
-                }
-            });
-
             if let Some(status) = &self.status {
                 ui.add_space(8.0);
                 ui.label(status);
@@ -171,7 +171,31 @@ impl Panel {
 
             let caps = "Gather caps: each source returns ~50 candidates per query; PMC only looks back 30 days. A long lookback broadens coverage across sources rather than exhaustively.";
             ui.add_space(8.0);
-            ui.label(egui::RichText::new(caps).weak().italics());
+            style::muted_label(ui, caps);
+
+            style::section_break(ui);
+            style::section_heading(ui, "Preview / reference");
+            if !self.form.refined_question.is_empty() {
+                ui.label(egui::RichText::new("Refined question from Gap Bridge").strong());
+                style::body_label(ui, self.form.refined_question.as_str());
+                ui.add_space(8.0);
+            }
+            self.show_wiring_preview(ui);
+
+            style::section_break(ui);
+            style::section_heading(ui, "Create workspace");
+            ui.horizontal(|ui| {
+                ui.text_edit_singleline(&mut self.new_name);
+                if ui
+                    .add_enabled(
+                        !self.busy && !self.new_name.trim().is_empty(),
+                        egui::Button::new("Create"),
+                    )
+                    .clicked()
+                {
+                    self.create(ctx);
+                }
+            });
         });
     }
 

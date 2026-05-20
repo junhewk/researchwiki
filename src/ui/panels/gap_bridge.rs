@@ -1,5 +1,5 @@
 use super::{MsgChannel, PanelCtx};
-use crate::models::workspace::Workspace;
+use crate::{models::workspace::Workspace, ui::style};
 
 enum Msg {
     Loaded(Box<Workspace>),
@@ -54,9 +54,11 @@ impl Panel {
             self.load(ctx, active);
         }
 
-        ui.heading("Gap Bridge");
-        ui.label("From the broad primary question to the refined, next research question.");
-        ui.separator();
+        style::panel_header(
+            ui,
+            "Gap Bridge",
+            Some("From the broad primary question to the refined, next research question."),
+        );
 
         egui::ScrollArea::vertical().show(ui, |ui| {
             ui.columns(2, |cols| {
@@ -114,14 +116,11 @@ impl Panel {
             }
 
             ui.add_space(10.0);
-            ui.label(
-                egui::RichText::new(
-                    "\"Run gap finder\" analyzes this workspace's knowledge graph (isolated and \
-                     under-connected concepts) and asks the LLM to draft the refined question from \
-                     your primary question + gap note. You can edit and re-save it.",
-                )
-                .weak()
-                .italics(),
+            style::muted_label(
+                ui,
+                "\"Run gap finder\" analyzes this workspace's knowledge graph (isolated and \
+                 under-connected concepts) and asks the LLM to draft the refined question from \
+                 your primary question + gap note. You can edit and re-save it.",
             );
         });
     }

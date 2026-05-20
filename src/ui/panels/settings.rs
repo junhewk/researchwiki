@@ -1,6 +1,7 @@
 use crate::{
     config::{EmbeddingConfig, LlmConfig, normalize_api_key},
     models::settings::{NewsletterSettings, SchedulerSettings, SettingsUpdate},
+    ui::style,
 };
 
 use super::{MsgChannel, PanelCtx};
@@ -63,8 +64,7 @@ impl Panel {
             self.spawn_load(ctx);
         }
 
-        ui.heading("Settings");
-        ui.separator();
+        style::panel_header(ui, "Settings", None);
 
         if self.loading && self.scheduler.is_none() {
             ui.label("Loading settings…");
@@ -90,11 +90,7 @@ impl Panel {
 
                 ui.add_space(12.0);
                 if let Some((kind, msg)) = &self.notice {
-                    let color = match kind {
-                        NoticeKind::Success => egui::Color32::from_rgb(0, 130, 0),
-                        NoticeKind::Error => egui::Color32::RED,
-                    };
-                    ui.colored_label(color, msg);
+                    style::status_notice(ui, matches!(kind, NoticeKind::Success), msg);
                 }
             });
 
@@ -178,7 +174,7 @@ impl Panel {
     }
 
     fn section_llm(&mut self, ui: &mut egui::Ui, ctx: &PanelCtx<'_>) {
-        ui.heading("LLM endpoint");
+        style::section_heading(ui, "LLM endpoint");
         ui.label("Changes are saved to settings.json. Restart to apply to the running LLM client.");
         ui.add_space(4.0);
 
@@ -227,7 +223,7 @@ impl Panel {
     }
 
     fn section_embedding_endpoint(&mut self, ui: &mut egui::Ui, ctx: &PanelCtx<'_>) {
-        ui.heading("Embedding endpoint");
+        style::section_heading(ui, "Embedding endpoint");
         ui.label("Used to embed article chunks for semantic + hybrid search. Restart to apply.");
         ui.add_space(4.0);
 
@@ -276,7 +272,7 @@ impl Panel {
     }
 
     fn section_paths(&mut self, ui: &mut egui::Ui, ctx: &PanelCtx<'_>) {
-        ui.heading("Paths");
+        style::section_heading(ui, "Paths");
         let storage = &ctx.state.config.storage;
         egui::Grid::new("settings-paths-grid")
             .num_columns(2)
@@ -290,7 +286,7 @@ impl Panel {
     }
 
     fn section_scheduler(&mut self, ui: &mut egui::Ui, ctx: &PanelCtx<'_>) {
-        ui.heading("Scheduler");
+        style::section_heading(ui, "Scheduler");
         let Some(sched) = self.scheduler.as_mut() else {
             ui.label("(unavailable)");
             return;
@@ -343,7 +339,7 @@ impl Panel {
     }
 
     fn section_embedding(&mut self, ui: &mut egui::Ui, ctx: &PanelCtx<'_>) {
-        ui.heading("Embeddings");
+        style::section_heading(ui, "Embeddings");
         ui.label(format!(
             "Current dimension: {}",
             ctx.state.config.embedding_dimensions
