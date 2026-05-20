@@ -276,9 +276,8 @@ impl ArticleService {
             let today = Utc::now().date_naive();
             let start_date = today - Duration::days(i64::from(days.saturating_sub(1)));
 
-            let mut sql = String::from(
-                "SELECT reg_date, COUNT(uid) FROM haie_rev WHERE reg_date >= ?",
-            );
+            let mut sql =
+                String::from("SELECT reg_date, COUNT(uid) FROM haie_rev WHERE reg_date >= ?");
             let mut params: Vec<Value> = vec![Value::Text(start_date.to_string())];
             append_ws(&mut sql, &mut params, workspace_id, true);
             sql.push_str(" GROUP BY reg_date ORDER BY reg_date");
@@ -531,7 +530,12 @@ impl ArticleService {
 
 /// Appends a workspace scope to a query when an id is provided. `has_where`
 /// chooses `AND` vs `WHERE` depending on whether the SQL already filters.
-fn append_ws(sql: &mut String, params: &mut Vec<Value>, workspace_id: Option<i64>, has_where: bool) {
+fn append_ws(
+    sql: &mut String,
+    params: &mut Vec<Value>,
+    workspace_id: Option<i64>,
+    has_where: bool,
+) {
     if let Some(id) = workspace_id {
         sql.push_str(if has_where {
             " AND workspace_id = ?"

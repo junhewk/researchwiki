@@ -2,7 +2,9 @@ use std::collections::BTreeMap;
 
 use super::{MsgChannel, PanelCtx};
 use crate::error::AppError;
-use crate::models::prompt::{PromptCreate, PromptFileConfig, PromptResponse, PromptVersionResponse};
+use crate::models::prompt::{
+    PromptCreate, PromptFileConfig, PromptResponse, PromptVersionResponse,
+};
 use crate::services::llm::LlmOutputMode;
 
 enum Msg {
@@ -44,8 +46,9 @@ impl Panel {
                 }
                 Msg::Rewritten(content) => {
                     self.editor = content;
-                    self.status =
-                        Some("Rewritten for the active workspace's topic — review and Save.".to_string());
+                    self.status = Some(
+                        "Rewritten for the active workspace's topic — review and Save.".to_string(),
+                    );
                     self.busy = false;
                 }
                 Msg::Saved => {
@@ -163,7 +166,8 @@ impl Panel {
                 if let Some(version) = load_version {
                     if let Some(v) = self.versions.iter().find(|v| v.version == version) {
                         self.editor = v.content.clone();
-                        self.status = Some(format!("Loaded v{version} into editor (not yet saved)."));
+                        self.status =
+                            Some(format!("Loaded v{version} into editor (not yet saved)."));
                     }
                 }
             } else {

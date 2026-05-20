@@ -158,36 +158,32 @@ impl ArticleEvaluator {
             _ => return Ok(None),
         };
 
-        // Preserve candidate metadata that the LLM may not provide.
-        if !fields.contains_key("first_author")
-            || fields
-                .get("first_author")
-                .and_then(Value::as_str)
-                .is_none_or(str::is_empty)
-        {
-            fields.insert(
-                "first_author".to_string(),
-                Value::String(candidate.first_author.clone()),
-            );
-        }
-        if let Some(authors) = &candidate.authors {
-            fields
-                .entry("authors".to_string())
-                .or_insert_with(|| Value::String(authors.clone()));
-        }
-        if let Some(pub_date) = &candidate.pub_date {
-            fields
-                .entry("pub_date".to_string())
-                .or_insert_with(|| Value::String(pub_date.clone()));
-        }
-        if let Some(journal) = &candidate.journal {
-            fields
-                .entry("journal".to_string())
-                .or_insert_with(|| Value::String(journal.clone()));
-        }
+        overlay_candidate_metadata(&mut fields, candidate);
 
         ensure_evaluation_scores(&mut fields);
         Ok(Some(fields))
+    }
+}
+
+fn overlay_candidate_metadata(fields: &mut Map<String, Value>, candidate: &ArticleCandidate) {
+    fields.insert("title".to_string(), Value::String(candidate.title.clone()));
+    fields.insert(
+        "first_author".to_string(),
+        Value::String(candidate.first_author.clone()),
+    );
+    fields.insert("url".to_string(), Value::String(candidate.url.clone()));
+
+    if let Some(authors) = &candidate.authors {
+        fields.insert("authors".to_string(), Value::String(authors.clone()));
+    }
+    if let Some(pub_date) = &candidate.pub_date {
+        fields.insert("pub_date".to_string(), Value::String(pub_date.clone()));
+    }
+    if let Some(journal) = &candidate.journal {
+        fields.insert("journal".to_string(), Value::String(journal.clone()));
+    }
+    if let Some(doi) = &candidate.doi {
+        fields.insert("doi".to_string(), Value::String(doi.clone()));
     }
 }
 
@@ -312,5 +308,41 @@ mod tests {
         assert!(compacted.contains("middle of article omitted"));
         assert!(compacted.ends_with("ZZZ"));
         assert!(compacted.len() < text.len());
+    }
+
+    #[test]
+    fn candidate_metadata_overrides_llm_metadata() {
+        let candidate = ArticleCandidate {
+            source: "semantic_scholar".to_string(),
+            source_id: "abc".to_string(),
+            title: "Source title".to_string(),
+            summary: Some("Source abstract".to_string()),
+            first_author: "Source Author".to_string(),
+            authors: Some("Source Author, Second Author".to_string()),
+            pub_date: Some("2026-05-20".to_string()),
+            journal: Some("Source Journal".to_string()),
+            doi: Some("10.1000/source".to_string()),
+            url: "https://example.com/source".to_string(),
+        };
+        let mut fields = Map::from_iter([
+            ("title".to_string(), json!("LLM hallucinated title")),
+            ("first_author".to_string(), json!("LLM Author")),
+            ("pub_date".to_string(), json!("1900-01-01")),
+            ("journal".to_string(), json!("LLM Journal")),
+            ("doi".to_string(), json!("10.1000/llm")),
+            ("url".to_string(), json!("https://example.com/llm")),
+        ]);
+
+        overlay_candidate_metadata(&mut fields, &candidate);
+
+        assert_eq!(fields.get("title"), Some(&json!("Source title")));
+        assert_eq!(fields.get("first_author"), Some(&json!("Source Author")));
+        assert_eq!(fields.get("pub_date"), Some(&json!("2026-05-20")));
+        assert_eq!(fields.get("journal"), Some(&json!("Source Journal")));
+        assert_eq!(fields.get("doi"), Some(&json!("10.1000/source")));
+        assert_eq!(
+            fields.get("url"),
+            Some(&json!("https://example.com/source"))
+        );
     }
 }

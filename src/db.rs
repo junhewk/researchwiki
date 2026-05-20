@@ -28,7 +28,10 @@ pub async fn initialize(config: &AppConfig) -> Result<()> {
 
 /// Initializes a single workspace's database file (full data schema). Each
 /// workspace lives in its own file, so isolation is physical.
-pub async fn initialize_workspace_db(database_path: PathBuf, embedding_dimensions: u32) -> Result<()> {
+pub async fn initialize_workspace_db(
+    database_path: PathBuf,
+    embedding_dimensions: u32,
+) -> Result<()> {
     if let Some(parent) = database_path.parent() {
         tokio::fs::create_dir_all(parent)
             .await
@@ -429,11 +432,10 @@ fn seed_default_workspace_and_backfill(conn: &Connection) -> Result<()> {
         [],
     )?;
 
-    let default_id: i64 = conn.query_row(
-        "SELECT id FROM workspaces ORDER BY id LIMIT 1",
-        [],
-        |row| row.get(0),
-    )?;
+    let default_id: i64 =
+        conn.query_row("SELECT id FROM workspaces ORDER BY id LIMIT 1", [], |row| {
+            row.get(0)
+        })?;
 
     conn.execute(
         "UPDATE haie_rev SET workspace_id = ?1 WHERE workspace_id IS NULL",

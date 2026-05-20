@@ -23,6 +23,10 @@ const NCBI_ESUMMARY_URL: &str = "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/e
 const NCBI_ELINK_URL: &str = "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/elink.fcgi";
 const EUROPE_PMC_SEARCH_URL: &str = "https://www.ebi.ac.uk/europepmc/webservices/rest/search";
 const RXIV_MAX_CANDIDATES: usize = 200;
+const RXIV_WINDOW_DAYS: i64 = 30;
+const RXIV_MAX_WINDOWS_PER_RUN: usize = 8;
+const RXIV_MAX_PAGES_PER_WINDOW: usize = 8;
+const MAX_WORKSPACE_SOURCE_QUERIES: usize = 8;
 const OPENALEX_SEARCH_URL: &str = "https://api.openalex.org/works";
 const CROSSREF_SEARCH_URL: &str = "https://api.crossref.org/works";
 const UNPAYWALL_SEARCH_URL: &str = "https://api.unpaywall.org/v2/search";
@@ -171,7 +175,7 @@ impl PipelineService {
         days_back: i32,
         profile: &WorkspaceResearchContext,
     ) -> Result<Vec<ArticleCandidate>> {
-        match source {
+        let candidates = match source {
             "arxiv" => self.list_arxiv(days_back, profile).await,
             "pmc" => self.list_pmc(days_back, profile).await,
             "pubmed" => self.list_pubmed(days_back, profile).await,
@@ -184,7 +188,8 @@ impl PipelineService {
             "semantic_scholar" => self.list_semantic_scholar(days_back, profile).await,
             "clinical_trials" => self.list_clinical_trials(days_back, profile).await,
             _ => bail!("unsupported source: {source}"),
-        }
+        }?;
+        Ok(filter_candidates_by_workspace_terms(candidates, profile))
     }
 
     pub async fn check_duplicates_batch(
@@ -266,6 +271,10 @@ impl PipelineService {
         let start = today
             .checked_sub_days(Days::new(days_back.max(1) as u64))
             .unwrap_or(today);
+
+        if !profile.query_terms().is_empty() {
+            return self.list_arxiv_legacy_search(start, today, profile).await;
+        }
 
         match self.list_arxiv_oai(start, today).await {
             Ok(candidates) => return Ok(candidates),
@@ -379,8 +388,12 @@ impl PipelineService {
                     }
                 }
                 Err(error) => {
+                    let rate_limited = error.to_string().contains("HTTP 429");
                     tracing::warn!("arXiv query '{query}' failed: {error}");
                     errors.push(error);
+                    if rate_limited {
+                        break;
+                    }
                 }
             }
         }
@@ -405,7 +418,7 @@ impl PipelineService {
         let to_str = format!("{}0000", end.format("%Y%m%d"));
         let search_query = format!("{query} AND submittedDate:[{from_str} TO {to_str}]");
 
-        const MAX_ATTEMPTS: usize = 4;
+        const MAX_ATTEMPTS: usize = 1;
         const RETRY_DELAYS: [Duration; 3] = [
             Duration::from_secs(60),
             Duration::from_secs(180),
@@ -462,14 +475,23 @@ impl PipelineService {
         limiter.wait_for_turn().await;
         limiter.mark_request_started();
 
-        self.client
-            .get(ARXIV_API_URL)
-            .query(&[
-                ("search_query", search_query),
-                ("sortBy", "lastUpdatedDate"),
-                ("sortOrder", "descending"),
-                ("max_results", "100"),
-            ])
+        let params = vec![
+            ("search_query", search_query.to_string()),
+            ("start", "0".to_string()),
+            ("sortBy", "submittedDate".to_string()),
+            ("sortOrder", "descending".to_string()),
+            (
+                "max_results",
+                DEFAULT_SOURCE_QUERY_LIMIT.clamp(1, 100).to_string(),
+            ),
+        ];
+        let request = if search_query.len() > 1400 {
+            self.client.post(ARXIV_API_URL).form(&params)
+        } else {
+            self.client.get(ARXIV_API_URL).query(&params)
+        };
+
+        request
             .send()
             .await
             .context("failed to request arXiv query")
@@ -828,14 +850,26 @@ impl PipelineService {
         profile: &WorkspaceResearchContext,
     ) -> Result<Vec<ArticleCandidate>> {
         let (start, today) = date_window(days_back);
-        let collection = self.fetch_rxiv_collection(server, start, today).await?;
         let mut merged = BTreeMap::<String, ArticleCandidate>::new();
         let queries = free_text_queries(profile, RXIV_MEDICAL_AI_ETHICS_QUERIES);
-        for query in &queries {
-            merge_candidates(
-                &mut merged,
-                rxiv_candidates_from_collection(server, &collection, query),
-            );
+        let categories = rxiv_categories(server, profile);
+
+        for (window_start, window_end) in rxiv_date_windows(start, today)
+            .into_iter()
+            .take(rxiv_max_windows_per_run(server))
+        {
+            let collection = self
+                .fetch_rxiv_collection(server, window_start, window_end, &categories)
+                .await?;
+            for query in &queries {
+                merge_candidates(
+                    &mut merged,
+                    rxiv_candidates_from_collection(server, &collection, query),
+                );
+            }
+            if merged.len() >= RXIV_MAX_CANDIDATES.min(DEFAULT_SOURCE_QUERY_LIMIT as usize) {
+                break;
+            }
         }
 
         Ok(merged.into_values().collect())
@@ -846,22 +880,104 @@ impl PipelineService {
         server: &'static str,
         start: NaiveDate,
         end: NaiveDate,
+        categories: &[Option<&'static str>],
     ) -> Result<Vec<Value>> {
+        let mut merged = BTreeMap::<String, Value>::new();
+        let mut errors = Vec::new();
+        let categories = if categories.is_empty() {
+            vec![None]
+        } else {
+            categories.to_vec()
+        };
+
+        for category in categories {
+            match self
+                .fetch_rxiv_category_collection(server, start, end, category)
+                .await
+            {
+                Ok(collection) => {
+                    for entry in collection {
+                        let key = entry
+                            .get("doi")
+                            .and_then(Value::as_str)
+                            .map(str::trim)
+                            .filter(|value| !value.is_empty())
+                            .map(ToOwned::to_owned)
+                            .unwrap_or_else(|| {
+                                entry
+                                    .get("title")
+                                    .and_then(Value::as_str)
+                                    .unwrap_or_default()
+                                    .to_string()
+                            });
+                        merged.entry(key).or_insert(entry);
+                    }
+                }
+                Err(error) => {
+                    tracing::warn!(
+                        server,
+                        category = category.unwrap_or("all"),
+                        "rxiv metadata page failed: {error}"
+                    );
+                    errors.push(error);
+                }
+            }
+        }
+
+        finish_json_collection("rxiv metadata", merged, errors)
+    }
+
+    async fn fetch_rxiv_category_collection(
+        &self,
+        server: &'static str,
+        start: NaiveDate,
+        end: NaiveDate,
+        category: Option<&'static str>,
+    ) -> Result<Vec<Value>> {
+        let mut cursor = 0usize;
+        let mut collection = Vec::new();
+
+        for _ in 0..rxiv_max_pages_per_window(server) {
+            let body = self
+                .fetch_rxiv_page(server, start, end, cursor, category)
+                .await?;
+            let mut page = rxiv_collection_from_body(&body);
+            let page_len = page.len();
+            if page_len == 0 {
+                break;
+            }
+
+            collection.append(&mut page);
+            cursor += page_len;
+
+            let total = rxiv_total_from_body(&body);
+            if total.is_some_and(|total| cursor >= total) {
+                break;
+            }
+        }
+
+        Ok(collection)
+    }
+
+    async fn fetch_rxiv_page(
+        &self,
+        server: &'static str,
+        start: NaiveDate,
+        end: NaiveDate,
+        cursor: usize,
+        category: Option<&str>,
+    ) -> Result<Value> {
         let url = format!(
-            "https://api.biorxiv.org/details/{server}/{}/{}/0",
+            "https://api.biorxiv.org/details/{server}/{}/{}/{cursor}/json",
             start.format("%Y-%m-%d"),
             end.format("%Y-%m-%d")
         );
-        let params: Vec<(&str, String)> = Vec::new();
-        let label = rxiv_label(server);
-        let body = self
-            .get_json_with_retries(&url, &params, label, None)
-            .await?;
-        Ok(body
-            .get("collection")
-            .and_then(Value::as_array)
-            .cloned()
-            .unwrap_or_default())
+        let mut params: Vec<(&str, String)> = Vec::new();
+        if let Some(category) = category {
+            params.push(("category", category.to_string()));
+        }
+        self.get_json_with_retries(&url, &params, rxiv_label(server), None)
+            .await
     }
 
     async fn list_openalex(
@@ -963,7 +1079,7 @@ impl PipelineService {
             end.format("%Y-%m-%d")
         );
         let params = vec![
-            ("query.bibliographic", query.to_string()),
+            ("query.title", query.to_string()),
             ("filter", filter),
             ("rows", DEFAULT_SOURCE_QUERY_LIMIT.clamp(1, 100).to_string()),
         ];
@@ -1048,8 +1164,12 @@ impl PipelineService {
             match self.fetch_semantic_scholar_query(query, start, today).await {
                 Ok(candidates) => merge_candidates(&mut merged, candidates),
                 Err(error) => {
+                    let rate_limited = error.to_string().contains("HTTP 429");
                     tracing::warn!("Semantic Scholar query '{query}' failed: {error}");
                     errors.push(error);
+                    if rate_limited {
+                        break;
+                    }
                 }
             }
         }
@@ -1076,11 +1196,12 @@ impl PipelineService {
             ("year", format!("{}-{}", start.year(), end.year())),
         ];
         let body = self
-            .get_json_with_retries(
+            .get_json_with_retry_limit(
                 SEMANTIC_SCHOLAR_SEARCH_URL,
                 &params,
                 "Semantic Scholar",
                 None,
+                1,
             )
             .await?;
         let items = body
@@ -1155,10 +1276,22 @@ impl PipelineService {
         label: &str,
         user_agent: Option<&str>,
     ) -> Result<Value> {
-        const MAX_ATTEMPTS: usize = 4;
-        let mut delay = Duration::from_secs(2);
+        self.get_json_with_retry_limit(url, params, label, user_agent, 4)
+            .await
+    }
 
-        for attempt in 1..=MAX_ATTEMPTS {
+    async fn get_json_with_retry_limit(
+        &self,
+        url: &str,
+        params: &[(&str, String)],
+        label: &str,
+        user_agent: Option<&str>,
+        max_attempts: usize,
+    ) -> Result<Value> {
+        let mut delay = Duration::from_secs(2);
+        let max_attempts = max_attempts.max(1);
+
+        for attempt in 1..=max_attempts {
             let mut request = self.client.get(url).query(params);
             if let Some(user_agent) = user_agent {
                 request = request.header("User-Agent", user_agent);
@@ -1180,7 +1313,7 @@ impl PipelineService {
             }
 
             let retryable = status == StatusCode::TOO_MANY_REQUESTS || status.is_server_error();
-            if retryable && attempt < MAX_ATTEMPTS {
+            if retryable && attempt < max_attempts {
                 tracing::warn!(
                     label,
                     attempt,
@@ -1252,12 +1385,29 @@ impl PipelineService {
 /// Builds a free-text query list from the workspace profile, falling back to the
 /// source's default queries when the workspace defines no concepts.
 fn free_text_queries(profile: &WorkspaceResearchContext, fallback: &[&str]) -> Vec<String> {
-    let concepts = profile.query_terms();
+    let concepts = source_query_terms(profile);
     if concepts.is_empty() {
         fallback.iter().map(|q| (*q).to_string()).collect()
     } else {
-        concepts.to_vec()
+        concepts
     }
+}
+
+fn source_query_terms(profile: &WorkspaceResearchContext) -> Vec<String> {
+    let mut seen = std::collections::BTreeSet::new();
+    profile
+        .query_terms()
+        .iter()
+        .filter_map(|term| {
+            let term = clean_text(term);
+            if term.is_empty() || !seen.insert(term.to_ascii_lowercase()) {
+                None
+            } else {
+                Some(term)
+            }
+        })
+        .take(MAX_WORKSPACE_SOURCE_QUERIES)
+        .collect()
 }
 
 fn quoted_or(concepts: &[String], suffix: &str) -> String {
@@ -1269,50 +1419,341 @@ fn quoted_or(concepts: &[String], suffix: &str) -> String {
 }
 
 fn pmc_term(profile: &WorkspaceResearchContext) -> String {
-    let concepts = profile.query_terms();
+    let concepts = source_query_terms(profile);
     if concepts.is_empty() {
         return PMC_QUERY.to_string();
     }
     format!(
         "({}) AND open access[filter]",
-        quoted_or(concepts, "[All Fields]")
+        quoted_or(&concepts, "[All Fields]")
     )
 }
 
 fn pubmed_term(profile: &WorkspaceResearchContext) -> String {
-    let concepts = profile.query_terms();
+    let concepts = source_query_terms(profile);
     if concepts.is_empty() {
         return PUBMED_QUERY.to_string();
     }
     format!(
         "(({}) AND hasabstract[text])",
-        quoted_or(concepts, "[Title/Abstract]")
+        quoted_or(&concepts, "[Title/Abstract]")
     )
 }
 
 fn europe_pmc_queries(profile: &WorkspaceResearchContext) -> Vec<String> {
-    let concepts = profile.query_terms();
+    let concepts = source_query_terms(profile);
     if concepts.is_empty() {
         return EUROPE_PMC_QUERIES
             .iter()
             .map(|q| (*q).to_string())
             .collect();
     }
-    vec![format!("({}) AND OPEN_ACCESS:Y", quoted_or(concepts, ""))]
+    vec![format!("({}) AND OPEN_ACCESS:Y", quoted_or(&concepts, ""))]
 }
 
 fn arxiv_queries(profile: &WorkspaceResearchContext) -> Vec<String> {
-    let concepts = profile.query_terms();
+    let concepts = source_query_terms(profile);
     if concepts.is_empty() {
         return ARXIV_QUERIES.iter().map(|q| (*q).to_string()).collect();
     }
-    let joined = concepts
+
+    concepts
         .iter()
-        .map(|c| format!("all:\"{c}\""))
-        .collect::<Vec<_>>()
-        .join(" OR ");
-    vec![format!("({joined})")]
+        .filter_map(|query| arxiv_query_from_workspace_query(query))
+        .collect()
 }
+
+fn arxiv_query_from_workspace_query(query: &str) -> Option<String> {
+    let mut clauses = Vec::new();
+    let domains = ordered_focused_query_tokens(query)
+        .into_iter()
+        .filter(|token| WORKSPACE_DOMAIN_TOKENS.contains(&token.as_str()))
+        .map(|token| format!("all:{token}"))
+        .collect::<Vec<_>>();
+    if !domains.is_empty() {
+        clauses.push(format!("({})", domains.join(" OR ")));
+    }
+
+    let phrase_group = arxiv_interest_phrase_clauses(query);
+    if !phrase_group.is_empty() {
+        clauses.push(format!("({})", phrase_group.join(" OR ")));
+    }
+
+    if clauses.len() < 2 {
+        for token in ordered_focused_query_tokens(query) {
+            if WORKSPACE_DOMAIN_TOKENS.contains(&token.as_str()) {
+                continue;
+            }
+            if arxiv_phrase_covers_token(query, &token) {
+                continue;
+            }
+            let clause = format!("all:{token}");
+            if !clauses.contains(&clause) {
+                clauses.push(clause);
+            }
+            if clauses.len() >= 3 {
+                break;
+            }
+        }
+    }
+
+    (!clauses.is_empty()).then(|| clauses.join(" AND "))
+}
+
+fn filter_candidates_by_workspace_terms(
+    candidates: Vec<ArticleCandidate>,
+    profile: &WorkspaceResearchContext,
+) -> Vec<ArticleCandidate> {
+    let query_groups = focused_query_token_groups(profile);
+    if query_groups.is_empty() {
+        return candidates;
+    }
+
+    candidates
+        .into_iter()
+        .filter(|candidate| candidate_matches_workspace_query(candidate, &query_groups))
+        .collect()
+}
+
+struct QueryTokenGroup {
+    tokens: Vec<String>,
+    anchors: Vec<String>,
+    domains: Vec<String>,
+    tech: Vec<String>,
+}
+
+fn focused_query_token_groups(profile: &WorkspaceResearchContext) -> Vec<QueryTokenGroup> {
+    profile
+        .query_terms()
+        .iter()
+        .filter_map(|query| {
+            let tokens = focused_query_tokens(query);
+            if tokens.is_empty() {
+                return None;
+            }
+            let anchors = tokens
+                .iter()
+                .filter(|token| !WORKSPACE_ANCHOR_STOPWORDS.contains(&token.as_str()))
+                .cloned()
+                .collect();
+            let domains = tokens
+                .iter()
+                .filter(|token| WORKSPACE_DOMAIN_TOKENS.contains(&token.as_str()))
+                .cloned()
+                .collect();
+            let tech = tokens
+                .iter()
+                .filter(|token| WORKSPACE_TECH_TOKENS.contains(&token.as_str()))
+                .cloned()
+                .collect();
+            Some(QueryTokenGroup {
+                tokens,
+                anchors,
+                domains,
+                tech,
+            })
+        })
+        .collect()
+}
+
+fn candidate_matches_workspace_query(
+    candidate: &ArticleCandidate,
+    query_groups: &[QueryTokenGroup],
+) -> bool {
+    let text = candidate_search_text(candidate);
+    let title = normalized_search_text(&candidate.title);
+    query_groups.iter().any(|group| {
+        let matched = group
+            .tokens
+            .iter()
+            .filter(|token| text.contains(token.as_str()))
+            .count();
+        let anchor_matched = group.anchors.is_empty()
+            || group
+                .anchors
+                .iter()
+                .any(|token| title.contains(token.as_str()));
+        let domain_matched = group.domains.is_empty()
+            || group
+                .domains
+                .iter()
+                .any(|token| text.contains(token.as_str()));
+        let tech_matched =
+            group.tech.is_empty() || group.tech.iter().any(|token| text.contains(token.as_str()));
+        matched >= group.tokens.len().min(2) && anchor_matched && domain_matched && tech_matched
+    })
+}
+
+fn candidate_search_text(candidate: &ArticleCandidate) -> String {
+    let mut text = format!("{} ", candidate.title);
+    if let Some(summary) = candidate.summary.as_deref() {
+        text.push_str(summary);
+        text.push(' ');
+    }
+    if let Some(journal) = candidate.journal.as_deref() {
+        text.push_str(journal);
+    }
+    normalized_search_text(&text)
+}
+
+fn focused_query_tokens(query: &str) -> Vec<String> {
+    tokenize_search_text(query)
+        .into_iter()
+        .filter(|token| !WORKSPACE_QUERY_STOPWORDS.contains(&token.as_str()))
+        .collect()
+}
+
+fn ordered_focused_query_tokens(query: &str) -> Vec<String> {
+    let normalized = normalized_search_text(query);
+    let mut seen = std::collections::BTreeSet::new();
+    normalized
+        .split_whitespace()
+        .filter(|token| token.len() >= 3)
+        .map(str::to_string)
+        .filter(|token| !WORKSPACE_QUERY_STOPWORDS.contains(&token.as_str()))
+        .filter(|token| seen.insert(token.clone()))
+        .collect()
+}
+
+fn arxiv_interest_phrase_clauses(query: &str) -> Vec<String> {
+    let lower = query.to_ascii_lowercase();
+    let mut clauses = Vec::new();
+    let mut push = |clause: &str| {
+        let clause = clause.to_string();
+        if !clauses.contains(&clause) {
+            clauses.push(clause);
+        }
+    };
+
+    if lower.contains("large language model") || lower.contains("large language models") {
+        push(r#"all:"large language model""#);
+        push("all:llm");
+    }
+    if lower.contains("chatbot") || lower.contains("chat bot") || lower.contains("chat-bot") {
+        push("all:chatbot");
+    }
+    if lower.contains("chatgpt") {
+        push("all:chatgpt");
+    }
+    if lower.contains("conversational agent") || lower.contains("conversational agents") {
+        push(r#"all:"conversational agent""#);
+    }
+    if lower.contains("virtual coach") || lower.contains("virtual coaching") {
+        push(r#"all:"virtual coach""#);
+    }
+    if lower.contains("digital coach") || lower.contains("digital coaching") {
+        push(r#"all:"digital coach""#);
+    }
+    if lower.contains("counseling") {
+        push("all:counseling");
+    }
+    if lower.contains("counselling") {
+        push("all:counselling");
+    }
+
+    clauses
+}
+
+fn arxiv_phrase_covers_token(query: &str, token: &str) -> bool {
+    let lower = query.to_ascii_lowercase();
+    match token {
+        "llm" => lower.contains("large language model") || lower.contains("large language models"),
+        "chatbot" => {
+            lower.contains("chatbot") || lower.contains("chat bot") || lower.contains("chat-bot")
+        }
+        "chatgpt" => lower.contains("chatgpt"),
+        "conversational" | "agent" => {
+            lower.contains("conversational agent") || lower.contains("conversational agents")
+        }
+        "virtual" | "coach" | "coaching" => {
+            lower.contains("virtual coach")
+                || lower.contains("virtual coaching")
+                || lower.contains("digital coach")
+                || lower.contains("digital coaching")
+        }
+        "counseling" => lower.contains("counseling"),
+        "counselling" => lower.contains("counselling"),
+        _ => false,
+    }
+}
+
+fn tokenize_search_text(text: &str) -> Vec<String> {
+    let normalized = normalized_search_text(text);
+    let mut tokens = normalized
+        .split_whitespace()
+        .filter(|token| token.len() >= 3)
+        .map(str::to_string)
+        .collect::<Vec<_>>();
+    tokens.sort();
+    tokens.dedup();
+    tokens
+}
+
+fn normalized_search_text(text: &str) -> String {
+    let mut normalized = text.to_ascii_lowercase();
+    for (from, to) in [
+        ("large language model", "llm"),
+        ("large-language-model", "llm"),
+        ("chat bot", "chatbot"),
+        ("chat-bot", "chatbot"),
+        ("self-management", "self management"),
+    ] {
+        normalized = normalized.replace(from, to);
+    }
+    normalized
+        .chars()
+        .map(|ch| if ch.is_ascii_alphanumeric() { ch } else { ' ' })
+        .collect::<String>()
+}
+
+const WORKSPACE_QUERY_STOPWORDS: &[&str] = &[
+    "adult",
+    "adults",
+    "clinical",
+    "education",
+    "intervention",
+    "large",
+    "language",
+    "life",
+    "management",
+    "model",
+    "outcome",
+    "outcomes",
+    "patient",
+    "patients",
+    "quality",
+    "randomized",
+    "research",
+    "safety",
+    "self",
+    "study",
+    "trial",
+    "type",
+    "usual",
+];
+
+const WORKSPACE_ANCHOR_STOPWORDS: &[&str] = &[
+    "adherence",
+    "agent",
+    "cgm",
+    "diabetes",
+    "glycemic",
+    "glucose",
+    "hba1c",
+    "monitoring",
+];
+
+const WORKSPACE_DOMAIN_TOKENS: &[&str] = &["diabetes", "glycemic", "glycaemic", "glucose", "hba1c"];
+
+const WORKSPACE_TECH_TOKENS: &[&str] = &[
+    "cgm",
+    "chatbot",
+    "chatgpt",
+    "conversational",
+    "digital",
+    "llm",
+    "virtual",
+];
 
 fn date_window(days_back: i32) -> (NaiveDate, NaiveDate) {
     let today = Utc::now().date_naive();
@@ -1320,6 +1761,73 @@ fn date_window(days_back: i32) -> (NaiveDate, NaiveDate) {
         .checked_sub_days(Days::new(days_back.max(1) as u64))
         .unwrap_or(today);
     (start, today)
+}
+
+fn rxiv_date_windows(start: NaiveDate, end: NaiveDate) -> Vec<(NaiveDate, NaiveDate)> {
+    let mut windows = Vec::new();
+    let mut window_end = end;
+
+    loop {
+        let window_start = window_end
+            .checked_sub_days(Days::new(RXIV_WINDOW_DAYS as u64 - 1))
+            .unwrap_or(start)
+            .max(start);
+        windows.push((window_start, window_end));
+        if window_start <= start {
+            break;
+        }
+        window_end = window_start
+            .checked_sub_days(Days::new(1))
+            .unwrap_or(window_start);
+    }
+
+    windows
+}
+
+fn rxiv_categories(
+    server: &'static str,
+    profile: &WorkspaceResearchContext,
+) -> Vec<Option<&'static str>> {
+    let text = profile.query_terms().join(" ").to_ascii_lowercase();
+    if server == "medrxiv"
+        && ["diabetes", "glycemic", "glycaemic", "glucose", "hba1c"]
+            .iter()
+            .any(|needle| text.contains(needle))
+    {
+        return vec![Some("endocrinology"), Some("health_informatics")];
+    }
+
+    vec![None]
+}
+
+fn rxiv_max_windows_per_run(server: &str) -> usize {
+    match server {
+        "biorxiv" => 2,
+        _ => RXIV_MAX_WINDOWS_PER_RUN,
+    }
+}
+
+fn rxiv_max_pages_per_window(server: &str) -> usize {
+    match server {
+        "biorxiv" => 2,
+        _ => RXIV_MAX_PAGES_PER_WINDOW,
+    }
+}
+
+fn rxiv_collection_from_body(body: &Value) -> Vec<Value> {
+    body.get("collection")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default()
+}
+
+fn rxiv_total_from_body(body: &Value) -> Option<usize> {
+    body.get("messages")
+        .and_then(Value::as_array)
+        .and_then(|messages| messages.first())
+        .and_then(|message| message.get("total"))
+        .and_then(|value| value.as_u64().or_else(|| value.as_str()?.parse().ok()))
+        .map(|value| value as usize)
 }
 
 fn filter_candidates_by_known_date(
@@ -1391,6 +1899,21 @@ fn finish_merged_source(
     merged: BTreeMap<String, ArticleCandidate>,
     mut errors: Vec<anyhow::Error>,
 ) -> Result<Vec<ArticleCandidate>> {
+    if merged.is_empty() && !errors.is_empty() {
+        bail!(
+            "all {label} queries failed; first error: {}",
+            errors.remove(0)
+        );
+    }
+
+    Ok(merged.into_values().collect())
+}
+
+fn finish_json_collection(
+    label: &str,
+    merged: BTreeMap<String, Value>,
+    mut errors: Vec<anyhow::Error>,
+) -> Result<Vec<Value>> {
     if merged.is_empty() && !errors.is_empty() {
         bail!(
             "all {label} queries failed; first error: {}",
@@ -1936,16 +2459,26 @@ fn reconstruct_inverted_abstract(index: &serde_json::Map<String, Value>) -> Stri
 }
 
 fn text_matches_query(text: &str, query: &str) -> bool {
-    let haystack = text.to_lowercase();
-    query
-        .split_whitespace()
-        .map(|token| {
-            token
-                .trim_matches(|character: char| !character.is_alphanumeric())
-                .to_lowercase()
-        })
-        .filter(|token| token.len() > 2)
-        .all(|token| haystack.contains(token.as_str()))
+    let haystack = normalized_search_text(text);
+    let tokens = focused_query_tokens(query);
+    if tokens.is_empty() {
+        return true;
+    }
+
+    let matched = tokens
+        .iter()
+        .filter(|token| haystack.contains(token.as_str()))
+        .count();
+    let domain_tokens = tokens
+        .iter()
+        .filter(|token| WORKSPACE_DOMAIN_TOKENS.contains(&token.as_str()))
+        .collect::<Vec<_>>();
+    let domain_matched = domain_tokens.is_empty()
+        || domain_tokens
+            .iter()
+            .any(|token| haystack.contains(token.as_str()));
+
+    matched >= tokens.len().min(2) && domain_matched
 }
 
 fn clean_text(value: &str) -> String {
@@ -2018,6 +2551,13 @@ fn save_article_sync(
     let first_author = get_str("first_author").unwrap_or_else(|| candidate.first_author.clone());
     let pub_date = candidate.pub_date.clone().or_else(|| get_str("pub_date"));
     let journal = candidate.journal.clone().or_else(|| get_str("journal"));
+    let candidate_uid = candidate.uid();
+
+    if find_duplicate_article_uid(conn, candidate, &title, workspace_id, &candidate_uid)?.is_some()
+    {
+        counters.skipped += 1;
+        return Ok(counters);
+    }
 
     let why_it_matters = get_str("why_it_matters").or_else(|| {
         evaluation.is_none().then(|| {
@@ -2053,9 +2593,9 @@ fn save_article_sync(
             ?26, ?27,
             ?28, ?29, ?30, ?31, ?32, ?33, ?34, ?35,
             ?36, ?37, ?38
-         )",
+        )",
         params![
-            candidate.uid(),
+            candidate_uid,
             candidate.url,
             category,
             reg_date,
@@ -2142,6 +2682,74 @@ fn save_article_sync(
     }
 
     Ok(counters)
+}
+
+fn find_duplicate_article_uid(
+    conn: &Connection,
+    candidate: &ArticleCandidate,
+    title: &str,
+    workspace_id: i64,
+    candidate_uid: &str,
+) -> Result<Option<String>> {
+    if let Some(candidate_doi) = candidate
+        .doi
+        .as_deref()
+        .map(normalized_duplicate_doi)
+        .filter(|value| !value.is_empty())
+    {
+        let mut stmt = conn.prepare(
+            "SELECT uid, doi FROM haie_rev
+             WHERE workspace_id = ?1
+               AND uid != ?2
+               AND doi IS NOT NULL
+               AND TRIM(doi) != ''",
+        )?;
+        let rows = stmt.query_map(params![workspace_id, candidate_uid], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })?;
+        for row in rows {
+            let (uid, doi) = row?;
+            if normalized_duplicate_doi(&doi) == candidate_doi {
+                return Ok(Some(uid));
+            }
+        }
+    }
+
+    let candidate_title = normalized_duplicate_title(title);
+    if candidate_title.is_empty() {
+        return Ok(None);
+    }
+
+    let mut stmt = conn.prepare(
+        "SELECT uid, title FROM haie_rev
+         WHERE workspace_id = ?1
+           AND uid != ?2
+           AND title IS NOT NULL
+           AND TRIM(title) != ''",
+    )?;
+    let rows = stmt.query_map(params![workspace_id, candidate_uid], |row| {
+        Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+    })?;
+    for row in rows {
+        let (uid, existing_title) = row?;
+        if normalized_duplicate_title(&existing_title) == candidate_title {
+            return Ok(Some(uid));
+        }
+    }
+
+    Ok(None)
+}
+
+fn normalized_duplicate_doi(doi: &str) -> String {
+    strip_doi_url(doi).to_ascii_lowercase()
+}
+
+fn normalized_duplicate_title(title: &str) -> String {
+    normalized_search_text(title)
+        .split_whitespace()
+        .filter(|token| *token != "preprint")
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2877,6 +3485,142 @@ mod tests {
     }
 
     #[test]
+    fn workspace_source_queries_are_deduped_and_capped() {
+        let mut profile = diabetes_chatbot_context();
+        profile.override_queries = vec![
+            "diabetes chatbot HbA1c".to_string(),
+            "diabetes chatbot HbA1c".to_string(),
+            "diabetes conversational agent".to_string(),
+            "diabetes digital coaching".to_string(),
+            "diabetes virtual coach".to_string(),
+            "diabetes ChatGPT education".to_string(),
+            "large language model diabetes counseling".to_string(),
+            "CGM conversational agent diabetes counseling".to_string(),
+            "diabetes medication adherence chatbot".to_string(),
+            "diabetes misinformation chatbot".to_string(),
+        ];
+
+        let queries = source_query_terms(&profile);
+
+        assert_eq!(queries.len(), MAX_WORKSPACE_SOURCE_QUERIES);
+        assert_eq!(queries[0], "diabetes chatbot HbA1c");
+    }
+
+    #[test]
+    fn arxiv_workspace_queries_are_split_and_focused() {
+        let profile = diabetes_chatbot_context();
+
+        let queries = arxiv_queries(&profile);
+
+        assert_eq!(queries.len(), 3);
+        assert!(queries[0].contains("all:diabetes"));
+        assert!(queries[0].contains("all:chatbot"));
+        assert!(!queries[0].contains(" OR all:\"diabetes conversational"));
+        assert!(queries[2].contains(r#"all:"large language model""#));
+    }
+
+    #[test]
+    fn rxiv_date_windows_are_recent_first() {
+        let windows = rxiv_date_windows(
+            NaiveDate::from_ymd_opt(2026, 3, 1).unwrap(),
+            NaiveDate::from_ymd_opt(2026, 5, 20).unwrap(),
+        );
+
+        assert_eq!(
+            windows[0],
+            (
+                NaiveDate::from_ymd_opt(2026, 4, 21).unwrap(),
+                NaiveDate::from_ymd_opt(2026, 5, 20).unwrap()
+            )
+        );
+        assert_eq!(
+            windows.last().copied(),
+            Some((
+                NaiveDate::from_ymd_opt(2026, 3, 1).unwrap(),
+                NaiveDate::from_ymd_opt(2026, 3, 21).unwrap()
+            ))
+        );
+    }
+
+    #[test]
+    fn rxiv_total_accepts_string_or_numeric_values() {
+        assert_eq!(
+            rxiv_total_from_body(&json!({ "messages": [{ "total": "927" }] })),
+            Some(927)
+        );
+        assert_eq!(
+            rxiv_total_from_body(&json!({ "messages": [{ "total": 12 }] })),
+            Some(12)
+        );
+    }
+
+    #[test]
+    fn workspace_prefilter_keeps_focused_diabetes_chatbot_candidates() {
+        let profile = diabetes_chatbot_context();
+        let mut candidate = test_candidate("focused");
+        candidate.title =
+            "Conversational agents for medication adherence in adults with diabetes".to_string();
+
+        let filtered = filter_candidates_by_workspace_terms(vec![candidate], &profile);
+
+        assert_eq!(filtered.len(), 1);
+    }
+
+    #[test]
+    fn workspace_prefilter_drops_broad_diabetes_trial_candidates() {
+        let profile = diabetes_chatbot_context();
+        let mut candidate = test_candidate("broad");
+        candidate.title =
+            "Virtual weight management and continuous glucose monitoring in type 2 diabetes"
+                .to_string();
+
+        let filtered = filter_candidates_by_workspace_terms(vec![candidate], &profile);
+
+        assert!(filtered.is_empty());
+    }
+
+    #[test]
+    fn workspace_prefilter_drops_cgm_only_diabetes_candidates() {
+        let mut profile = diabetes_chatbot_context();
+        profile.override_queries = vec!["CGM conversational agent diabetes counseling".to_string()];
+        let mut candidate = test_candidate("cgm");
+        candidate.title =
+            "Seasonal fluctuations of CGM metrics in individuals with type 1 diabetes".to_string();
+
+        let filtered = filter_candidates_by_workspace_terms(vec![candidate], &profile);
+
+        assert!(filtered.is_empty());
+    }
+
+    #[test]
+    fn workspace_prefilter_drops_non_diabetes_cgm_abbreviation_matches() {
+        let mut profile = diabetes_chatbot_context();
+        profile.override_queries = vec!["CGM conversational agent diabetes counseling".to_string()];
+        let mut candidate = test_candidate("cgm-abbreviation");
+        candidate.title =
+            "Conversational Gesture Model (CGM): Full conversation gestures".to_string();
+        candidate.summary =
+            Some("A motion generation method for conversational avatars.".to_string());
+
+        let filtered = filter_candidates_by_workspace_terms(vec![candidate], &profile);
+
+        assert!(filtered.is_empty());
+    }
+
+    #[test]
+    fn workspace_prefilter_drops_human_coaching_without_tech_signal() {
+        let mut profile = diabetes_chatbot_context();
+        profile.override_queries = vec!["diabetes digital coaching chatbot".to_string()];
+        let mut candidate = test_candidate("coaching");
+        candidate.title =
+            "Enhancing Group Coaching Competencies in the Diabetes Prevention Program".to_string();
+
+        let filtered = filter_candidates_by_workspace_terms(vec![candidate], &profile);
+
+        assert!(filtered.is_empty());
+    }
+
+    #[test]
     fn known_date_filter_keeps_unknown_dates() {
         let mut old = test_candidate("old");
         old.pub_date = Some("2025-01-01".to_string());
@@ -3007,6 +3751,38 @@ mod tests {
         assert_eq!(scores, (Some(5), Some(83), Some("Tier1".to_string())));
     }
 
+    #[test]
+    fn save_skips_duplicate_articles_by_doi_or_title() {
+        let conn = Connection::open_in_memory().unwrap();
+        create_save_test_table(&conn);
+
+        let mut first = test_candidate("openalex");
+        first.source = "openalex".to_string();
+        first.doi = Some("10.1000/diabetes.chat".to_string());
+        first.title = "Blinded Multi-Rater Comparative Evaluation".to_string();
+        assert_eq!(save_article_sync(&conn, &first, None, 1).unwrap().saved, 1);
+
+        let mut same_doi = test_candidate("semantic");
+        same_doi.source = "semantic_scholar".to_string();
+        same_doi.doi = Some("https://doi.org/10.1000/diabetes.chat".to_string());
+        same_doi.title = "Different source title".to_string();
+        let doi_result = save_article_sync(&conn, &same_doi, None, 1).unwrap();
+        assert_eq!(doi_result.saved, 0);
+        assert_eq!(doi_result.skipped, 1);
+
+        let mut same_title = test_candidate("preprint");
+        same_title.source = "openalex".to_string();
+        same_title.title = "Blinded Multi-Rater Comparative Evaluation (Preprint)".to_string();
+        let title_result = save_article_sync(&conn, &same_title, None, 1).unwrap();
+        assert_eq!(title_result.saved, 0);
+        assert_eq!(title_result.skipped, 1);
+
+        let count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM haie_rev", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(count, 1);
+    }
+
     fn create_save_test_table(conn: &Connection) {
         conn.execute_batch(
             r#"
@@ -3068,6 +3844,31 @@ mod tests {
             journal: None,
             doi: None,
             url: "https://example.com".to_string(),
+        }
+    }
+
+    fn diabetes_chatbot_context() -> WorkspaceResearchContext {
+        WorkspaceResearchContext {
+            name: "Diabetes chatbot self-management evidence map".to_string(),
+            primary_question:
+                "Do chatbot/conversational agents improve diabetes self-management outcomes?"
+                    .to_string(),
+            gap_note: String::new(),
+            refined_question: String::new(),
+            seed_concepts: vec![
+                "Type 2 diabetes".to_string(),
+                "Chatbot intervention".to_string(),
+                "Conversational agent".to_string(),
+            ],
+            override_queries: vec![
+                "type 2 diabetes chatbot HbA1c adherence randomized trial".to_string(),
+                "diabetes conversational agent self-management quality of life".to_string(),
+                "large language model diabetes patient education safety escalation misinformation"
+                    .to_string(),
+            ],
+            topic_descriptor: "chatbot and conversational agent interventions for type 2 diabetes"
+                .to_string(),
+            lookback_days: 30,
         }
     }
 }

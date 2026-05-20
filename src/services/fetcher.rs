@@ -285,12 +285,10 @@ impl ContentFetcher {
             return Ok(None);
         };
 
-        let pdf_response = self
-            .client
-            .get(&pdf_url)
-            .send()
-            .await
-            .map_err(|error| AppError::Internal(format!("unpaywall PDF fetch failed: {error}")))?;
+        let pdf_response =
+            self.client.get(&pdf_url).send().await.map_err(|error| {
+                AppError::Internal(format!("unpaywall PDF fetch failed: {error}"))
+            })?;
         if !pdf_response.status().is_success() {
             return Ok(None);
         }

@@ -34,7 +34,8 @@ impl Panel {
                 }
                 Msg::Generated(refined) => {
                     self.refined_question = refined;
-                    self.status = Some("Gap finder produced a refined question (saved).".to_string());
+                    self.status =
+                        Some("Gap finder produced a refined question (saved).".to_string());
                     self.busy = false;
                 }
                 Msg::Status(text) => {
