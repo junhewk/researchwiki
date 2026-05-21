@@ -5,9 +5,12 @@ use tokio::{
     sync::{mpsc, watch},
 };
 
+use crate::models::settings::UiLanguage;
+
 #[derive(Debug, Clone)]
 pub enum UiEvent {
     Status(String),
+    LanguageChanged(UiLanguage),
     JobProgress {
         run_id: String,
         step: String,

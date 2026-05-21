@@ -3,7 +3,7 @@ use researchwiki::{
     config::AppConfig,
     init_tracing, register_sqlite_vec,
     runtime::DesktopRuntime,
-    services::settings::load_overrides_sync,
+    services::settings::{load_overrides_sync, load_ui_language_sync},
 };
 
 fn main() -> eframe::Result<()> {
@@ -29,6 +29,7 @@ fn main() -> eframe::Result<()> {
     if let Some(dim) = persisted_dim {
         config.embedding_dimensions = dim;
     }
+    let language = load_ui_language_sync(&config.storage.settings_file);
 
     runtime
         .handle
@@ -47,6 +48,6 @@ fn main() -> eframe::Result<()> {
     eframe::run_native(
         "ResearchWiki",
         native_options,
-        Box::new(move |cc| Ok(Box::new(DesktopApp::new(cc, runtime, config)))),
+        Box::new(move |cc| Ok(Box::new(DesktopApp::new(cc, runtime, config, language)))),
     )
 }

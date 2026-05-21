@@ -1,6 +1,7 @@
 use crate::{
     config::{EmbeddingConfig, LlmConfig, normalize_api_key},
-    models::settings::{NewsletterSettings, SchedulerSettings, SettingsUpdate},
+    models::settings::{NewsletterSettings, SchedulerSettings, SettingsUpdate, UiLanguage},
+    runtime::UiEvent,
     ui::style,
 };
 
@@ -11,6 +12,7 @@ enum Msg {
         scheduler: SchedulerSettings,
         newsletter: NewsletterSettings,
         embedding_dimensions: Option<u32>,
+        ui_language: UiLanguage,
     },
     LoadError(String),
     Saved(&'static str),
@@ -24,6 +26,7 @@ pub struct Panel {
     loading: bool,
 
     scheduler: Option<SchedulerSettings>,
+    ui_language: UiLanguage,
     // Held so scheduler-only saves don't clobber the persisted newsletter
     // defaults; a future newsletter UI will edit this directly.
     #[allow(dead_code)]
@@ -64,16 +67,19 @@ impl Panel {
             self.spawn_load(ctx);
         }
 
-        style::panel_header(ui, "Settings", None);
+        style::panel_header(ui, ctx.t("Settings"), None);
 
         if self.loading && self.scheduler.is_none() {
-            ui.label("Loading settings…");
+            ui.label(ctx.t("Loading settings..."));
             return;
         }
 
         egui::ScrollArea::vertical()
             .auto_shrink([false, false])
             .show(ui, |ui| {
+                self.section_interface(ui, ctx);
+                ui.add_space(8.0);
+                ui.separator();
                 self.section_llm(ui, ctx);
                 ui.add_space(8.0);
                 ui.separator();
@@ -109,8 +115,10 @@ impl Panel {
                     scheduler,
                     newsletter,
                     embedding_dimensions,
+                    ui_language,
                 } => {
                     self.scheduler = Some(scheduler);
+                    self.ui_language = ui_language;
                     self.newsletter = Some(newsletter);
                     self.embedding_dim_persisted = embedding_dimensions;
                     if let Some(dim) = embedding_dimensions {
@@ -140,6 +148,7 @@ impl Panel {
 
     fn populate_from_state(&mut self, ctx: &PanelCtx<'_>) {
         let cfg = &ctx.state.config;
+        self.ui_language = ctx.language;
         self.llm_base_url = cfg.llm.base_url.clone();
         self.llm_model = cfg.llm.model.clone();
         self.llm_api_key = cfg.llm.api_key.clone();
@@ -164,6 +173,7 @@ impl Panel {
                         scheduler: resp.scheduler,
                         newsletter: resp.newsletter,
                         embedding_dimensions: dim,
+                        ui_language: resp.ui_language,
                     });
                 }
                 Err(err) => {
@@ -173,28 +183,52 @@ impl Panel {
         });
     }
 
+    fn section_interface(&mut self, ui: &mut egui::Ui, ctx: &PanelCtx<'_>) {
+        style::section_heading(ui, ctx.t("Interface"));
+        ui.horizontal(|ui| {
+            ui.label(ctx.t("Language"));
+            let mut next = self.ui_language;
+            egui::ComboBox::from_id_salt("settings-language-combo")
+                .selected_text(next.label())
+                .show_ui(ui, |ui| {
+                    for language in UiLanguage::ALL {
+                        ui.selectable_value(&mut next, language, language.label());
+                    }
+                });
+            if next != self.ui_language {
+                self.ui_language = next;
+                self.save_language(ctx, next);
+            }
+        });
+    }
+
     fn section_llm(&mut self, ui: &mut egui::Ui, ctx: &PanelCtx<'_>) {
-        style::section_heading(ui, "LLM endpoint");
-        ui.label("Changes are saved to settings.json. Restart to apply to the running LLM client.");
+        style::section_heading(ui, ctx.t("LLM endpoint"));
+        style::muted_label(
+            ui,
+            ctx.t(
+                "Changes are saved to settings.json. Restart to apply to the running LLM client.",
+            ),
+        );
         ui.add_space(4.0);
 
         egui::Grid::new("settings-llm-grid")
             .num_columns(2)
             .spacing([8.0, 6.0])
             .show(ui, |ui| {
-                ui.label("Base URL");
+                ui.label(ctx.t("Base URL"));
                 if ui.text_edit_singleline(&mut self.llm_base_url).changed() {
                     self.llm_dirty = true;
                 }
                 ui.end_row();
 
-                ui.label("Model");
+                ui.label(ctx.t("Model"));
                 if ui.text_edit_singleline(&mut self.llm_model).changed() {
                     self.llm_dirty = true;
                 }
                 ui.end_row();
 
-                ui.label("API key");
+                ui.label(ctx.t("API key"));
                 let resp = ui.add(
                     egui::TextEdit::singleline(&mut self.llm_api_key)
                         .password(true)
@@ -211,39 +245,42 @@ impl Panel {
                 && !self.llm_base_url.trim().is_empty()
                 && !self.llm_model.trim().is_empty();
             if ui
-                .add_enabled(save_enabled, egui::Button::new("Save LLM endpoint"))
+                .add_enabled(save_enabled, egui::Button::new(ctx.t("Save LLM endpoint")))
                 .clicked()
             {
                 self.save_llm(ctx);
             }
             if self.llm_dirty {
-                ui.label(egui::RichText::new("unsaved changes").italics());
+                ui.label(egui::RichText::new(ctx.t("unsaved changes")).italics());
             }
         });
     }
 
     fn section_embedding_endpoint(&mut self, ui: &mut egui::Ui, ctx: &PanelCtx<'_>) {
-        style::section_heading(ui, "Embedding endpoint");
-        ui.label("Used to embed article chunks for semantic + hybrid search. Restart to apply.");
+        style::section_heading(ui, ctx.t("Embedding endpoint"));
+        style::muted_label(
+            ui,
+            ctx.t("Used to embed article chunks for semantic + hybrid search. Restart to apply."),
+        );
         ui.add_space(4.0);
 
         egui::Grid::new("settings-embed-endpoint-grid")
             .num_columns(2)
             .spacing([8.0, 6.0])
             .show(ui, |ui| {
-                ui.label("Base URL");
+                ui.label(ctx.t("Base URL"));
                 if ui.text_edit_singleline(&mut self.embed_base_url).changed() {
                     self.embed_dirty = true;
                 }
                 ui.end_row();
 
-                ui.label("Model");
+                ui.label(ctx.t("Model"));
                 if ui.text_edit_singleline(&mut self.embed_model).changed() {
                     self.embed_dirty = true;
                 }
                 ui.end_row();
 
-                ui.label("API key");
+                ui.label(ctx.t("API key"));
                 let resp = ui.add(
                     egui::TextEdit::singleline(&mut self.embed_api_key)
                         .password(true)
@@ -260,51 +297,54 @@ impl Panel {
                 && !self.embed_base_url.trim().is_empty()
                 && !self.embed_model.trim().is_empty();
             if ui
-                .add_enabled(save_enabled, egui::Button::new("Save embedding endpoint"))
+                .add_enabled(
+                    save_enabled,
+                    egui::Button::new(ctx.t("Save embedding endpoint")),
+                )
                 .clicked()
             {
                 self.save_embedding_endpoint(ctx);
             }
             if self.embed_dirty {
-                ui.label(egui::RichText::new("unsaved changes").italics());
+                ui.label(egui::RichText::new(ctx.t("unsaved changes")).italics());
             }
         });
     }
 
     fn section_paths(&mut self, ui: &mut egui::Ui, ctx: &PanelCtx<'_>) {
-        style::section_heading(ui, "Paths");
+        style::section_heading(ui, ctx.t("Paths"));
         let storage = &ctx.state.config.storage;
         egui::Grid::new("settings-paths-grid")
             .num_columns(2)
             .spacing([8.0, 4.0])
             .show(ui, |ui| {
-                path_row(ui, "Database", &storage.database_path);
-                path_row(ui, "Prompts", &storage.prompts_dir);
-                path_row(ui, "Wiki export", &storage.wiki_export_dir);
-                path_row(ui, "Settings file", &storage.settings_file);
+                path_row(ui, ctx, "Database", &storage.database_path);
+                path_row(ui, ctx, "Prompts", &storage.prompts_dir);
+                path_row(ui, ctx, "Wiki export", &storage.wiki_export_dir);
+                path_row(ui, ctx, "Settings file", &storage.settings_file);
             });
     }
 
     fn section_scheduler(&mut self, ui: &mut egui::Ui, ctx: &PanelCtx<'_>) {
-        style::section_heading(ui, "Scheduler");
+        style::section_heading(ui, ctx.t("Scheduler"));
         let Some(sched) = self.scheduler.as_mut() else {
             ui.label("(unavailable)");
             return;
         };
 
         let mut changed = ui
-            .checkbox(&mut sched.enabled, "Enable scheduled gathers")
+            .checkbox(&mut sched.enabled, ctx.t("Enable scheduled gathers"))
             .changed();
 
         ui.add_space(4.0);
-        ui.label("Daily schedule (KST, 24h)");
+        ui.label(ctx.t("Daily schedule (KST, 24h)"));
         egui::Grid::new("settings-sched-grid")
             .num_columns(3)
             .spacing([8.0, 4.0])
             .show(ui, |ui| {
-                ui.label("Source");
-                ui.label("Hour");
-                ui.label("Minute");
+                ui.label(ctx.t("Source"));
+                ui.label(ctx.t("Hour"));
+                ui.label(ctx.t("Minute"));
                 ui.end_row();
 
                 changed |= hm_row(
@@ -329,19 +369,20 @@ impl Panel {
 
         ui.add_space(4.0);
         ui.horizontal(|ui| {
-            if ui.button("Save scheduler").clicked() {
+            if ui.button(ctx.t("Save scheduler")).clicked() {
                 self.save_scheduler(ctx);
             }
             if changed {
-                ui.label(egui::RichText::new("unsaved changes").italics());
+                ui.label(egui::RichText::new(ctx.t("unsaved changes")).italics());
             }
         });
     }
 
     fn section_embedding(&mut self, ui: &mut egui::Ui, ctx: &PanelCtx<'_>) {
-        style::section_heading(ui, "Embeddings");
+        style::section_heading(ui, ctx.t("Embeddings"));
         ui.label(format!(
-            "Current dimension: {}",
+            "{} {}",
+            ctx.t("Current dimension:"),
             ctx.state.config.embedding_dimensions
         ));
         if let Some(dim) = self.embedding_dim_persisted
@@ -355,14 +396,14 @@ impl Panel {
 
         ui.add_space(4.0);
         ui.horizontal(|ui| {
-            ui.label("New dimension:");
+            ui.label(ctx.t("New dimension:"));
             ui.add(egui::TextEdit::singleline(&mut self.embedding_dim_input).desired_width(80.0));
             let parsed = self.embedding_dim_input.trim().parse::<u32>().ok();
             let new_dim_differs =
                 parsed.is_some_and(|d| d != ctx.state.config.embedding_dimensions);
             let enabled = parsed.is_some_and(|d| (1..=8192).contains(&d)) && new_dim_differs;
             if ui
-                .add_enabled(enabled, egui::Button::new("Change…"))
+                .add_enabled(enabled, egui::Button::new(ctx.t("Change...")))
                 .clicked()
             {
                 self.embedding_confirm_open = true;
@@ -375,30 +416,30 @@ impl Panel {
         let mut confirm = false;
         let new_dim = self.embedding_dim_input.trim().parse::<u32>().unwrap_or(0);
 
-        egui::Window::new("Confirm dimension change")
+        egui::Window::new(ctx.t("Confirm dimension change"))
             .collapsible(false)
             .resizable(false)
             .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
             .show(egui_ctx, |ui| {
-                ui.label(
+                ui.label(ctx.t(
                     "Changing the embedding dimension drops the existing vector \
                      table on the next startup. All article and entity embeddings \
                      will need to be regenerated from scratch.",
-                );
+                ));
                 ui.add_space(6.0);
                 ui.label(format!(
-                    "Current: {} → New: {new_dim}",
+                    "Current: {} -> New: {new_dim}",
                     ctx.state.config.embedding_dimensions,
                 ));
                 ui.add_space(6.0);
                 ui.horizontal(|ui| {
-                    if ui.button("Cancel").clicked() {
+                    if ui.button(ctx.t("Cancel")).clicked() {
                         close = true;
                     }
                     if ui
                         .add(
                             egui::Button::new(
-                                egui::RichText::new("Drop embeddings and save")
+                                egui::RichText::new(ctx.t("Drop embeddings and save"))
                                     .color(egui::Color32::WHITE),
                             )
                             .fill(egui::Color32::from_rgb(160, 30, 30)),
@@ -438,6 +479,25 @@ impl Panel {
         });
     }
 
+    fn save_language(&mut self, ctx: &PanelCtx<'_>, language: UiLanguage) {
+        let Some(channel) = self.channel.as_ref() else {
+            return;
+        };
+        let tx = channel.tx.clone();
+        let ui_tx = ctx.ui_tx.clone();
+        let svc = ctx.state.settings_service.clone();
+        ctx.handle.spawn(async move {
+            let result = svc.set_ui_language(language).await;
+            let _ = match result {
+                Ok(()) => {
+                    let _ = ui_tx.send(UiEvent::LanguageChanged(language));
+                    tx.send(Msg::Saved("Language"))
+                }
+                Err(err) => tx.send(Msg::SaveError(err.to_string())),
+            };
+        });
+    }
+
     fn save_embedding_endpoint(&mut self, ctx: &PanelCtx<'_>) {
         let Some(channel) = self.channel.as_ref() else {
             return;
@@ -470,6 +530,7 @@ impl Panel {
         let update = SettingsUpdate {
             scheduler: Some(sched),
             newsletter: None,
+            ui_language: None,
         };
         ctx.handle.spawn(async move {
             let result = svc.update_settings(update).await;
@@ -497,15 +558,15 @@ impl Panel {
     }
 }
 
-fn path_row(ui: &mut egui::Ui, label: &str, path: &std::path::Path) {
-    ui.label(label);
+fn path_row(ui: &mut egui::Ui, ctx: &PanelCtx<'_>, label: &'static str, path: &std::path::Path) {
+    ui.label(ctx.t(label));
     let display = path.display().to_string();
     ui.horizontal(|ui| {
         ui.add(egui::Label::new(egui::RichText::new(&display).monospace()).truncate());
-        if ui.small_button("Copy").clicked() {
+        if ui.small_button(ctx.t("Copy")).clicked() {
             ui.ctx().copy_text(display.clone());
         }
-        if path.exists() && ui.small_button("Open folder").clicked() {
+        if path.exists() && ui.small_button(ctx.t("Open folder")).clicked() {
             let target = if path.is_dir() {
                 path.to_path_buf()
             } else {

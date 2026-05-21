@@ -56,26 +56,26 @@ impl Panel {
 
         style::panel_header(
             ui,
-            "Gap Bridge",
-            Some("From the broad primary question to the refined, next research question."),
+            ctx.t("Gap Bridge"),
+            Some(ctx.t("From the broad primary question to the refined, next research question.")),
         );
 
         egui::ScrollArea::vertical().show(ui, |ui| {
             ui.columns(2, |cols| {
                 cols[0].group(|ui| {
-                    ui.label(egui::RichText::new("Broad question").strong());
+                    ui.label(egui::RichText::new(ctx.t("Broad question")).strong());
                     ui.add_space(4.0);
                     ui.label(if self.primary_question.is_empty() {
-                        "(set the primary question in the Input Set tab)"
+                        ctx.t("(set the primary question in the Input Set tab)")
                     } else {
                         &self.primary_question
                     });
                 });
                 cols[1].group(|ui| {
-                    ui.label(egui::RichText::new("Identified gap").strong());
+                    ui.label(egui::RichText::new(ctx.t("Identified gap")).strong());
                     ui.add_space(4.0);
                     ui.label(if self.gap_note.is_empty() {
-                        "(add a gap note in the Input Set tab)"
+                        ctx.t("(add a gap note in the Input Set tab)")
                     } else {
                         &self.gap_note
                     });
@@ -83,24 +83,29 @@ impl Panel {
             });
 
             ui.add_space(12.0);
-            ui.label(egui::RichText::new("Refined / next research question").strong());
+            ui.label(egui::RichText::new(ctx.t("Refined / next research question")).strong());
             ui.add(
                 egui::TextEdit::multiline(&mut self.refined_question)
                     .desired_rows(4)
                     .desired_width(f32::INFINITY)
-                    .hint_text("the focused, answerable trial question that bridges the gap"),
+                    .hint_text(
+                        ctx.t("the focused, answerable trial question that bridges the gap"),
+                    ),
             );
 
             ui.add_space(8.0);
             ui.horizontal(|ui| {
                 if ui
-                    .add_enabled(!self.busy, egui::Button::new("Save refined question"))
+                    .add_enabled(
+                        !self.busy,
+                        egui::Button::new(ctx.t("Save refined question")),
+                    )
                     .clicked()
                 {
                     self.save(ctx, active);
                 }
                 if ui
-                    .add_enabled(!self.busy, egui::Button::new("Run gap finder (LLM)"))
+                    .add_enabled(!self.busy, egui::Button::new(ctx.t("Run gap finder (LLM)")))
                     .clicked()
                 {
                     self.run_gap_finder(ctx, active);
@@ -118,9 +123,11 @@ impl Panel {
             ui.add_space(10.0);
             style::muted_label(
                 ui,
-                "\"Run gap finder\" analyzes this workspace's knowledge graph (isolated and \
-                 under-connected concepts) and asks the LLM to draft the refined question from \
-                 your primary question + gap note. You can edit and re-save it.",
+                ctx.t(
+                    "\"Run gap finder\" analyzes this workspace's knowledge graph (isolated and \
+                     under-connected concepts) and asks the LLM to draft the refined question from \
+                     your primary question + gap note. You can edit and re-save it.",
+                ),
             );
         });
     }

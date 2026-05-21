@@ -87,7 +87,7 @@ impl Panel {
             self.load_graph(ctx);
         }
 
-        style::panel_header(ui, "Knowledge Graph", None);
+        style::panel_header(ui, ctx.t("Knowledge Graph"), None);
 
         self.show_controls(ui, ctx);
         ui.add_space(8.0);
@@ -143,16 +143,16 @@ impl Panel {
     }
 
     fn show_controls(&mut self, ui: &mut egui::Ui, ctx: &PanelCtx<'_>) {
-        style::section_heading(ui, "Entity search");
+        style::section_heading(ui, ctx.t("Entity search"));
         ui.horizontal_wrapped(|ui| {
-            ui.label("Search");
+            ui.label(ctx.t("Search"));
             let resp = ui.add(
                 egui::TextEdit::singleline(&mut self.search)
                     .hint_text("entity name")
                     .desired_width(220.0),
             );
             let enter = resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
-            if enter || ui.button("Search").clicked() {
+            if enter || ui.button(ctx.t("Search")).clicked() {
                 self.run_search(ctx);
             }
             if self.searching {
@@ -161,23 +161,23 @@ impl Panel {
         });
 
         ui.add_space(8.0);
-        style::section_heading(ui, "Graph view");
+        style::section_heading(ui, ctx.t("Graph view"));
         ui.horizontal_wrapped(|ui| {
-            ui.label("Graph nodes ≤");
+            ui.label(ctx.t("Graph nodes <="));
             ui.add(
                 egui::DragValue::new(&mut self.limit)
                     .range(10..=1000)
                     .speed(2.0),
             );
-            ui.label("Min degree");
+            ui.label(ctx.t("Min degree"));
             ui.add(egui::DragValue::new(&mut self.min_degree).range(0..=20));
-            ui.label("Type");
+            ui.label(ctx.t("Type"));
             ui.add(
                 egui::TextEdit::singleline(&mut self.entity_type)
                     .hint_text("(any)")
                     .desired_width(120.0),
             );
-            if ui.button("Load graph").clicked() {
+            if ui.button(ctx.t("Load graph")).clicked() {
                 self.load_graph(ctx);
             }
             if self.graph_loading {
@@ -187,9 +187,9 @@ impl Panel {
             ui.add(
                 egui::Slider::new(&mut self.view_zoom, MIN_ZOOM..=MAX_ZOOM)
                     .logarithmic(true)
-                    .text("Zoom"),
+                    .text(ctx.t("Zoom")),
             );
-            if ui.button("Reset view").clicked() {
+            if ui.button(ctx.t("Reset view")).clicked() {
                 self.reset_view();
             }
             if let Some(stats) = &self.stats {
@@ -204,8 +204,10 @@ impl Panel {
             ui.centered_and_justified(|ui| {
                 style::body_label(
                     ui,
-                    "No graph data. Adjust the filters and click \"Load graph\", or populate \
-                     the knowledge graph from the Gather tab (Run gather + KG smoke test).",
+                    ctx.t(
+                        "No graph data. Adjust the filters and click \"Load graph\", or populate \
+                         the knowledge graph from the Gather tab (Run gather + KG smoke test).",
+                    ),
                 );
             });
             return;
@@ -369,7 +371,11 @@ impl Panel {
             .auto_shrink([false, false])
             .show(ui, |ui| {
                 if !self.results.is_empty() {
-                    ui.strong(format!("Search results ({})", self.results.len()));
+                    ui.strong(format!(
+                        "{} ({})",
+                        ctx.t("Search results"),
+                        self.results.len()
+                    ));
                     let mut clicked: Option<String> = None;
                     for entity in &self.results {
                         let label = format!("{} ({})", entity.name, entity.entity_type);
@@ -398,10 +404,14 @@ impl Panel {
                     }
                     if !detail.neighbors.is_empty() {
                         ui.separator();
-                        ui.strong(format!("Neighbors ({})", detail.neighbors.len()));
+                        ui.strong(format!(
+                            "{} ({})",
+                            ctx.t("Neighbors"),
+                            detail.neighbors.len()
+                        ));
                         for neighbor in &detail.neighbors {
                             let label = format!(
-                                "{} → {} ({}, w{:.1})",
+                                "{} -> {} ({}, w{:.1})",
                                 neighbor.relationship,
                                 neighbor.entity,
                                 neighbor.entity_type,
@@ -419,7 +429,7 @@ impl Panel {
                 } else {
                     style::body_label(
                         ui,
-                        "Click a graph node or a search result to see entity details.",
+                        ctx.t("Click a graph node or a search result to see entity details."),
                     );
                 }
                 if let Some(name) = navigate {

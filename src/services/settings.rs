@@ -10,7 +10,7 @@ use crate::{
     config::{EmbeddingConfig, LlmConfig, normalize_api_key},
     error::AppError,
     models::settings::{
-        AiProvider, ApiKeyStatus, SettingsResponse, SettingsUpdate, StoredSettings,
+        AiProvider, ApiKeyStatus, SettingsResponse, SettingsUpdate, StoredSettings, UiLanguage,
     },
 };
 
@@ -51,6 +51,7 @@ impl SettingsService {
             api_keys,
             scheduler: stored.scheduler,
             newsletter: stored.newsletter,
+            ui_language: stored.ui_language,
         })
     }
 
@@ -64,7 +65,22 @@ impl SettingsService {
         if let Some(newsletter) = update.newsletter {
             stored.newsletter = newsletter;
         }
+        if let Some(language) = update.ui_language {
+            stored.ui_language = language;
+        }
 
+        self.save(&stored).await
+    }
+
+    pub async fn get_ui_language(&self) -> Result<UiLanguage, AppError> {
+        let stored = self.load().await?;
+        Ok(stored.ui_language)
+    }
+
+    pub async fn set_ui_language(&self, language: UiLanguage) -> Result<(), AppError> {
+        let _guard = self.lock.write().await;
+        let mut stored = self.load().await?;
+        stored.ui_language = language;
         self.save(&stored).await
     }
 
@@ -158,6 +174,17 @@ pub fn load_overrides_sync(
     };
     sanitize_stored_settings(&mut stored);
     (stored.llm, stored.embedding, stored.embedding_dimensions)
+}
+
+pub fn load_ui_language_sync(settings_file: &Path) -> UiLanguage {
+    let Ok(raw) = std::fs::read_to_string(settings_file) else {
+        return UiLanguage::default();
+    };
+    let Ok(mut stored) = serde_json::from_str::<StoredSettings>(strip_utf8_bom(&raw)) else {
+        return UiLanguage::default();
+    };
+    sanitize_stored_settings(&mut stored);
+    stored.ui_language
 }
 
 fn strip_utf8_bom(raw: &str) -> &str {

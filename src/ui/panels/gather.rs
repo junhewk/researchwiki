@@ -128,12 +128,12 @@ impl Panel {
             self.refresh_operations(ctx);
         }
 
-        style::panel_header(ui, "Gather", None);
+        style::panel_header(ui, ctx.t("Gather"), None);
 
         egui::ScrollArea::vertical()
             .auto_shrink([false, false])
             .show(ui, |ui| {
-                style::section_heading(ui, "Run gather");
+                style::section_heading(ui, ctx.t("Run gather"));
                 self.show_controls(ui, ctx);
                 self.show_notice(ui);
                 style::section_break(ui);
@@ -143,7 +143,7 @@ impl Panel {
                 style::section_break(ui);
                 self.show_kg_ops(ui, ctx);
                 style::section_break(ui);
-                egui::CollapsingHeader::new("Advanced diagnostics")
+                egui::CollapsingHeader::new(ctx.t("Advanced diagnostics"))
                     .default_open(false)
                     .show(ui, |ui| {
                         self.show_pipeline_test(ui, ctx);
@@ -278,9 +278,9 @@ impl Panel {
     }
 
     fn show_pipeline_test(&mut self, ui: &mut egui::Ui, ctx: &PanelCtx<'_>) {
-        style::section_heading(ui, "Pipeline smoke test");
+        style::section_heading(ui, ctx.t("Pipeline smoke test"));
         ui.horizontal_wrapped(|ui| {
-            ui.label("Source");
+            ui.label(ctx.t("Source"));
             source_combo(
                 ui,
                 "gather-pipeline-source-combo",
@@ -288,7 +288,7 @@ impl Panel {
                 GATHER_SOURCE_IDS,
             );
 
-            ui.label("Days back");
+            ui.label(ctx.t("Days back"));
             ui.add(
                 egui::DragValue::new(&mut self.days_back)
                     .range(1..=30)
@@ -300,7 +300,7 @@ impl Panel {
             if ui
                 .add_enabled(
                     !self.action_in_flight && !busy,
-                    egui::Button::new("Run gather + KG smoke test"),
+                    egui::Button::new(ctx.t("Run gather + KG smoke test")),
                 )
                 .clicked()
             {
@@ -314,16 +314,16 @@ impl Panel {
     }
 
     fn show_kg_ops(&mut self, ui: &mut egui::Ui, ctx: &PanelCtx<'_>) {
-        style::section_heading(ui, "Knowledge graph / wiki backfill");
+        style::section_heading(ui, ctx.t("Knowledge graph / wiki backfill"));
 
         ui.horizontal_wrapped(|ui| {
-            ui.label("KG batch");
+            ui.label(ctx.t("KG batch"));
             ui.add(
                 egui::DragValue::new(&mut self.kg_batch_size)
                     .range(1..=100)
                     .speed(0.5),
             );
-            ui.label("Wiki batch");
+            ui.label(ctx.t("Wiki batch"));
             ui.add(
                 egui::DragValue::new(&mut self.wiki_batch_size)
                     .range(1..=100)
@@ -331,7 +331,7 @@ impl Panel {
             );
 
             if ui
-                .add_enabled(!self.ops_loading, egui::Button::new("Refresh KG"))
+                .add_enabled(!self.ops_loading, egui::Button::new(ctx.t("Refresh KG")))
                 .clicked()
             {
                 self.refresh_operations(ctx);
@@ -344,7 +344,7 @@ impl Panel {
             if ui
                 .add_enabled(
                     !self.action_in_flight && !kg_busy,
-                    egui::Button::new("Backfill KG batch"),
+                    egui::Button::new(ctx.t("Backfill KG batch")),
                 )
                 .clicked()
             {
@@ -358,7 +358,7 @@ impl Panel {
             if ui
                 .add_enabled(
                     !self.action_in_flight && !synthesis_busy,
-                    egui::Button::new("Compile wiki syntheses"),
+                    egui::Button::new(ctx.t("Compile wiki syntheses")),
                 )
                 .clicked()
             {
@@ -372,7 +372,7 @@ impl Panel {
             if ui
                 .add_enabled(
                     !self.action_in_flight && !full_busy,
-                    egui::Button::new("Run full KG + wiki backfill"),
+                    egui::Button::new(ctx.t("Run full KG + wiki backfill")),
                 )
                 .clicked()
             {
@@ -382,7 +382,7 @@ impl Panel {
             if ui
                 .add_enabled(
                     !self.action_in_flight && full_busy,
-                    egui::Button::new("Stop full backfill"),
+                    egui::Button::new(ctx.t("Stop full backfill")),
                 )
                 .clicked()
             {
@@ -399,10 +399,10 @@ impl Panel {
     }
 
     fn show_scheduler_check(&mut self, ui: &mut egui::Ui, ctx: &PanelCtx<'_>) {
-        style::section_heading(ui, "Scheduler check");
+        style::section_heading(ui, ctx.t("Scheduler check"));
 
         ui.horizontal_wrapped(|ui| {
-            ui.label("Scheduled source");
+            ui.label(ctx.t("Scheduled source"));
             source_combo(
                 ui,
                 "gather-scheduler-source-combo",
@@ -413,7 +413,7 @@ impl Panel {
             if ui
                 .add_enabled(
                     !self.scheduler_loading,
-                    egui::Button::new("Refresh scheduler"),
+                    egui::Button::new(ctx.t("Refresh scheduler")),
                 )
                 .clicked()
             {
@@ -424,7 +424,7 @@ impl Panel {
             if ui
                 .add_enabled(
                     !self.action_in_flight && !scheduler_test_running,
-                    egui::Button::new("Run scheduled source now"),
+                    egui::Button::new(ctx.t("Run scheduled source now")),
                 )
                 .clicked()
             {
@@ -435,7 +435,7 @@ impl Panel {
             if ui
                 .add_enabled(
                     !self.action_in_flight && !scheduler_test_running,
-                    egui::Button::new("Arm next-minute scheduler test"),
+                    egui::Button::new(ctx.t("Arm next-minute scheduler test")),
                 )
                 .clicked()
             {
@@ -445,7 +445,10 @@ impl Panel {
             if let Some(test) = &self.scheduler_test {
                 let can_restore = !self.action_in_flight && !test.restore_requested;
                 if ui
-                    .add_enabled(can_restore, egui::Button::new("Restore scheduler settings"))
+                    .add_enabled(
+                        can_restore,
+                        egui::Button::new(ctx.t("Restore scheduler settings")),
+                    )
                     .clicked()
                 {
                     let backup = test.backup.clone();
@@ -465,7 +468,7 @@ impl Panel {
 
     fn show_controls(&mut self, ui: &mut egui::Ui, ctx: &PanelCtx<'_>) {
         ui.horizontal_wrapped(|ui| {
-            ui.label("Days back");
+            ui.label(ctx.t("Days back"));
             ui.add(
                 egui::DragValue::new(&mut self.days_back)
                     .range(1..=30)
@@ -473,7 +476,7 @@ impl Panel {
             );
 
             if ui
-                .add_enabled(!self.action_in_flight, egui::Button::new("Refresh"))
+                .add_enabled(!self.action_in_flight, egui::Button::new(ctx.t("Refresh")))
                 .clicked()
             {
                 self.refresh(ctx);
@@ -491,7 +494,7 @@ impl Panel {
             if ui
                 .add_enabled(
                     !self.action_in_flight && !all_busy,
-                    egui::Button::new("Run all sources"),
+                    egui::Button::new(ctx.t("Run all sources")),
                 )
                 .clicked()
             {
@@ -670,7 +673,7 @@ impl Panel {
     }
 
     fn show_active_runs(&mut self, ui: &mut egui::Ui, ctx: &PanelCtx<'_>) {
-        style::section_heading(ui, "Active runs");
+        style::section_heading(ui, ctx.t("Active runs"));
         let active = self
             .jobs
             .iter()
@@ -680,7 +683,7 @@ impl Panel {
             .collect::<Vec<_>>();
 
         if active.is_empty() {
-            ui.label("No active gather jobs.");
+            ui.label(ctx.t("No active gather jobs."));
             return;
         }
 
@@ -729,11 +732,11 @@ impl Panel {
 
                     ui.add_space(4.0);
                     ui.horizontal(|ui| {
-                        if ui.button("Details").clicked() {
+                        if ui.button(ctx.t("Details")).clicked() {
                             detail_request = Some(job.run_id.clone());
                         }
                         if ui
-                            .add_enabled(!self.action_in_flight, egui::Button::new("Cancel"))
+                            .add_enabled(!self.action_in_flight, egui::Button::new(ctx.t("Cancel")))
                             .clicked()
                         {
                             cancel_request = Some(job.run_id.clone());
@@ -752,7 +755,7 @@ impl Panel {
     }
 
     fn show_history(&mut self, ui: &mut egui::Ui, ctx: &PanelCtx<'_>) {
-        style::section_heading(ui, "Run history");
+        style::section_heading(ui, ctx.t("Run history"));
         let text_height = egui::TextStyle::Body.resolve(ui.style()).size + 8.0;
         let rows = self.jobs.len();
         let max_scroll_height = ui.available_height().max(180.0);
@@ -773,22 +776,22 @@ impl Panel {
             .max_scroll_height(max_scroll_height)
             .header(text_height, |mut header| {
                 header.col(|ui| {
-                    ui.strong("Requested");
+                    ui.strong(ctx.t("Requested"));
                 });
                 header.col(|ui| {
-                    ui.strong("Source");
+                    ui.strong(ctx.t("Source"));
                 });
                 header.col(|ui| {
-                    ui.strong("Status");
+                    ui.strong(ctx.t("Status"));
                 });
                 header.col(|ui| {
-                    ui.strong("Step");
+                    ui.strong(ctx.t("Step"));
                 });
                 header.col(|ui| {
-                    ui.strong("Found");
+                    ui.strong(ctx.t("Found"));
                 });
                 header.col(|ui| {
-                    ui.strong("Saved");
+                    ui.strong(ctx.t("Saved"));
                 });
                 header.col(|ui| {
                     ui.strong("");
@@ -821,7 +824,7 @@ impl Panel {
                         ui.label(job.candidates_saved.to_string());
                     });
                     row.col(|ui| {
-                        if ui.small_button("Open").clicked() {
+                        if ui.small_button(ctx.t("Open")).clicked() {
                             detail_request = Some(job.run_id.clone());
                         }
                     });
@@ -1162,6 +1165,7 @@ impl Panel {
                     .update_settings(SettingsUpdate {
                         scheduler: Some(next_settings.clone()),
                         newsletter: None,
+                        ui_language: None,
                     })
                     .await?;
                 let status = jobs.scheduler_status(&next_settings);
@@ -1211,6 +1215,7 @@ impl Panel {
                     .update_settings(SettingsUpdate {
                         scheduler: Some(scheduler.clone()),
                         newsletter: None,
+                        ui_language: None,
                     })
                     .await?;
                 let status = jobs.scheduler_status(&scheduler);

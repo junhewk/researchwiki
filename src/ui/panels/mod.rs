@@ -12,7 +12,7 @@ pub mod workspace;
 use serde::{Deserialize, Serialize};
 use tokio::{runtime::Handle, sync::mpsc};
 
-use crate::{runtime::UiEvent, state::AppState};
+use crate::{models::settings::UiLanguage, runtime::UiEvent, state::AppState, ui::i18n};
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum Tab {
@@ -57,6 +57,10 @@ impl Tab {
             Tab::Traces => "Traces",
         }
     }
+
+    pub fn label_for(self, language: UiLanguage) -> &'static str {
+        i18n::t(language, self.label())
+    }
 }
 
 /// Per-frame context handed to each panel. `ui_tx` is for app-wide status
@@ -68,6 +72,13 @@ pub struct PanelCtx<'a> {
     /// The workspace currently selected in the top-bar switcher. Panels scope
     /// their queries to this id.
     pub active_workspace_id: i64,
+    pub language: UiLanguage,
+}
+
+impl PanelCtx<'_> {
+    pub fn t(&self, text: &'static str) -> &'static str {
+        i18n::t(self.language, text)
+    }
 }
 
 /// Paired sender/receiver each panel uses to receive results from its own

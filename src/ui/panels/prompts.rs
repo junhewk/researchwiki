@@ -77,8 +77,8 @@ impl Panel {
 
         style::panel_header(
             ui,
-            "Prompts",
-            Some("Edit prompt templates (YAML). Saving creates a new version."),
+            ctx.t("Prompts"),
+            Some(ctx.t("Edit prompt templates (YAML). Saving creates a new version.")),
         );
 
         let names: Vec<(String, i64)> = self
@@ -90,7 +90,7 @@ impl Panel {
 
         ui.columns(2, |cols| {
             // Left: prompt list.
-            cols[0].label(egui::RichText::new("Prompts").strong());
+            cols[0].label(egui::RichText::new(ctx.t("Prompts")).strong());
             egui::ScrollArea::vertical()
                 .id_salt("prompt_list")
                 .max_height(420.0)
@@ -140,7 +140,7 @@ impl Panel {
                 });
 
                 editor_ui.add_space(8.0);
-                editor_ui.label(egui::RichText::new("Version history").strong());
+                editor_ui.label(egui::RichText::new(ctx.t("Version history")).strong());
                 let versions: Vec<(i64, String, String)> = self
                     .versions
                     .iter()
@@ -174,7 +174,7 @@ impl Panel {
                     }
                 }
             } else {
-                editor_ui.label("Select a prompt to edit.");
+                editor_ui.label(ctx.t("Select a prompt to edit."));
             }
         });
 

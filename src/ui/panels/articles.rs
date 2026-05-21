@@ -70,7 +70,7 @@ impl Panel {
             self.fetch(ctx);
         }
 
-        style::panel_header(ui, "Articles", None);
+        style::panel_header(ui, ctx.t("Articles"), None);
 
         self.show_filters(ui, ctx);
         ui.add_space(4.0);
@@ -120,33 +120,33 @@ impl Panel {
     }
 
     fn show_filters(&mut self, ui: &mut egui::Ui, ctx: &PanelCtx<'_>) {
-        egui::CollapsingHeader::new("Filters")
+        egui::CollapsingHeader::new(ctx.t("Filters"))
             .default_open(true)
             .show(ui, |ui| {
                 egui::Grid::new("articles-filters-grid")
                     .num_columns(4)
                     .spacing([8.0, 4.0])
                     .show(ui, |ui| {
-                        ui.label("Search");
+                        ui.label(ctx.t("Search"));
                         ui.add(
                             egui::TextEdit::singleline(&mut self.filters.search)
                                 .hint_text("title or argument")
                                 .desired_width(220.0),
                         );
-                        ui.label("Category");
+                        ui.label(ctx.t("Category"));
                         ui.add(
                             egui::TextEdit::singleline(&mut self.filters.category)
                                 .desired_width(140.0),
                         );
                         ui.end_row();
 
-                        ui.label("Date from");
+                        ui.label(ctx.t("Date from"));
                         ui.add(
                             egui::TextEdit::singleline(&mut self.filters.date_from)
                                 .hint_text("YYYY-MM-DD")
                                 .desired_width(120.0),
                         );
-                        ui.label("Date to");
+                        ui.label(ctx.t("Date to"));
                         ui.add(
                             egui::TextEdit::singleline(&mut self.filters.date_to)
                                 .hint_text("YYYY-MM-DD")
@@ -154,19 +154,19 @@ impl Panel {
                         );
                         ui.end_row();
 
-                        ui.label("Min score");
+                        ui.label(ctx.t("Min score"));
                         ui.add(
                             egui::TextEdit::singleline(&mut self.filters.min_score)
                                 .desired_width(60.0),
                         );
-                        ui.label("Max score");
+                        ui.label(ctx.t("Max score"));
                         ui.add(
                             egui::TextEdit::singleline(&mut self.filters.max_score)
                                 .desired_width(60.0),
                         );
                         ui.end_row();
 
-                        ui.label("Tier");
+                        ui.label(ctx.t("Tier"));
                         egui::ComboBox::new("articles-tier-combo", "")
                             .selected_text(if self.filters.tier.is_empty() {
                                 "(any)"
@@ -195,11 +195,11 @@ impl Panel {
                     });
 
                 ui.horizontal(|ui| {
-                    if ui.button("Apply").clicked() {
+                    if ui.button(ctx.t("Apply")).clicked() {
                         self.page = 1;
                         self.fetch(ctx);
                     }
-                    if ui.button("Reset").clicked() {
+                    if ui.button(ctx.t("Reset")).clicked() {
                         self.filters = Filters::default();
                         self.page = 1;
                         self.fetch(ctx);
@@ -353,7 +353,7 @@ impl Panel {
             }
 
             ui.add_space(16.0);
-            ui.label("Page size");
+            ui.label(ctx.t("Page size"));
             let mut ps = self.page_size;
             egui::ComboBox::new("articles-ps-combo", "")
                 .selected_text(ps.to_string())

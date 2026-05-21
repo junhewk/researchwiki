@@ -72,30 +72,30 @@ impl Panel {
 
         style::panel_header(
             ui,
-            "Input Set",
-            Some(
+            ctx.t("Input Set"),
+            Some(ctx.t(
                 "Create or edit a research workspace. Seed concepts drive gather queries; the gap note feeds Gap Bridge.",
-            ),
+            )),
         );
 
         egui::ScrollArea::vertical().show(ui, |ui| {
-            style::section_heading(ui, "Workspace");
+            style::section_heading(ui, ctx.t("Workspace"));
             egui::Grid::new("workspace_identity")
                 .num_columns(2)
                 .spacing([12.0, 8.0])
                 .show(ui, |ui| {
-                    ui.label("Name");
+                    ui.label(ctx.t("Name"));
                     ui.text_edit_singleline(&mut self.form.name);
                     ui.end_row();
                 });
 
             style::section_break(ui);
-            style::section_heading(ui, "Research context");
+            style::section_heading(ui, ctx.t("Research context"));
             egui::Grid::new("workspace_research_context")
                 .num_columns(2)
                 .spacing([12.0, 8.0])
                 .show(ui, |ui| {
-                    ui.label("Primary question");
+                    ui.label(ctx.t("Primary question"));
                     ui.add(
                         egui::TextEdit::multiline(&mut self.form.primary_question)
                             .desired_rows(2)
@@ -103,7 +103,7 @@ impl Panel {
                     );
                     ui.end_row();
 
-                    ui.label("Topic descriptor");
+                    ui.label(ctx.t("Topic descriptor"));
                     ui.add(
                         egui::TextEdit::singleline(&mut self.form.topic_descriptor)
                             .hint_text("short natural-language topic, used by screening + prompt rewrite")
@@ -111,7 +111,7 @@ impl Panel {
                     );
                     ui.end_row();
 
-                    ui.label("Gap note");
+                    ui.label(ctx.t("Gap note"));
                     ui.add(
                         egui::TextEdit::multiline(&mut self.form.gap_note)
                             .desired_rows(3)
@@ -121,12 +121,12 @@ impl Panel {
                 });
 
             style::section_break(ui);
-            style::section_heading(ui, "Gather inputs");
+            style::section_heading(ui, ctx.t("Gather inputs"));
             egui::Grid::new("workspace_gather_inputs")
                 .num_columns(2)
                 .spacing([12.0, 8.0])
                 .show(ui, |ui| {
-                    ui.label("Seed concepts\n(one per line)");
+                    ui.label(ctx.t("Seed concepts\n(one per line)"));
                     ui.add(
                         egui::TextEdit::multiline(&mut self.form.seed_concepts_text)
                             .desired_rows(6)
@@ -134,11 +134,11 @@ impl Panel {
                     );
                     ui.end_row();
 
-                    ui.label("Lookback (days)");
+                    ui.label(ctx.t("Lookback (days)"));
                     ui.add(egui::DragValue::new(&mut self.form.lookback_days).range(1..=3650));
                     ui.end_row();
 
-                    ui.label("Override queries\n(optional, one per line)");
+                    ui.label(ctx.t("Override queries\n(optional, one per line)"));
                     ui.add(
                         egui::TextEdit::multiline(&mut self.form.override_queries_text)
                             .desired_rows(3)
@@ -148,15 +148,18 @@ impl Panel {
                 });
 
             style::section_break(ui);
-            style::section_heading(ui, "Actions");
+            style::section_heading(ui, ctx.t("Actions"));
             ui.horizontal(|ui| {
-                if ui.add_enabled(!self.busy, egui::Button::new("Save")).clicked() {
+                if ui
+                    .add_enabled(!self.busy, egui::Button::new(ctx.t("Save")))
+                    .clicked()
+                {
                     self.save(ctx, active);
                 }
                 if ui
                     .add_enabled(
                         !self.busy,
-                        egui::Button::new("Save and run gather (all sources)"),
+                        egui::Button::new(ctx.t("Save and run gather (all sources)")),
                     )
                     .clicked()
                 {
@@ -171,25 +174,25 @@ impl Panel {
 
             let caps = "Gather caps: each source returns ~50 candidates per query; PMC only looks back 30 days. A long lookback broadens coverage across sources rather than exhaustively.";
             ui.add_space(8.0);
-            style::muted_label(ui, caps);
+            style::muted_label(ui, ctx.t(caps));
 
             style::section_break(ui);
-            style::section_heading(ui, "Preview / reference");
+            style::section_heading(ui, ctx.t("Preview / reference"));
             if !self.form.refined_question.is_empty() {
-                ui.label(egui::RichText::new("Refined question from Gap Bridge").strong());
+                ui.label(egui::RichText::new(ctx.t("Refined question from Gap Bridge")).strong());
                 style::body_label(ui, self.form.refined_question.as_str());
                 ui.add_space(8.0);
             }
-            self.show_wiring_preview(ui);
+            self.show_wiring_preview(ui, ctx);
 
             style::section_break(ui);
-            style::section_heading(ui, "Create workspace");
+            style::section_heading(ui, ctx.t("Create workspace"));
             ui.horizontal(|ui| {
                 ui.text_edit_singleline(&mut self.new_name);
                 if ui
                     .add_enabled(
                         !self.busy && !self.new_name.trim().is_empty(),
-                        egui::Button::new("Create"),
+                        egui::Button::new(ctx.t("Create")),
                     )
                     .clicked()
                 {
@@ -307,10 +310,10 @@ impl Panel {
         }
     }
 
-    fn show_wiring_preview(&self, ui: &mut egui::Ui) {
+    fn show_wiring_preview(&self, ui: &mut egui::Ui, ctx: &PanelCtx<'_>) {
         let context = context_from_form(&self.form);
         ui.add_space(10.0);
-        egui::CollapsingHeader::new("Wiring preview")
+        egui::CollapsingHeader::new(ctx.t("Wiring preview"))
             .default_open(true)
             .show(ui, |ui| {
                 egui::Grid::new("workspace_wiring_preview")
@@ -318,7 +321,7 @@ impl Panel {
                     .spacing([12.0, 6.0])
                     .striped(true)
                     .show(ui, |ui| {
-                        ui.label("Gather search");
+                        ui.label(ctx.t("Gather search"));
                         ui.label(format!(
                             "{}: {}",
                             context.query_source_label(),
@@ -326,23 +329,23 @@ impl Panel {
                         ));
                         ui.end_row();
 
-                        ui.label("Gather window");
+                        ui.label(ctx.t("Gather window"));
                         ui.label(format!("{} days", context.lookback_days.max(1)));
                         ui.end_row();
 
-                        ui.label("Screening");
+                        ui.label(ctx.t("Screening"));
                         ui.label("topic descriptor + primary question + seed/refined question");
                         ui.end_row();
 
-                        ui.label("Fetcher");
+                        ui.label(ctx.t("Fetcher"));
                         ui.label("runs after topic-aware prompt screening selects candidates");
                         ui.end_row();
 
-                        ui.label("KG/wiki");
+                        ui.label(ctx.t("KG/wiki"));
                         ui.label("saved articles + workspace research context");
                         ui.end_row();
 
-                        ui.label("Gap Bridge");
+                        ui.label(ctx.t("Gap Bridge"));
                         ui.label("primary question + gap note + KG gaps");
                         ui.end_row();
                     });

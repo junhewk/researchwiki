@@ -54,8 +54,8 @@ impl Panel {
         }
 
         ui.horizontal(|ui| {
-            ui.heading("Dashboard");
-            if ui.button("Refresh").clicked() {
+            ui.heading(ctx.t("Dashboard"));
+            if ui.button(ctx.t("Refresh")).clicked() {
                 self.refresh(ctx, active);
             }
             if self.loading {
@@ -101,10 +101,10 @@ impl Panel {
         }
 
         ui.add_space(10.0);
-        style::section_heading(ui, "Top articles");
+        style::section_heading(ui, ctx.t("Top articles"));
         egui::ScrollArea::vertical().show(ui, |ui| {
             if self.top.is_empty() {
-                style::muted_label(ui, "No scored articles yet for this workspace.");
+                style::muted_label(ui, ctx.t("No scored articles yet for this workspace."));
             }
             for article in &self.top {
                 ui.horizontal(|ui| {

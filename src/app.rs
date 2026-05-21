@@ -12,7 +12,7 @@ use tracing::{info, warn};
 use crate::{
     config::AppConfig,
     db,
-    models::workspace::WorkspaceSummary,
+    models::{settings::UiLanguage, workspace::WorkspaceSummary},
     runtime::{DesktopRuntime, UiEvent},
     services::{
         scheduler::run_scheduler_loop, settings::SettingsService, workspace::WorkspaceService,
@@ -21,6 +21,7 @@ use crate::{
     tray::{TrayCommand, TrayController},
     ui::{
         first_run::{FirstRunForm, FirstRunOutcome},
+        i18n,
         panels::{PanelCtx, Panels, Tab},
         style,
     },
@@ -61,6 +62,7 @@ pub struct DesktopApp {
     status: Option<String>,
     workspaces: Vec<WorkspaceSummary>,
     workspaces_refreshed_at: Option<std::time::Instant>,
+    language: UiLanguage,
 }
 
 impl DesktopApp {
@@ -68,6 +70,7 @@ impl DesktopApp {
         cc: &eframe::CreationContext<'_>,
         runtime: DesktopRuntime,
         config: AppConfig,
+        language: UiLanguage,
     ) -> Self {
         install_system_font_fallbacks(&cc.egui_ctx);
         style::apply_app_style(&cc.egui_ctx);
@@ -103,6 +106,7 @@ impl DesktopApp {
             status: None,
             workspaces: Vec::new(),
             workspaces_refreshed_at: None,
+            language,
         };
 
         if app.config.llm.is_configured() {
@@ -201,13 +205,17 @@ impl DesktopApp {
 
         self.persistent.active_workspace_id = workspace_id;
         self.state = Some(state);
-        self.status = Some("Ready.".to_string());
+        self.status = Some(i18n::t(self.language, "Ready.").to_string());
     }
 
     fn drain_events(&mut self) {
         while let Ok(evt) = self.ui_rx.try_recv() {
             match evt {
                 UiEvent::Status(msg) => self.status = Some(msg),
+                UiEvent::LanguageChanged(language) => {
+                    self.language = language;
+                    self.status = Some(i18n::t(language, "Language updated.").to_string());
+                }
                 UiEvent::JobProgress {
                     run_id,
                     step,
@@ -288,7 +296,7 @@ impl DesktopApp {
         ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
         ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
         ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
-        self.status = Some("Restored from system tray.".to_string());
+        self.status = Some(i18n::t(self.language, "Restored from system tray.").to_string());
     }
 
     fn hide_to_tray_if_minimized(&mut self, ctx: &egui::Context) {
@@ -311,7 +319,13 @@ impl DesktopApp {
             self.hidden_to_tray = true;
             ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
             ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
-            self.status = Some("Minimized to system tray. Scheduler remains active.".to_string());
+            self.status = Some(
+                i18n::t(
+                    self.language,
+                    "Minimized to system tray. Scheduler remains active.",
+                )
+                .to_string(),
+            );
         }
     }
 }
@@ -324,7 +338,9 @@ impl eframe::App for DesktopApp {
         self.drain_events();
 
         if self.state.is_none() {
-            if let FirstRunOutcome::Submitted { llm, embedding } = self.first_run.show(ctx) {
+            if let FirstRunOutcome::Submitted { llm, embedding } =
+                self.first_run.show(ctx, self.language)
+            {
                 // Best-effort persist so the modal only fires once. A failed
                 // write still lets the user continue in this session.
                 let path = self.config.storage.settings_file.clone();
@@ -357,7 +373,7 @@ impl eframe::App for DesktopApp {
 
         egui::TopBottomPanel::top("tabs").show(ctx, |ui| {
             ui.horizontal(|ui| {
-                ui.label("Workspace:");
+                ui.label(i18n::t(self.language, "Workspace:"));
                 let mut selected = active_ws;
                 let current = workspace_items
                     .iter()
@@ -378,7 +394,11 @@ impl eframe::App for DesktopApp {
             ui.separator();
             ui.horizontal_wrapped(|ui| {
                 for tab in Tab::ALL {
-                    ui.selectable_value(&mut self.persistent.active_tab, tab, tab.label());
+                    ui.selectable_value(
+                        &mut self.persistent.active_tab,
+                        tab,
+                        tab.label_for(self.language),
+                    );
                 }
             });
         });
@@ -398,6 +418,7 @@ impl eframe::App for DesktopApp {
                     handle: &self.handle,
                     ui_tx: &self.ui_tx,
                     active_workspace_id: self.persistent.active_workspace_id,
+                    language: self.language,
                 };
                 self.panels.show(self.persistent.active_tab, ui, &panel_ctx);
             }
@@ -438,6 +459,26 @@ fn native_window_handle(_cc: &eframe::CreationContext<'_>) -> Option<isize> {
 fn install_system_font_fallbacks(ctx: &egui::Context) {
     let mut fonts = egui::FontDefinitions::default();
     add_font_if_available(&mut fonts, "malgun_gothic", r"C:\Windows\Fonts\malgun.ttf");
+    add_font_if_available(
+        &mut fonts,
+        "apple_sd_gothic",
+        "/System/Library/Fonts/AppleSDGothicNeo.ttc",
+    );
+    add_font_if_available(
+        &mut fonts,
+        "noto_sans_cjk_kr",
+        "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
+    );
+    add_font_if_available(
+        &mut fonts,
+        "noto_sans_cjk_kr_otf",
+        "/usr/share/fonts/opentype/noto/NotoSansCJKkr-Regular.otf",
+    );
+    add_font_if_available(
+        &mut fonts,
+        "nanum_gothic",
+        "/usr/share/fonts/truetype/nanum/NanumGothic.ttf",
+    );
     ctx.set_fonts(fonts);
 }
 

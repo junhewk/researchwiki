@@ -64,7 +64,7 @@ impl Panel {
         }
         self.poll_compile(ui, ctx);
 
-        style::panel_header(ui, "Wiki", None);
+        style::panel_header(ui, ctx.t("Wiki"), None);
 
         self.show_controls(ui, ctx);
         ui.add_space(8.0);
@@ -157,19 +157,19 @@ impl Panel {
     }
 
     fn show_controls(&mut self, ui: &mut egui::Ui, ctx: &PanelCtx<'_>) {
-        style::section_heading(ui, "Search syntheses");
+        style::section_heading(ui, ctx.t("Search syntheses"));
         ui.horizontal_wrapped(|ui| {
-            ui.label("Search");
+            ui.label(ctx.t("Search"));
             let resp = ui.add(
                 egui::TextEdit::singleline(&mut self.search)
                     .hint_text("synthesis text")
                     .desired_width(220.0),
             );
             let enter = resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
-            if enter || ui.button("Search").clicked() {
+            if enter || ui.button(ctx.t("Search")).clicked() {
                 self.run_search(ctx);
             }
-            if ui.button("Clear").clicked() {
+            if ui.button(ctx.t("Clear")).clicked() {
                 self.search.clear();
                 self.offset = 0;
                 self.fetch_list(ctx);
@@ -180,25 +180,31 @@ impl Panel {
         });
 
         ui.add_space(8.0);
-        style::section_heading(ui, "Filters and compilation");
+        style::section_heading(ui, ctx.t("Filters and compilation"));
         ui.horizontal_wrapped(|ui| {
-            ui.label("Type");
+            ui.label(ctx.t("Type"));
             ui.add(
                 egui::TextEdit::singleline(&mut self.entity_type)
                     .hint_text("(any)")
                     .desired_width(120.0),
             );
-            if ui.checkbox(&mut self.stale_only, "Stale only").changed() {
+            if ui
+                .checkbox(&mut self.stale_only, ctx.t("Stale only"))
+                .changed()
+            {
                 self.offset = 0;
                 self.fetch_list(ctx);
             }
-            if ui.button("Apply").clicked() {
+            if ui.button(ctx.t("Apply")).clicked() {
                 self.offset = 0;
                 self.fetch_list(ctx);
             }
             ui.separator();
             if ui
-                .add_enabled(!self.compile_busy, egui::Button::new("Compile syntheses"))
+                .add_enabled(
+                    !self.compile_busy,
+                    egui::Button::new(ctx.t("Compile syntheses")),
+                )
                 .clicked()
             {
                 self.start_compile(ctx);
@@ -228,8 +234,10 @@ impl Panel {
                 if self.list.is_empty() {
                     style::body_label(
                         ui,
-                        "No syntheses yet. Populate the knowledge graph (Gather tab), then \
-                         click \"Compile syntheses\". Only entities cited by ≥3 articles appear.",
+                        ctx.t(
+                            "No syntheses yet. Populate the knowledge graph (Gather tab), then \
+                             click \"Compile syntheses\". Only entities cited by >=3 articles appear.",
+                        ),
                     );
                     return;
                 }
@@ -282,7 +290,7 @@ impl Panel {
             .auto_shrink([false, false])
             .show(ui, |ui| {
                 let Some(syn) = &self.selected else {
-                    style::body_label(ui, "Select an entity to view its synthesis.");
+                    style::body_label(ui, ctx.t("Select an entity to view its synthesis."));
                     return;
                 };
                 ui.heading(&syn.entity_name);
@@ -345,14 +353,14 @@ impl Panel {
                 }
                 if !syn.key_aspects.is_empty() {
                     ui.add_space(8.0);
-                    ui.strong("Key aspects");
+                    ui.strong(ctx.t("Key aspects"));
                     for aspect in &syn.key_aspects {
                         style::body_label(ui, format!("• {aspect}"));
                     }
                 }
                 if !syn.related_entities.is_empty() {
                     ui.add_space(8.0);
-                    ui.strong("Related entities");
+                    ui.strong(ctx.t("Related entities"));
                     for rel in &syn.related_entities {
                         style::body_label(
                             ui,

@@ -69,6 +69,25 @@ impl Default for NewsletterSettings {
     }
 }
 
+#[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, PartialEq, Eq, Hash)]
+#[serde(rename_all = "snake_case")]
+pub enum UiLanguage {
+    #[default]
+    English,
+    Korean,
+}
+
+impl UiLanguage {
+    pub const ALL: [Self; 2] = [Self::English, Self::Korean];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::English => "English",
+            Self::Korean => "한국어",
+        }
+    }
+}
+
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
 pub struct StoredSettings {
     #[serde(default)]
@@ -87,6 +106,8 @@ pub struct StoredSettings {
     pub embedding: Option<crate::config::EmbeddingConfig>,
     #[serde(default)]
     pub embedding_dimensions: Option<u32>,
+    #[serde(default)]
+    pub ui_language: UiLanguage,
 }
 
 fn default_true() -> bool {
@@ -98,12 +119,17 @@ pub struct SettingsResponse {
     pub api_keys: Vec<ApiKeyStatus>,
     pub scheduler: SchedulerSettings,
     pub newsletter: NewsletterSettings,
+    pub ui_language: UiLanguage,
 }
 
 #[derive(Debug, Deserialize)]
 pub struct SettingsUpdate {
+    #[serde(default)]
     pub scheduler: Option<SchedulerSettings>,
+    #[serde(default)]
     pub newsletter: Option<NewsletterSettings>,
+    #[serde(default)]
+    pub ui_language: Option<UiLanguage>,
 }
 
 #[derive(Debug, Serialize)]

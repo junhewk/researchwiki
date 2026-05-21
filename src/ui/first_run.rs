@@ -1,6 +1,7 @@
 use crate::{
     config::{EmbeddingConfig, LlmConfig, normalize_api_key},
-    ui::style,
+    models::settings::UiLanguage,
+    ui::{i18n, style},
 };
 
 pub struct FirstRunForm {
@@ -37,62 +38,74 @@ pub enum FirstRunOutcome {
 }
 
 impl FirstRunForm {
-    pub fn show(&mut self, ctx: &egui::Context) -> FirstRunOutcome {
+    pub fn show(&mut self, ctx: &egui::Context, language: UiLanguage) -> FirstRunOutcome {
         let mut outcome = FirstRunOutcome::Pending;
 
-        egui::Window::new("Welcome to ResearchWiki")
+        egui::Window::new(i18n::t(language, "Welcome to ResearchWiki"))
             .collapsible(false)
             .resizable(false)
             .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
             .show(ctx, |ui| {
                 style::body_label(
                     ui,
-                    "Configure the two OpenAI-compatible endpoints ResearchWiki uses.",
+                    i18n::t(
+                        language,
+                        "Configure the two OpenAI-compatible endpoints ResearchWiki uses.",
+                    ),
                 );
-                style::muted_label(ui, "You can change either later in Settings.");
-                ui.add_space(10.0);
-
-                style::section_heading(ui, "LLM endpoint");
                 style::muted_label(
                     ui,
-                    "Used for evaluation, screening, knowledge-graph extraction, etc.",
+                    i18n::t(language, "You can change either later in Settings."),
+                );
+                ui.add_space(10.0);
+
+                style::section_heading(ui, i18n::t(language, "LLM endpoint"));
+                style::muted_label(
+                    ui,
+                    i18n::t(
+                        language,
+                        "Used for evaluation, screening, knowledge-graph extraction, etc.",
+                    ),
                 );
                 egui::Grid::new("first-run-llm-grid")
                     .num_columns(2)
                     .spacing([8.0, 6.0])
                     .show(ui, |ui| {
-                        ui.label("Base URL");
+                        ui.label(i18n::t(language, "Base URL"));
                         ui.text_edit_singleline(&mut self.llm_base_url);
                         ui.end_row();
 
-                        ui.label("Model");
+                        ui.label(i18n::t(language, "Model"));
                         ui.text_edit_singleline(&mut self.llm_model);
                         ui.end_row();
 
-                        ui.label("API key");
+                        ui.label(i18n::t(language, "API key"));
                         ui.add(egui::TextEdit::singleline(&mut self.llm_api_key).password(true));
                         ui.end_row();
                     });
 
                 ui.add_space(12.0);
-                style::section_heading(ui, "Embedding endpoint");
+                style::section_heading(ui, i18n::t(language, "Embedding endpoint"));
                 style::muted_label(
                     ui,
-                    "Used to embed article chunks for semantic + hybrid search.",
+                    i18n::t(
+                        language,
+                        "Used to embed article chunks for semantic + hybrid search.",
+                    ),
                 );
                 egui::Grid::new("first-run-embed-grid")
                     .num_columns(2)
                     .spacing([8.0, 6.0])
                     .show(ui, |ui| {
-                        ui.label("Base URL");
+                        ui.label(i18n::t(language, "Base URL"));
                         ui.text_edit_singleline(&mut self.embed_base_url);
                         ui.end_row();
 
-                        ui.label("Model");
+                        ui.label(i18n::t(language, "Model"));
                         ui.text_edit_singleline(&mut self.embed_model);
                         ui.end_row();
 
-                        ui.label("API key");
+                        ui.label(i18n::t(language, "API key"));
                         ui.add(
                             egui::TextEdit::singleline(&mut self.embed_api_key)
                                 .password(true)
@@ -107,7 +120,7 @@ impl FirstRunForm {
                 }
 
                 ui.horizontal(|ui| {
-                    if ui.button("Save and continue").clicked() {
+                    if ui.button(i18n::t(language, "Save and continue")).clicked() {
                         match self.validate() {
                             Ok((llm, embedding)) => {
                                 outcome = FirstRunOutcome::Submitted { llm, embedding }
