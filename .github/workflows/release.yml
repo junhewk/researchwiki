@@ -30,7 +30,9 @@ jobs:
       # once via control-click → Open (see README).
       - name: Install cargo-bundle (macOS)
         if: runner.os == 'macOS'
-        run: cargo install cargo-bundle
+        # --locked uses cargo-bundle's pinned deps so the install doesn't pull a
+        # transitive crate that demands a newer rustc than the runner's stable.
+        run: cargo install cargo-bundle --locked
       - name: Bundle, sign, and package DMG (macOS)
         if: runner.os == 'macOS'
         run: |
