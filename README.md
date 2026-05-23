@@ -66,6 +66,22 @@ monochrome glyph, ~36×36, transparent background) before bundling.
 > On Windows, release builds run without a console window. On macOS, running the bare
 > binary from a terminal will show logs; launch the bundled `.app` for a clean experience.
 
+### Opening the app on macOS (Gatekeeper)
+
+The macOS build is **ad‑hoc signed but not Apple‑notarized**, so the first launch shows an
+"unidentified developer" / "cannot verify" warning. To open it:
+
+- **Control‑click** (right‑click) **ResearchWiki.app → Open**, then **Open** again in the dialog. macOS remembers this and won't ask again.
+- Or go to **System Settings → Privacy & Security** and choose **Open Anyway** for ResearchWiki.
+
+If macOS instead says the app is **"damaged and can't be opened"** (this happens with downloaded
+apps because of the quarantine flag), move it to `/Applications` and clear the flag:
+
+```sh
+xattr -dr com.apple.quarantine "/Applications/ResearchWiki.app"
+open "/Applications/ResearchWiki.app"
+```
+
 ## First run
 
 A short setup wizard appears on first launch:

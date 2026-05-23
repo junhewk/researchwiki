@@ -24,23 +24,31 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
 
-      # --- macOS: bundle into a .app and zip it ---
+      # --- macOS: bundle into a .app, ad-hoc sign, package a signed DMG ---
+      # Ad-hoc signing (no Apple Developer ID / notarization) keeps macOS from
+      # treating the nested binary as "damaged"; users still bypass Gatekeeper
+      # once via control-click → Open (see README).
       - name: Install cargo-bundle (macOS)
         if: runner.os == 'macOS'
         run: cargo install cargo-bundle
-      - name: Bundle .app (macOS)
+      - name: Bundle, sign, and package DMG (macOS)
         if: runner.os == 'macOS'
         run: |
           cargo bundle --release
-          ditto -c -k --keepParent \
-            "target/release/bundle/osx/ResearchWiki.app" \
-            "ResearchWiki-macos.zip"
+          APP="target/release/bundle/osx/ResearchWiki.app"
+          codesign --force --deep --sign - "$APP"
+          codesign --verify --deep --strict --verbose=2 "$APP"
+          hdiutil create -volname "ResearchWiki" \
+            -srcfolder "$APP" -ov -format UDZO \
+            "ResearchWiki-macos.dmg"
+          codesign --force --sign - "ResearchWiki-macos.dmg"
+          codesign --verify --verbose=2 "ResearchWiki-macos.dmg"
       - name: Upload macOS artifact
         if: runner.os == 'macOS'
         uses: actions/upload-artifact@v4
         with:
           name: ResearchWiki-macos
-          path: ResearchWiki-macos.zip
+          path: ResearchWiki-macos.dmg
 
       # --- Windows: build the exe and zip it ---
       - name: Build (Windows)
@@ -61,5 +69,7 @@ jobs:
         if: startsWith(github.ref, 'refs/tags/')
         uses: softprops/action-gh-release@v2
         with:
-          files: ResearchWiki-*.zip
+          files: |
+            ResearchWiki-macos.dmg
+            ResearchWiki-windows.zip
           fail_on_unmatched_files: false
