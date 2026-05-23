@@ -1,0 +1,65 @@
+name: release
+
+# Build distributable artifacts for macOS and Windows. Runs on a version tag
+# (e.g. `git tag v0.1.0 && git push --tags`) and can be triggered manually.
+# Prompts and icons are embedded in the binary, so the artifacts are self-contained.
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Build (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      # --- macOS: bundle into a .app and zip it ---
+      - name: Install cargo-bundle (macOS)
+        if: runner.os == 'macOS'
+        run: cargo install cargo-bundle
+      - name: Bundle .app (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          cargo bundle --release
+          ditto -c -k --keepParent \
+            "target/release/bundle/osx/ResearchWiki.app" \
+            "ResearchWiki-macos.zip"
+      - name: Upload macOS artifact
+        if: runner.os == 'macOS'
+        uses: actions/upload-artifact@v4
+        with:
+          name: ResearchWiki-macos
+          path: ResearchWiki-macos.zip
+
+      # --- Windows: build the exe and zip it ---
+      - name: Build (Windows)
+        if: runner.os == 'Windows'
+        run: cargo build --release
+      - name: Package (Windows)
+        if: runner.os == 'Windows'
+        run: Compress-Archive -Path target/release/researchwiki.exe -DestinationPath ResearchWiki-windows.zip
+      - name: Upload Windows artifact
+        if: runner.os == 'Windows'
+        uses: actions/upload-artifact@v4
+        with:
+          name: ResearchWiki-windows
+          path: ResearchWiki-windows.zip
+
+      # --- Attach to the GitHub Release when building a tag ---
+      - name: Attach to release
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: ResearchWiki-*.zip
+          fail_on_unmatched_files: false

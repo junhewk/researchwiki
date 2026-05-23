@@ -51,6 +51,7 @@ egui_commonmark = "0.21"
 petgraph = { version = "0.8", default-features = false, features = ["stable_graph"] }
 egui-phosphor = "0.10"
 image = { version = "0.25.10", default-features = false, features = ["png"] }
+include_dir = "0.7.4"
 
 # Tray icon works on both Windows and macOS (tray-icon links system frameworks
 # natively — no pkg-config). Linux is excluded (its tray needs GTK/appindicator).

@@ -42,6 +42,12 @@ struct PersistentUi {
 const PERSIST_SCHEMA: u32 = 2;
 const PERSIST_KEY: &str = "researchwiki_ui";
 
+/// Default prompt templates embedded at build time so a distributed binary /
+/// `.app` is self-contained. Seeded into the user's prompts dir on first run
+/// when no loose `prompts/` folder ships beside the executable.
+static BUNDLED_PROMPTS: include_dir::Dir<'_> =
+    include_dir::include_dir!("$CARGO_MANIFEST_DIR/prompts");
+
 /// A pending "this research set is due for a gather" prompt.
 struct CadenceDue {
     workspace_id: i64,
@@ -860,6 +866,8 @@ pub fn first_launch_seed(config: &AppConfig) -> Result<()> {
         .with_context(|| format!("failed to create {:?}", storage.wiki_export_dir))?;
 
     if dir_is_empty(&storage.prompts_dir)? {
+        // Prefer a loose prompts/ dir beside the executable (lets developers edit
+        // templates without rebuilding); otherwise extract the embedded copy.
         if let Some(bundled) = bundled_prompts_dir() {
             copy_dir_recursive(&bundled, &storage.prompts_dir).with_context(|| {
                 format!(
@@ -873,9 +881,14 @@ pub fn first_launch_seed(config: &AppConfig) -> Result<()> {
                 storage.prompts_dir.display()
             );
         } else {
-            warn!(
-                "no bundled prompts directory found beside executable; \
-                 leaving {} empty (LLM prompts will need to be authored from scratch)",
+            BUNDLED_PROMPTS
+                .extract(&storage.prompts_dir)
+                .with_context(|| {
+                    format!("failed to seed embedded prompts to {:?}", storage.prompts_dir)
+                })?;
+            info!(
+                "seeded {} embedded prompt templates to {}",
+                BUNDLED_PROMPTS.files().count(),
                 storage.prompts_dir.display()
             );
         }
