@@ -106,6 +106,15 @@ pub fn t(language: UiLanguage, text: &'static str) -> &'static str {
             "대체 쿼리는 검색 시 핵심 주제를 대체합니다. 비워 두면 위의 주제를 사용합니다."
         }
         "Save & start gathering" => "저장 후 수집 시작",
+        "Save stores this research set. The Gather tab and the daily scheduler both use it to build search queries and prompts — saving alone does not gather." => {
+            "저장은 이 연구 세트를 저장합니다. 수집 탭과 일일 스케줄러가 이 내용을 사용해 검색 쿼리와 프롬프트를 구성합니다. 저장만으로는 수집되지 않습니다."
+        }
+        "Save & start gathering also runs one gather now across all sources, looking back the days set in Advanced settings." => {
+            "저장 후 수집 시작은 저장한 뒤, 고급 설정의 조회 기간만큼 전체 소스에서 즉시 한 번 수집합니다."
+        }
+        "To gather automatically on a schedule, set daily times in Settings → Scheduler." => {
+            "정기적으로 자동 수집하려면 설정 → 스케줄러에서 일일 시간을 지정하세요."
+        }
         "Create another research set" => "다른 연구 세트 만들기",
 
         "Run gather" => "수집 실행",

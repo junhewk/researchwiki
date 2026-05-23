@@ -173,6 +173,24 @@ impl Panel {
                 }
             });
 
+            ui.add_space(6.0);
+            style::muted_label(
+                ui,
+                ctx.t(
+                    "Save stores this research set. The Gather tab and the daily scheduler both use it to build search queries and prompts — saving alone does not gather.",
+                ),
+            );
+            style::muted_label(
+                ui,
+                ctx.t(
+                    "Save & start gathering also runs one gather now across all sources, looking back the days set in Advanced settings.",
+                ),
+            );
+            style::muted_label(
+                ui,
+                ctx.t("To gather automatically on a schedule, set daily times in Settings → Scheduler."),
+            );
+
             if let Some(status) = &self.status {
                 ui.add_space(8.0);
                 ui.label(status);
