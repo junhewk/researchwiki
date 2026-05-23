@@ -4,8 +4,6 @@ use anyhow::{Context, Result};
 use tokio::{
     runtime::{Handle, Runtime},
     sync::{mpsc, watch},
-    task::JoinHandle,
-    time::timeout,
 };
 use tracing::{info, warn};
 
@@ -17,9 +15,7 @@ use crate::{
         workspace::{WorkspaceSummary, WorkspaceUpdate},
     },
     runtime::{DesktopRuntime, UiEvent},
-    services::{
-        scheduler::run_scheduler_loop, settings::SettingsService, workspace::WorkspaceService,
-    },
+    services::{settings::SettingsService, workspace::WorkspaceService},
     state::AppState,
     tray::{TrayCommand, TrayController},
     ui::{
@@ -46,6 +42,22 @@ struct PersistentUi {
 const PERSIST_SCHEMA: u32 = 2;
 const PERSIST_KEY: &str = "researchwiki_ui";
 
+/// A pending "this research set is due for a gather" prompt.
+struct CadenceDue {
+    workspace_id: i64,
+    name: String,
+    days: Option<i64>,
+    lookback: i32,
+}
+
+/// Whole days elapsed since `timestamp` (SQLite `datetime('now')`, UTC). `None`
+/// when there is no timestamp or it can't be parsed — treated as "due".
+fn days_since(timestamp: Option<&str>) -> Option<i64> {
+    let parsed =
+        chrono::NaiveDateTime::parse_from_str(timestamp?.trim(), "%Y-%m-%d %H:%M:%S").ok()?;
+    Some((chrono::Utc::now().naive_utc() - parsed).num_days().max(0))
+}
+
 pub struct DesktopApp {
     // Held only to keep the tokio runtime alive — dropping it tears down
     // every spawned task.
@@ -53,9 +65,7 @@ pub struct DesktopApp {
     handle: Handle,
     config: AppConfig,
     state: Option<AppState>,
-    scheduler: Option<JoinHandle<()>>,
     shutdown_tx: watch::Sender<bool>,
-    shutdown_rx: watch::Receiver<bool>,
     ui_tx: mpsc::UnboundedSender<UiEvent>,
     ui_rx: mpsc::UnboundedReceiver<UiEvent>,
     tray: Option<TrayController>,
@@ -74,6 +84,13 @@ pub struct DesktopApp {
     allow_quit: bool,
     /// "Don't ask again" checkbox state in the close modal.
     remember_close: bool,
+    /// Throttle for the per-research-set gather-cadence check.
+    last_cadence_check: Option<std::time::Instant>,
+    /// The (workspace id, last_gathered_at) pair we've already evaluated, so we
+    /// don't re-prompt for the same due state.
+    cadence_seen: Option<(i64, Option<String>)>,
+    /// A pending "gather is due" prompt (ask mode).
+    cadence_due: Option<CadenceDue>,
     panels: Panels,
     persistent: PersistentUi,
     status: Option<String>,
@@ -109,9 +126,7 @@ impl DesktopApp {
             handle: runtime.handle,
             config,
             state: None,
-            scheduler: None,
             shutdown_tx: runtime.shutdown_tx,
-            shutdown_rx: runtime.shutdown_rx,
             ui_tx: runtime.ui_tx,
             ui_rx: runtime.ui_rx,
             tray: None,
@@ -125,6 +140,9 @@ impl DesktopApp {
             close_modal_open: false,
             allow_quit: false,
             remember_close: false,
+            last_cadence_check: None,
+            cadence_seen: None,
+            cadence_due: None,
             panels: Panels::default(),
             persistent,
             status: None,
@@ -217,20 +235,10 @@ impl DesktopApp {
             }
         });
 
-        // Restart the scheduler bound to the now-active workspace.
-        if let Some(old) = self.scheduler.take() {
-            old.abort();
-        }
-        let scheduler_job = state.job_service.clone();
-        let scheduler_settings = state.settings_service.clone();
-        let shutdown_rx = self.shutdown_rx.clone();
-        let scheduler = self.handle.spawn(run_scheduler_loop(
-            scheduler_job,
-            scheduler_settings,
-            workspace_id,
-            shutdown_rx,
-        ));
-        self.scheduler = Some(scheduler);
+        // Re-evaluate this research set's gather cadence on the next frame.
+        self.last_cadence_check = None;
+        self.cadence_seen = None;
+        self.cadence_due = None;
 
         self.persistent.active_workspace_id = workspace_id;
         self.state = Some(state);
@@ -282,6 +290,8 @@ impl DesktopApp {
                 seed_concepts: Some(topics),
                 override_queries: None,
                 lookback_days: None,
+                cadence_days: None,
+                cadence_auto: None,
             };
             if let Err(err) = self
                 .handle
@@ -514,6 +524,131 @@ impl DesktopApp {
             self.close_modal_open = false;
         }
     }
+
+    /// Evaluates the active research set's gather cadence (on activation and
+    /// every 30 min while running). When due, auto-gathers or queues a prompt.
+    fn check_cadence(&mut self) {
+        const INTERVAL: Duration = Duration::from_secs(1800);
+        if self.cadence_due.is_some() {
+            return; // a prompt is already showing
+        }
+        if self
+            .last_cadence_check
+            .is_some_and(|t| t.elapsed() < INTERVAL)
+        {
+            return;
+        }
+        self.last_cadence_check = Some(std::time::Instant::now());
+
+        let id = self.persistent.active_workspace_id;
+        if id <= 0 {
+            return;
+        }
+        let Some(state) = self.state.as_ref() else {
+            return;
+        };
+        let svc = state.workspace_service.clone();
+        let Ok(ws) = self.handle.block_on(async move { svc.get(id).await }) else {
+            return;
+        };
+
+        // Don't re-evaluate the same due state (avoids re-prompting every tick).
+        let key = (ws.id, ws.last_gathered_at.clone());
+        if self.cadence_seen.as_ref() == Some(&key) {
+            return;
+        }
+        self.cadence_seen = Some(key);
+
+        let Some(cadence_days) = ws.cadence_days else {
+            return; // cadence off
+        };
+        let overdue = days_since(ws.last_gathered_at.as_deref());
+        let due = overdue.is_none_or(|days| days >= i64::from(cadence_days));
+        if !due {
+            return;
+        }
+
+        // Auto-lookback: cover the gap since the last gather (or the configured
+        // window if we've never gathered).
+        let lookback = overdue
+            .map(|days| (days as i32 + 1).clamp(1, 3650))
+            .unwrap_or_else(|| ws.lookback_days.max(1));
+
+        if ws.cadence_auto {
+            self.start_workspace_gather(
+                id,
+                lookback,
+                format!(
+                    "Auto-gather for '{}' (every {cadence_days} day(s))",
+                    ws.name
+                ),
+            );
+        } else {
+            self.cadence_due = Some(CadenceDue {
+                workspace_id: id,
+                name: ws.name,
+                days: overdue,
+                lookback,
+            });
+        }
+    }
+
+    fn start_workspace_gather(&mut self, id: i64, lookback: i32, status: String) {
+        let Some(state) = self.state.as_ref() else {
+            return;
+        };
+        let jobs = state.job_service.clone();
+        self.handle.spawn(async move {
+            if let Err(err) = jobs.enqueue_source("all", lookback, id).await {
+                warn!("cadence gather failed to start: {err:#}");
+            }
+        });
+        self.status = Some(status);
+    }
+
+    fn show_cadence_modal(&mut self, ctx: &egui::Context) {
+        let Some(due) = self.cadence_due.as_ref() else {
+            return;
+        };
+        let lang = self.language;
+        let id = due.workspace_id;
+        let lookback = due.lookback;
+        let detail = format!(
+            "{} · {} day(s) since last gather",
+            due.name,
+            due.days
+                .map(|d| d.to_string())
+                .unwrap_or_else(|| "—".into())
+        );
+        let mut gather = false;
+        let mut dismiss = false;
+
+        egui::Modal::new(egui::Id::new("cadence_due_modal")).show(ctx, |ui| {
+            ui.set_width(380.0);
+            style::section_heading(ui, i18n::t(lang, "Gather due"));
+            style::body_label(
+                ui,
+                i18n::t(lang, "This research set is due for a scheduled gather."),
+            );
+            style::muted_label(ui, detail);
+            ui.add_space(10.0);
+            ui.horizontal(|ui| {
+                if style::primary_button(ui, i18n::t(lang, "Gather now")).clicked() {
+                    gather = true;
+                }
+                if style::secondary_button(ui, i18n::t(lang, "Not now")).clicked() {
+                    dismiss = true;
+                }
+            });
+        });
+
+        if gather {
+            self.cadence_due = None;
+            self.start_workspace_gather(id, lookback, i18n::t(lang, "Gathering…").to_string());
+        } else if dismiss {
+            self.cadence_due = None;
+        }
+    }
 }
 
 impl eframe::App for DesktopApp {
@@ -570,6 +705,11 @@ impl eframe::App for DesktopApp {
         if !self.setup_complete {
             self.show_research_setup(ctx);
             return;
+        }
+
+        self.check_cadence();
+        if self.cadence_due.is_some() {
+            self.show_cadence_modal(ctx);
         }
 
         self.maybe_refresh_workspaces();
@@ -641,13 +781,8 @@ impl eframe::App for DesktopApp {
     }
 
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
-        info!("desktop app exiting; signalling scheduler shutdown");
+        info!("desktop app exiting; signalling background tasks to stop");
         let _ = self.shutdown_tx.send(true);
-        if let Some(scheduler) = self.scheduler.take() {
-            let _ = self
-                .handle
-                .block_on(async move { timeout(Duration::from_secs(5), scheduler).await });
-        }
     }
 }
 

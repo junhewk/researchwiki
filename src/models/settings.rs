@@ -112,6 +112,9 @@ pub struct StoredSettings {
     /// user provides one in setup or Settings.
     #[serde(default)]
     pub contact_email: Option<String>,
+    /// Semantic Scholar API key. Unset disables that gather source.
+    #[serde(default)]
+    pub semantic_scholar_api_key: Option<String>,
     /// Whether the guided research-setup step has been completed. `None` means
     /// unknown (legacy installs predating the wizard); startup treats an already
     /// configured legacy install as complete.

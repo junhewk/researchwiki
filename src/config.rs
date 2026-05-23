@@ -15,6 +15,9 @@ pub struct AppConfig {
     /// Empty when the user has not provided one — callers must then omit it
     /// rather than impersonate anyone.
     pub contact_email: String,
+    /// Semantic Scholar API key. Empty disables that source (its keyless pool is
+    /// rate-limited to the point of being unusable).
+    pub semantic_scholar_api_key: String,
 }
 
 #[derive(Clone, Debug)]
@@ -122,6 +125,7 @@ impl AppConfig {
             embedding: EmbeddingConfig::default(),
             embedding_dimensions: 1536,
             contact_email: String::new(),
+            semantic_scholar_api_key: String::new(),
         })
     }
 
@@ -192,13 +196,25 @@ impl AppConfig {
             .map(|value| value.trim().to_string())
             .unwrap_or(base.contact_email);
 
+        let semantic_scholar_api_key = env::var("SEMANTIC_SCHOLAR_API_KEY")
+            .map(|value| value.trim().to_string())
+            .unwrap_or(base.semantic_scholar_api_key);
+
         Ok(Self {
             storage,
             llm,
             embedding,
             embedding_dimensions,
             contact_email,
+            semantic_scholar_api_key,
         })
+    }
+
+    /// The Semantic Scholar API key as `Some` only when non-empty, so the source
+    /// can be skipped cleanly when no key is configured.
+    pub fn semantic_scholar_api_key_opt(&self) -> Option<String> {
+        let trimmed = self.semantic_scholar_api_key.trim();
+        (!trimmed.is_empty()).then(|| trimmed.to_string())
     }
 
     /// The contact email as `Some` only when non-empty, so callers can cleanly

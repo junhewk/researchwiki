@@ -22,6 +22,11 @@ struct Form {
     override_queries_text: String,
     lookback_days: i32,
     refined_question: String,
+    /// Auto-gather cadence in days; `None` = off.
+    cadence_days: Option<i32>,
+    /// When due, gather automatically vs. ask first.
+    cadence_auto: bool,
+    last_gathered_at: Option<String>,
 }
 
 #[derive(Default)]
@@ -151,6 +156,9 @@ impl Panel {
                         ),
                     );
                 });
+
+            style::section_break(ui);
+            self.show_schedule_section(ui, ctx);
 
             style::section_break(ui);
             style::section_heading(ui, ctx.t("Actions"));
@@ -314,6 +322,67 @@ impl Panel {
         });
     }
 
+    fn show_schedule_section(&mut self, ui: &mut egui::Ui, ctx: &PanelCtx<'_>) {
+        style::section_heading(ui, ctx.t("Gathering schedule"));
+        style::muted_label(
+            ui,
+            ctx.t(
+                "Optionally gather this research set on a cadence. Checked when you open the app and periodically while it's open (the app must be running or in the tray).",
+            ),
+        );
+        ui.add_space(4.0);
+
+        let mut enabled = self.form.cadence_days.is_some();
+        ui.horizontal(|ui| {
+            if ui
+                .checkbox(&mut enabled, ctx.t("Auto-gather every"))
+                .changed()
+            {
+                self.form.cadence_days = enabled
+                    .then(|| self.form.cadence_days.unwrap_or(7).max(1))
+                    .or(None);
+            }
+            let mut days = self.form.cadence_days.unwrap_or(7).max(1);
+            if ui
+                .add_enabled(enabled, egui::DragValue::new(&mut days).range(1..=3650))
+                .changed()
+                && enabled
+            {
+                self.form.cadence_days = Some(days.max(1));
+            }
+            ui.label(ctx.t("days"));
+        });
+
+        if enabled {
+            ui.horizontal(|ui| {
+                ui.label(ctx.t("When due:"));
+                ui.radio_value(&mut self.form.cadence_auto, false, ctx.t("Ask me first"));
+                ui.radio_value(
+                    &mut self.form.cadence_auto,
+                    true,
+                    ctx.t("Gather automatically"),
+                );
+            });
+            style::muted_label(
+                ui,
+                ctx.t("Auto-gather looks back far enough to cover the gap since the last run."),
+            );
+        }
+
+        let last = self
+            .form
+            .last_gathered_at
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty());
+        let last_text = match last {
+            Some(value) => value.to_string(),
+            None => ctx.t("never").to_string(),
+        };
+        ui.add_space(4.0);
+        style::muted_label(ui, format!("{}: {last_text}", ctx.t("Last gathered")));
+    }
+
     fn update_request(&self) -> WorkspaceUpdate {
         WorkspaceUpdate {
             name: Some(self.form.name.clone()),
@@ -324,6 +393,8 @@ impl Panel {
             seed_concepts: Some(lines(&self.form.seed_concepts_text)),
             override_queries: Some(lines(&self.form.override_queries_text)),
             lookback_days: Some(self.form.lookback_days.max(1)),
+            cadence_days: Some(self.form.cadence_days),
+            cadence_auto: Some(self.form.cadence_auto),
         }
     }
 }
@@ -338,6 +409,9 @@ fn form_from(ws: &Workspace) -> Form {
         override_queries_text: ws.override_queries.join("\n"),
         lookback_days: ws.lookback_days,
         refined_question: ws.refined_question.clone(),
+        cadence_days: ws.cadence_days,
+        cadence_auto: ws.cadence_auto,
+        last_gathered_at: ws.last_gathered_at.clone(),
     }
 }
 

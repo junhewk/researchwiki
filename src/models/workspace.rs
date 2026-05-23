@@ -18,6 +18,13 @@ pub struct Workspace {
     pub is_active: bool,
     pub created_at: Option<String>,
     pub updated_at: Option<String>,
+    /// Auto-gather cadence in days: `None` = off, `Some(n)` = gather when it has
+    /// been ≥ n days since `last_gathered_at`.
+    pub cadence_days: Option<i32>,
+    /// When due, gather automatically (`true`) or prompt the user first (`false`).
+    pub cadence_auto: bool,
+    /// Timestamp of the last gather for this set; drives the cadence due check.
+    pub last_gathered_at: Option<String>,
 }
 
 /// Canonical research framing for one workspace. This is the object downstream
@@ -149,6 +156,10 @@ pub struct WorkspaceUpdate {
     pub seed_concepts: Option<Vec<String>>,
     pub override_queries: Option<Vec<String>>,
     pub lookback_days: Option<i32>,
+    /// Outer `Option` = include in update; inner `Option<i32>` = the cadence
+    /// (None = off).
+    pub cadence_days: Option<Option<i32>>,
+    pub cadence_auto: Option<bool>,
 }
 
 fn default_lookback_days() -> i32 {

@@ -115,6 +115,8 @@ pub struct PipelineService {
     /// User-Agent is baked into `client` and `polite_ua`.
     contact_email: Option<String>,
     polite_ua: String,
+    /// Semantic Scholar API key (None disables that source).
+    semantic_scholar_api_key: Option<String>,
 }
 
 #[derive(Debug, Default)]
@@ -169,7 +171,11 @@ pub struct SaveCounters {
 }
 
 impl PipelineService {
-    pub fn new(database_path: std::path::PathBuf, contact_email: Option<String>) -> Self {
+    pub fn new(
+        database_path: std::path::PathBuf,
+        contact_email: Option<String>,
+        semantic_scholar_api_key: Option<String>,
+    ) -> Self {
         let polite_ua = polite_pool_ua(contact_email.as_deref());
         let client = Client::builder()
             .user_agent(&polite_ua)
@@ -185,6 +191,9 @@ impl PipelineService {
                 .map(|email| email.trim().to_string())
                 .filter(|email| !email.is_empty()),
             polite_ua,
+            semantic_scholar_api_key: semantic_scholar_api_key
+                .map(|key| key.trim().to_string())
+                .filter(|key| !key.is_empty()),
         }
     }
 
@@ -437,11 +446,14 @@ impl PipelineService {
         let to_str = format!("{}0000", end.format("%Y%m%d"));
         let search_query = format!("{query} AND submittedDate:[{from_str} TO {to_str}]");
 
-        const MAX_ATTEMPTS: usize = 1;
+        // arXiv recommends ≥3s between requests (handled by the limiter) and
+        // returns HTTP 429 on bursts. Retry a few times with a short, interactive
+        // back-off, honoring Retry-After when the server provides it.
+        const MAX_ATTEMPTS: usize = 3;
         const RETRY_DELAYS: [Duration; 3] = [
-            Duration::from_secs(60),
-            Duration::from_secs(180),
-            Duration::from_secs(600),
+            Duration::from_secs(5),
+            Duration::from_secs(15),
+            Duration::from_secs(30),
         ];
 
         for attempt in 1..=MAX_ATTEMPTS {
@@ -461,14 +473,13 @@ impl PipelineService {
             let snippet = body.chars().take(240).collect::<String>();
             let retryable = status == StatusCode::TOO_MANY_REQUESTS || status.is_server_error();
             if retryable && attempt < MAX_ATTEMPTS {
+                let fallback = RETRY_DELAYS[(attempt - 1).min(RETRY_DELAYS.len() - 1)];
                 let delay = if status == StatusCode::TOO_MANY_REQUESTS {
-                    retry_after
-                        .unwrap_or(RETRY_DELAYS[attempt - 1])
-                        .max(RETRY_DELAYS[attempt - 1])
+                    retry_after.unwrap_or(fallback)
                 } else {
-                    RETRY_DELAYS[attempt - 1]
+                    fallback
                 }
-                .min(ARXIV_MAX_RETRY_DELAY);
+                .clamp(ARXIV_MIN_REQUEST_INTERVAL, ARXIV_MAX_RETRY_DELAY);
                 self.defer_arxiv_requests(delay).await;
                 tracing::warn!(
                     "arXiv query '{query}' returned HTTP {}; backing off for {} seconds",
@@ -1181,6 +1192,14 @@ impl PipelineService {
         days_back: i32,
         profile: &WorkspaceResearchContext,
     ) -> Result<Vec<ArticleCandidate>> {
+        // The keyless Semantic Scholar pool is throttled to the point of being
+        // unusable (constant HTTP 429), so the source only runs with an API key.
+        let Some(api_key) = self.semantic_scholar_api_key.clone() else {
+            tracing::info!(
+                "Skipping Semantic Scholar: no API key configured (set one in Settings)."
+            );
+            return Ok(Vec::new());
+        };
         let (start, today) = date_window(days_back);
 
         let mut merged = BTreeMap::<String, ArticleCandidate>::new();
@@ -1188,7 +1207,10 @@ impl PipelineService {
         let queries = free_text_queries(profile, SCHOLARLY_FREE_TEXT_QUERIES);
         for (index, query) in queries.iter().enumerate() {
             pause_between_source_queries(index).await;
-            match self.fetch_semantic_scholar_query(query, start, today).await {
+            match self
+                .fetch_semantic_scholar_query(query, start, today, &api_key)
+                .await
+            {
                 Ok(candidates) => merge_candidates(&mut merged, candidates),
                 Err(error) => {
                     let rate_limited = error.to_string().contains("HTTP 429");
@@ -1209,6 +1231,7 @@ impl PipelineService {
         query: &str,
         start: NaiveDate,
         end: NaiveDate,
+        api_key: &str,
     ) -> Result<Vec<ArticleCandidate>> {
         let params = vec![
             ("query", query.to_string()),
@@ -1228,7 +1251,8 @@ impl PipelineService {
                 &params,
                 "Semantic Scholar",
                 None,
-                1,
+                3,
+                Some(api_key),
             )
             .await?;
         let items = body
@@ -1303,7 +1327,7 @@ impl PipelineService {
         label: &str,
         user_agent: Option<&str>,
     ) -> Result<Value> {
-        self.get_json_with_retry_limit(url, params, label, user_agent, 4)
+        self.get_json_with_retry_limit(url, params, label, user_agent, 4, None)
             .await
     }
 
@@ -1314,6 +1338,7 @@ impl PipelineService {
         label: &str,
         user_agent: Option<&str>,
         max_attempts: usize,
+        api_key: Option<&str>,
     ) -> Result<Value> {
         let mut delay = Duration::from_secs(2);
         let max_attempts = max_attempts.max(1);
@@ -1322,6 +1347,9 @@ impl PipelineService {
             let mut request = self.client.get(url).query(params);
             if let Some(user_agent) = user_agent {
                 request = request.header("User-Agent", user_agent);
+            }
+            if let Some(api_key) = api_key {
+                request = request.header("x-api-key", api_key);
             }
 
             let response = request

@@ -85,12 +85,25 @@ fn initialize_meta_sync(meta_path: &std::path::Path, default_db_filename: &str) 
             lookback_days INTEGER NOT NULL DEFAULT 180,
             is_active INTEGER NOT NULL DEFAULT 0,
             created_at TEXT DEFAULT (datetime('now')),
-            updated_at TEXT DEFAULT (datetime('now'))
+            updated_at TEXT DEFAULT (datetime('now')),
+            cadence_days INTEGER,
+            cadence_auto INTEGER NOT NULL DEFAULT 0,
+            last_gathered_at TEXT
         );
 
         CREATE INDEX IF NOT EXISTS idx_workspaces_slug ON workspaces(slug);
         "#,
     )?;
+
+    // Bring pre-cadence meta databases up to date.
+    ensure_column(&conn, "workspaces", "cadence_days", "INTEGER")?;
+    ensure_column(
+        &conn,
+        "workspaces",
+        "cadence_auto",
+        "INTEGER NOT NULL DEFAULT 0",
+    )?;
+    ensure_column(&conn, "workspaces", "last_gathered_at", "TEXT")?;
 
     conn.execute(
         "INSERT INTO workspaces

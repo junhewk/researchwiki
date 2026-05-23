@@ -74,8 +74,13 @@ impl JobService {
         kg_service: Arc<KnowledgeGraphService>,
         workspace_service: Arc<WorkspaceService>,
         contact_email: Option<String>,
+        semantic_scholar_api_key: Option<String>,
     ) -> Self {
-        let pipeline_service = PipelineService::new(database_path.clone(), contact_email.clone());
+        let pipeline_service = PipelineService::new(
+            database_path.clone(),
+            contact_email.clone(),
+            semantic_scholar_api_key,
+        );
         let screener = ArticleScreener::new(llm_service.clone());
         let fetcher = ContentFetcher::new(http_client.clone(), contact_email);
         let evaluator = ArticleEvaluator::new(llm_service);
@@ -255,6 +260,15 @@ impl JobService {
             queued_job.days_back,
             workspace_id,
         );
+
+        // Reset the per-workspace cadence clock: any gather (manual or auto)
+        // counts as "last gathered now".
+        if workspace_id > 0 {
+            let _ = self
+                .workspace_service
+                .touch_last_gathered(workspace_id)
+                .await;
+        }
 
         Ok(queued_job)
     }

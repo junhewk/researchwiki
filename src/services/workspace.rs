@@ -11,7 +11,8 @@ use crate::{
 
 const WORKSPACE_COLUMNS: &str = "id, name, slug, db_filename, primary_question, gap_note, \
      refined_question, seed_concepts_json, override_queries_json, topic_descriptor, \
-     lookback_days, is_active, created_at, updated_at";
+     lookback_days, is_active, created_at, updated_at, cadence_days, cadence_auto, \
+     last_gathered_at";
 
 /// Registry of workspaces. Lives in a single meta database; each workspace's
 /// actual data lives in its own file under `workspaces_dir/<db_filename>`.
@@ -160,6 +161,12 @@ impl WorkspaceService {
             if let Some(value) = request.lookback_days {
                 current.lookback_days = value.max(1);
             }
+            if let Some(value) = request.cadence_days {
+                current.cadence_days = value.filter(|days| *days >= 1);
+            }
+            if let Some(value) = request.cadence_auto {
+                current.cadence_auto = value;
+            }
 
             let seed_json =
                 serde_json::to_string(&current.seed_concepts).unwrap_or_else(|_| "[]".into());
@@ -170,7 +177,8 @@ impl WorkspaceService {
                 "UPDATE workspaces SET
                     name = ?2, primary_question = ?3, gap_note = ?4, refined_question = ?5,
                     topic_descriptor = ?6, seed_concepts_json = ?7, override_queries_json = ?8,
-                    lookback_days = ?9, updated_at = datetime('now')
+                    lookback_days = ?9, cadence_days = ?10, cadence_auto = ?11,
+                    updated_at = datetime('now')
                  WHERE id = ?1",
                 params![
                     id,
@@ -182,6 +190,8 @@ impl WorkspaceService {
                     seed_json,
                     override_json,
                     current.lookback_days,
+                    current.cadence_days,
+                    current.cadence_auto as i64,
                 ],
             )?;
 
@@ -196,6 +206,21 @@ impl WorkspaceService {
             let conn = crate::db::open_connection(&*meta_path)?;
             conn.execute(
                 "UPDATE workspaces SET is_active = CASE WHEN id = ?1 THEN 1 ELSE 0 END",
+                [id],
+            )?;
+            Ok(())
+        })
+        .await
+    }
+
+    /// Records that a gather just ran for this workspace, resetting the cadence
+    /// clock. Called whenever a gather is enqueued (manual or auto).
+    pub async fn touch_last_gathered(&self, id: i64) -> Result<(), AppError> {
+        let meta_path = self.meta_path.clone();
+        run_blocking_db(move || {
+            let conn = crate::db::open_connection(&*meta_path)?;
+            conn.execute(
+                "UPDATE workspaces SET last_gathered_at = datetime('now') WHERE id = ?1",
                 [id],
             )?;
             Ok(())
@@ -240,6 +265,9 @@ fn map_workspace_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Workspace> {
         is_active: row.get::<_, i64>(11)? != 0,
         created_at: row.get(12)?,
         updated_at: row.get(13)?,
+        cadence_days: row.get(14)?,
+        cadence_auto: row.get::<_, i64>(15)? != 0,
+        last_gathered_at: row.get(16)?,
     })
 }
 

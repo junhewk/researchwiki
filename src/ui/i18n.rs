@@ -117,6 +117,22 @@ pub fn t(language: UiLanguage, text: &'static str) -> &'static str {
         }
         "Create another research set" => "다른 연구 세트 만들기",
 
+        // Gathering schedule (per-research-set cadence)
+        "Gathering schedule" => "수집 일정",
+        "Optionally gather this research set on a cadence. Checked when you open the app and periodically while it's open (the app must be running or in the tray)." => {
+            "이 연구 세트를 주기적으로 수집할 수 있습니다. 앱을 열 때와 실행 중 주기적으로 확인합니다(앱이 실행 중이거나 트레이에 있어야 합니다)."
+        }
+        "Auto-gather every" => "자동 수집 주기",
+        "days" => "일",
+        "When due:" => "시점 동작:",
+        "Ask me first" => "먼저 묻기",
+        "Gather automatically" => "자동으로 수집",
+        "Auto-gather looks back far enough to cover the gap since the last run." => {
+            "자동 수집은 마지막 실행 이후의 공백을 메울 만큼 조회 기간을 잡습니다."
+        }
+        "never" => "없음",
+        "Last gathered" => "마지막 수집",
+
         "Run gather" => "수집 실행",
         "Active runs" => "실행 중인 작업",
         "Run history" => "실행 기록",
@@ -203,6 +219,12 @@ pub fn t(language: UiLanguage, text: &'static str) -> &'static str {
             "학술 API(OpenAlex, Crossref, Unpaywall)에 전송됩니다. Unpaywall에는 필수이며, 비워 두면 건너뜁니다. 적용하려면 다시 시작하세요."
         }
         "Save contact email" => "연락처 이메일 저장",
+        "Semantic Scholar API key" => "Semantic Scholar API 키",
+        "Optional. The Semantic Scholar gather source only runs when a key is set (its keyless tier is rate-limited). Get one free at semanticscholar.org. Restart to apply." => {
+            "선택 사항. Semantic Scholar 수집 소스는 키가 설정된 경우에만 실행됩니다(키 없는 등급은 요청 제한이 있습니다). semanticscholar.org에서 무료로 발급받을 수 있습니다. 적용하려면 다시 시작하세요."
+        }
+        "(leave blank to skip Semantic Scholar)" => "(비워 두면 Semantic Scholar를 건너뜁니다)",
+        "Save key" => "키 저장",
 
         // Close-confirmation modal
         "Close ResearchWiki?" => "ResearchWiki를 닫을까요?",
@@ -212,6 +234,15 @@ pub fn t(language: UiLanguage, text: &'static str) -> &'static str {
         "Don't ask again" => "다시 묻지 않기",
         "Minimize to tray" => "트레이로 최소화",
         "Quit" => "종료",
+
+        // Cadence (auto-gather) prompt
+        "Gather due" => "수집 시점",
+        "This research set is due for a scheduled gather." => {
+            "이 연구 세트의 예약 수집 시점입니다."
+        }
+        "Gather now" => "지금 수집",
+        "Not now" => "나중에",
+        "Gathering…" => "수집 중…",
         "unsaved changes" => "저장되지 않은 변경 사항",
         "Database" => "데이터베이스",
         "Wiki export" => "위키 내보내기",

@@ -94,6 +94,7 @@ fn demo_config_from_env() -> Result<AppConfig> {
         contact_email: std::env::var("RESEARCHWIKI_CONTACT_EMAIL")
             .or_else(|_| std::env::var("UNPAYWALL_EMAIL"))
             .unwrap_or_default(),
+        semantic_scholar_api_key: std::env::var("SEMANTIC_SCHOLAR_API_KEY").unwrap_or_default(),
     })
 }
 

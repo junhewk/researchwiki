@@ -300,7 +300,12 @@ async fn preview_source_candidates(
     let contact_email = std::env::var("RESEARCHWIKI_CONTACT_EMAIL")
         .or_else(|_| std::env::var("UNPAYWALL_EMAIL"))
         .ok();
-    let pipeline = PipelineService::new(workspace_db.to_path_buf(), contact_email);
+    let semantic_scholar_api_key = std::env::var("SEMANTIC_SCHOLAR_API_KEY").ok();
+    let pipeline = PipelineService::new(
+        workspace_db.to_path_buf(),
+        contact_email,
+        semantic_scholar_api_key,
+    );
     let mut total = 0usize;
     let sources = source_filter
         .map(|source| vec![source])
@@ -367,6 +372,7 @@ fn demo_config_from_env() -> Result<AppConfig> {
         contact_email: std::env::var("RESEARCHWIKI_CONTACT_EMAIL")
             .or_else(|_| std::env::var("UNPAYWALL_EMAIL"))
             .unwrap_or_default(),
+        semantic_scholar_api_key: std::env::var("SEMANTIC_SCHOLAR_API_KEY").unwrap_or_default(),
     })
 }
 

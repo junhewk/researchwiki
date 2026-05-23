@@ -22,6 +22,7 @@ async fn main() -> Result<()> {
     let contact_email = std::env::var("RESEARCHWIKI_CONTACT_EMAIL")
         .or_else(|_| std::env::var("UNPAYWALL_EMAIL"))
         .ok();
+    let semantic_scholar_api_key = std::env::var("SEMANTIC_SCHOLAR_API_KEY").ok();
 
     let context = WorkspaceResearchContext {
         name: "Source check".to_string(),
@@ -35,6 +36,7 @@ async fn main() -> Result<()> {
     let pipeline = PipelineService::new(
         std::env::temp_dir().join("researchwiki-source-check.db"),
         contact_email.clone(),
+        semantic_scholar_api_key,
     );
 
     println!(

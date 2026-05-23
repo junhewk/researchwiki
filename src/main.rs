@@ -36,6 +36,9 @@ fn main() -> eframe::Result<()> {
     if let Some(email) = overrides.contact_email {
         config.contact_email = email;
     }
+    if let Some(key) = overrides.semantic_scholar_api_key {
+        config.semantic_scholar_api_key = key;
+    }
     let language = load_ui_language_sync(&config.storage.settings_file);
     // Unknown (legacy) installs that are already configured count as set up, so
     // only genuinely fresh installs see the research-setup step.

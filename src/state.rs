@@ -89,6 +89,7 @@ impl AppState {
             knowledge_graph_service.clone(),
             workspace_service.clone(),
             config.contact_email_opt(),
+            config.semantic_scholar_api_key_opt(),
         ));
         let newsletter_service = std::sync::Arc::new(NewsletterService::new(
             article_service.clone(),

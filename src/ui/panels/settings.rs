@@ -1,6 +1,6 @@
 use crate::{
     config::{EmbeddingConfig, LlmConfig, normalize_api_key},
-    models::settings::{NewsletterSettings, SchedulerSettings, SettingsUpdate, UiLanguage},
+    models::settings::{NewsletterSettings, UiLanguage},
     runtime::UiEvent,
     ui::style,
 };
@@ -9,7 +9,6 @@ use super::{MsgChannel, PanelCtx};
 
 enum Msg {
     Loaded {
-        scheduler: SchedulerSettings,
         newsletter: NewsletterSettings,
         embedding_dimensions: Option<u32>,
         ui_language: UiLanguage,
@@ -25,11 +24,9 @@ pub struct Panel {
     initialized: bool,
     loading: bool,
 
-    scheduler: Option<SchedulerSettings>,
     ui_language: UiLanguage,
-    // Held so scheduler-only saves don't clobber the persisted newsletter
-    // defaults; a future newsletter UI will edit this directly.
-    #[allow(dead_code)]
+    // Loaded so a future newsletter UI can edit it; also drives the initial
+    // "Loading settings…" guard.
     newsletter: Option<NewsletterSettings>,
 
     llm_base_url: String,
@@ -44,6 +41,9 @@ pub struct Panel {
 
     contact_email: String,
     contact_email_dirty: bool,
+
+    semantic_scholar_api_key: String,
+    s2_dirty: bool,
 
     embedding_dim_persisted: Option<u32>,
     embedding_dim_input: String,
@@ -72,7 +72,7 @@ impl Panel {
 
         style::panel_header_icon(ui, style::icon::GEAR, ctx.t("Settings"), None);
 
-        if self.loading && self.scheduler.is_none() {
+        if self.loading && self.newsletter.is_none() {
             ui.label(ctx.t("Loading settings..."));
             return;
         }
@@ -92,10 +92,10 @@ impl Panel {
                 self.section_contact_email(ui, ctx);
                 ui.add_space(8.0);
                 ui.separator();
-                self.section_paths(ui, ctx);
+                self.section_semantic_scholar(ui, ctx);
                 ui.add_space(8.0);
                 ui.separator();
-                self.section_scheduler(ui, ctx);
+                self.section_paths(ui, ctx);
                 ui.add_space(8.0);
                 ui.separator();
                 self.section_embedding(ui, ctx);
@@ -118,12 +118,10 @@ impl Panel {
         while let Ok(msg) = channel.rx.try_recv() {
             match msg {
                 Msg::Loaded {
-                    scheduler,
                     newsletter,
                     embedding_dimensions,
                     ui_language,
                 } => {
-                    self.scheduler = Some(scheduler);
                     self.ui_language = ui_language;
                     self.newsletter = Some(newsletter);
                     self.embedding_dim_persisted = embedding_dimensions;
@@ -143,6 +141,7 @@ impl Panel {
                         "LLM endpoint" => self.llm_dirty = false,
                         "Embedding endpoint" => self.embed_dirty = false,
                         "Contact email" => self.contact_email_dirty = false,
+                        "Semantic Scholar key" => self.s2_dirty = false,
                         _ => {}
                     }
                 }
@@ -163,6 +162,7 @@ impl Panel {
         self.embed_model = cfg.embedding.model.clone();
         self.embed_api_key = cfg.embedding.api_key.clone();
         self.contact_email = cfg.contact_email.clone();
+        self.semantic_scholar_api_key = cfg.semantic_scholar_api_key.clone();
         self.embedding_dim_input = cfg.embedding_dimensions.to_string();
     }
 
@@ -178,7 +178,6 @@ impl Panel {
                 Ok(resp) => {
                     let dim = svc.get_embedding_dimensions().await.ok().flatten();
                     let _ = tx.send(Msg::Loaded {
-                        scheduler: resp.scheduler,
                         newsletter: resp.newsletter,
                         embedding_dimensions: dim,
                         ui_language: resp.ui_language,
@@ -307,6 +306,47 @@ impl Panel {
         });
     }
 
+    fn section_semantic_scholar(&mut self, ui: &mut egui::Ui, ctx: &PanelCtx<'_>) {
+        style::section_heading(ui, ctx.t("Semantic Scholar API key"));
+        style::muted_label(
+            ui,
+            ctx.t(
+                "Optional. The Semantic Scholar gather source only runs when a key is set (its keyless tier is rate-limited). Get one free at semanticscholar.org. Restart to apply.",
+            ),
+        );
+        ui.add_space(4.0);
+
+        egui::Grid::new("settings-s2-grid")
+            .num_columns(2)
+            .spacing([8.0, 6.0])
+            .show(ui, |ui| {
+                ui.label(ctx.t("API key"));
+                if ui
+                    .add(
+                        egui::TextEdit::singleline(&mut self.semantic_scholar_api_key)
+                            .password(true)
+                            .hint_text(ctx.t("(leave blank to skip Semantic Scholar)")),
+                    )
+                    .changed()
+                {
+                    self.s2_dirty = true;
+                }
+                ui.end_row();
+            });
+
+        ui.horizontal(|ui| {
+            if ui
+                .add_enabled(self.s2_dirty, egui::Button::new(ctx.t("Save key")))
+                .clicked()
+            {
+                self.save_semantic_scholar(ctx);
+            }
+            if self.s2_dirty {
+                ui.label(egui::RichText::new(ctx.t("unsaved changes")).italics());
+            }
+        });
+    }
+
     fn section_embedding_endpoint(&mut self, ui: &mut egui::Ui, ctx: &PanelCtx<'_>) {
         style::section_heading(ui, ctx.t("Embedding endpoint"));
         style::muted_label(
@@ -374,59 +414,6 @@ impl Panel {
                 path_row(ui, ctx, "Wiki export", &storage.wiki_export_dir);
                 path_row(ui, ctx, "Settings file", &storage.settings_file);
             });
-    }
-
-    fn section_scheduler(&mut self, ui: &mut egui::Ui, ctx: &PanelCtx<'_>) {
-        style::section_heading(ui, ctx.t("Scheduler"));
-        let Some(sched) = self.scheduler.as_mut() else {
-            ui.label("(unavailable)");
-            return;
-        };
-
-        let mut changed = ui
-            .checkbox(&mut sched.enabled, ctx.t("Enable scheduled gathers"))
-            .changed();
-
-        ui.add_space(4.0);
-        ui.label(ctx.t("Daily schedule (local time, 24h)"));
-        egui::Grid::new("settings-sched-grid")
-            .num_columns(3)
-            .spacing([8.0, 4.0])
-            .show(ui, |ui| {
-                ui.label(ctx.t("Source"));
-                ui.label(ctx.t("Hour"));
-                ui.label(ctx.t("Minute"));
-                ui.end_row();
-
-                changed |= hm_row(
-                    ui,
-                    "arXiv",
-                    &mut sched.arxiv_schedule_hour,
-                    &mut sched.arxiv_schedule_minute,
-                );
-                changed |= hm_row(
-                    ui,
-                    "PMC",
-                    &mut sched.pmc_schedule_hour,
-                    &mut sched.pmc_schedule_minute,
-                );
-                changed |= hm_row(
-                    ui,
-                    "PubMed",
-                    &mut sched.pubmed_schedule_hour,
-                    &mut sched.pubmed_schedule_minute,
-                );
-            });
-
-        ui.add_space(4.0);
-        ui.horizontal(|ui| {
-            if ui.button(ctx.t("Save scheduler")).clicked() {
-                self.save_scheduler(ctx);
-            }
-            if changed {
-                ui.label(egui::RichText::new(ctx.t("unsaved changes")).italics());
-            }
-        });
     }
 
     fn section_embedding(&mut self, ui: &mut egui::Ui, ctx: &PanelCtx<'_>) {
@@ -549,6 +536,25 @@ impl Panel {
         });
     }
 
+    fn save_semantic_scholar(&mut self, ctx: &PanelCtx<'_>) {
+        let Some(channel) = self.channel.as_ref() else {
+            return;
+        };
+        let tx = channel.tx.clone();
+        let key = {
+            let trimmed = self.semantic_scholar_api_key.trim();
+            (!trimmed.is_empty()).then(|| trimmed.to_string())
+        };
+        let svc = ctx.state.settings_service.clone();
+        ctx.handle.spawn(async move {
+            let result = svc.set_semantic_scholar_api_key(key).await;
+            let _ = match result {
+                Ok(()) => tx.send(Msg::Saved("Semantic Scholar key")),
+                Err(err) => tx.send(Msg::SaveError(err.to_string())),
+            };
+        });
+    }
+
     fn save_language(&mut self, ctx: &PanelCtx<'_>, language: UiLanguage) {
         let Some(channel) = self.channel.as_ref() else {
             return;
@@ -583,29 +589,6 @@ impl Panel {
             let result = svc.set_embedding_config(new_embed).await;
             let _ = match result {
                 Ok(()) => tx.send(Msg::Saved("Embedding endpoint")),
-                Err(err) => tx.send(Msg::SaveError(err.to_string())),
-            };
-        });
-    }
-
-    fn save_scheduler(&mut self, ctx: &PanelCtx<'_>) {
-        let Some(channel) = self.channel.as_ref() else {
-            return;
-        };
-        let Some(sched) = self.scheduler.clone() else {
-            return;
-        };
-        let tx = channel.tx.clone();
-        let svc = ctx.state.settings_service.clone();
-        let update = SettingsUpdate {
-            scheduler: Some(sched),
-            newsletter: None,
-            ui_language: None,
-        };
-        ctx.handle.spawn(async move {
-            let result = svc.update_settings(update).await;
-            let _ = match result {
-                Ok(()) => tx.send(Msg::Saved("Scheduler")),
                 Err(err) => tx.send(Msg::SaveError(err.to_string())),
             };
         });
@@ -648,18 +631,6 @@ fn path_row(ui: &mut egui::Ui, ctx: &PanelCtx<'_>, label: &'static str, path: &s
         }
     });
     ui.end_row();
-}
-
-fn hm_row(ui: &mut egui::Ui, label: &str, hour: &mut u8, minute: &mut u8) -> bool {
-    ui.label(label);
-    let h_changed = ui
-        .add(egui::DragValue::new(hour).range(0..=23).speed(0.1))
-        .changed();
-    let m_changed = ui
-        .add(egui::DragValue::new(minute).range(0..=59).speed(0.5))
-        .changed();
-    ui.end_row();
-    h_changed || m_changed
 }
 
 fn open_in_file_manager(path: &std::path::Path) -> std::io::Result<()> {

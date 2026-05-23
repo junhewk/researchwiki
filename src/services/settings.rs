@@ -123,6 +123,20 @@ impl SettingsService {
         Ok(stored.contact_email)
     }
 
+    pub async fn get_semantic_scholar_api_key(&self) -> Result<Option<String>, AppError> {
+        let stored = self.load().await?;
+        Ok(stored.semantic_scholar_api_key)
+    }
+
+    pub async fn set_semantic_scholar_api_key(&self, key: Option<String>) -> Result<(), AppError> {
+        let _guard = self.lock.write().await;
+        let mut stored = self.load().await?;
+        stored.semantic_scholar_api_key = key
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty());
+        self.save(&stored).await
+    }
+
     pub async fn set_setup_complete(&self, complete: bool) -> Result<(), AppError> {
         let _guard = self.lock.write().await;
         let mut stored = self.load().await?;
@@ -210,26 +224,24 @@ pub struct StartupOverrides {
     pub embedding: Option<EmbeddingConfig>,
     pub embedding_dimensions: Option<u32>,
     pub contact_email: Option<String>,
+    pub semantic_scholar_api_key: Option<String>,
 }
 
 /// Sync read of settings.json overrides at startup, before the tokio runtime
 /// exists. Missing/unparseable file → all-`None`; startup uses defaults.
 pub fn load_overrides_sync(settings_file: &Path) -> StartupOverrides {
+    let empty = || StartupOverrides {
+        llm: None,
+        embedding: None,
+        embedding_dimensions: None,
+        contact_email: None,
+        semantic_scholar_api_key: None,
+    };
     let Ok(raw) = std::fs::read_to_string(settings_file) else {
-        return StartupOverrides {
-            llm: None,
-            embedding: None,
-            embedding_dimensions: None,
-            contact_email: None,
-        };
+        return empty();
     };
     let Ok(mut stored) = serde_json::from_str::<StoredSettings>(strip_utf8_bom(&raw)) else {
-        return StartupOverrides {
-            llm: None,
-            embedding: None,
-            embedding_dimensions: None,
-            contact_email: None,
-        };
+        return empty();
     };
     sanitize_stored_settings(&mut stored);
     StartupOverrides {
@@ -237,6 +249,7 @@ pub fn load_overrides_sync(settings_file: &Path) -> StartupOverrides {
         embedding: stored.embedding,
         embedding_dimensions: stored.embedding_dimensions,
         contact_email: stored.contact_email,
+        semantic_scholar_api_key: stored.semantic_scholar_api_key,
     }
 }
 
