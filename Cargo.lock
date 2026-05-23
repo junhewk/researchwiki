@@ -3244,6 +3244,7 @@ dependencies = [
  "egui_graphs",
  "egui_plot",
  "futures",
+ "image",
  "petgraph",
  "quick-xml 0.38.4",
  "raw-window-handle",

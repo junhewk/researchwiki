@@ -92,24 +92,10 @@ mod platform {
         }
     }
 
-    fn icon() -> Result<Icon, tray_icon::BadIcon> {
-        const SIZE: u32 = 32;
-        let mut rgba = Vec::with_capacity((SIZE * SIZE * 4) as usize);
-        for y in 0..SIZE {
-            for x in 0..SIZE {
-                let border = !(4..=27).contains(&x) || !(4..=27).contains(&y);
-                let diagonal = x.abs_diff(y) <= 2 || x + y >= 30 && x + y <= 34;
-                let (r, g, b, a) = if border {
-                    (26, 82, 118, 255)
-                } else if diagonal {
-                    (48, 132, 170, 255)
-                } else {
-                    (240, 248, 252, 255)
-                };
-                rgba.extend_from_slice(&[r, g, b, a]);
-            }
-        }
-        Icon::from_rgba(rgba, SIZE, SIZE)
+    fn icon() -> anyhow::Result<Icon> {
+        let image = image::load_from_memory(include_bytes!("../assets/tray-icon.png"))?.to_rgba8();
+        let (width, height) = image.dimensions();
+        Ok(Icon::from_rgba(image.into_raw(), width, height)?)
     }
 
     // On Windows we nudge the window directly via Win32 because a hidden window

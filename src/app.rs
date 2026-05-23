@@ -37,6 +37,10 @@ struct PersistentUi {
     active_tab: Tab,
     /// Active workspace id; 0 = unset (reconciled against the DB on activate).
     active_workspace_id: i64,
+    /// Remembered answer to the close prompt: `Some(true)` = minimize to tray,
+    /// `Some(false)` = quit, `None` = ask each time.
+    #[serde(default)]
+    close_to_tray: Option<bool>,
 }
 
 const PERSIST_SCHEMA: u32 = 2;
@@ -64,6 +68,12 @@ pub struct DesktopApp {
     /// Whether the guided research-setup step is done. While false (and the app
     /// is activated), the research-setup modal blocks the main UI.
     setup_complete: bool,
+    /// Close-confirmation modal state.
+    close_modal_open: bool,
+    /// Set once the user confirms Quit, so the next close request isn't intercepted.
+    allow_quit: bool,
+    /// "Don't ask again" checkbox state in the close modal.
+    remember_close: bool,
     panels: Panels,
     persistent: PersistentUi,
     status: Option<String>,
@@ -91,6 +101,7 @@ impl DesktopApp {
                 schema_version: PERSIST_SCHEMA,
                 active_tab: Tab::default(),
                 active_workspace_id: 0,
+                close_to_tray: None,
             });
 
         let mut app = Self {
@@ -111,6 +122,9 @@ impl DesktopApp {
             first_run: FirstRunForm::default(),
             research_setup: ResearchSetupForm::default(),
             setup_complete,
+            close_modal_open: false,
+            allow_quit: false,
+            remember_close: false,
             panels: Panels::default(),
             persistent,
             status: None,
@@ -409,14 +423,110 @@ impl DesktopApp {
             );
         }
     }
+
+    /// When the window close button is pressed, either honor a remembered
+    /// choice or pop the confirmation modal. Only intercepts when a tray exists
+    /// to minimize into (otherwise the app just closes).
+    fn handle_close_request(&mut self, ctx: &egui::Context) {
+        if self.allow_quit {
+            return; // Quit already confirmed; let the close proceed.
+        }
+        let close_requested = ctx.input(|input| input.viewport().close_requested());
+        // Only intercept where there's a real tray to minimize into. The
+        // non-Windows/macOS TrayController is a do-nothing stub, so hiding the
+        // window there would strand it with no way back.
+        let real_tray = cfg!(any(target_os = "windows", target_os = "macos"));
+        if !close_requested || self.tray.is_none() || !real_tray {
+            return;
+        }
+        match self.persistent.close_to_tray {
+            Some(true) => {
+                ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+                self.minimize_to_tray(ctx);
+            }
+            Some(false) => {} // Remembered "quit": allow the close to proceed.
+            None => {
+                ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+                self.remember_close = false;
+                self.close_modal_open = true;
+            }
+        }
+    }
+
+    fn minimize_to_tray(&mut self, ctx: &egui::Context) {
+        self.hidden_to_tray = true;
+        ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
+        self.status = Some(
+            i18n::t(
+                self.language,
+                "Minimized to system tray. Scheduler remains active.",
+            )
+            .to_string(),
+        );
+    }
+
+    fn show_close_modal(&mut self, ctx: &egui::Context) {
+        let lang = self.language;
+        let mut minimize = false;
+        let mut quit = false;
+        let mut cancel = false;
+
+        egui::Modal::new(egui::Id::new("close_confirm_modal")).show(ctx, |ui| {
+            ui.set_width(360.0);
+            style::section_heading(ui, i18n::t(lang, "Close ResearchWiki?"));
+            style::body_label(
+                ui,
+                i18n::t(
+                    lang,
+                    "Keep it running in the background (system tray), or quit completely?",
+                ),
+            );
+            ui.add_space(8.0);
+            ui.checkbox(&mut self.remember_close, i18n::t(lang, "Don't ask again"));
+            ui.add_space(10.0);
+            ui.horizontal(|ui| {
+                if style::primary_button(ui, i18n::t(lang, "Minimize to tray")).clicked() {
+                    minimize = true;
+                }
+                if style::danger_button(ui, i18n::t(lang, "Quit")).clicked() {
+                    quit = true;
+                }
+                if style::ghost_button(ui, i18n::t(lang, "Cancel")).clicked() {
+                    cancel = true;
+                }
+            });
+        });
+
+        if minimize {
+            if self.remember_close {
+                self.persistent.close_to_tray = Some(true);
+            }
+            self.close_modal_open = false;
+            self.minimize_to_tray(ctx);
+        } else if quit {
+            if self.remember_close {
+                self.persistent.close_to_tray = Some(false);
+            }
+            self.close_modal_open = false;
+            self.allow_quit = true;
+            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+        } else if cancel {
+            self.close_modal_open = false;
+        }
+    }
 }
 
 impl eframe::App for DesktopApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.ensure_tray(ctx);
         self.handle_tray(ctx);
+        self.handle_close_request(ctx);
         self.hide_to_tray_if_minimized(ctx);
         self.drain_events();
+
+        if self.close_modal_open {
+            self.show_close_modal(ctx);
+        }
 
         if self.state.is_none() {
             if let FirstRunOutcome::Submitted {

@@ -5,6 +5,16 @@ edition = "2024"
 description = "Native desktop app for gathering academic articles and building a knowledge-graph wiki"
 license = "MIT"
 
+# `cargo install cargo-bundle` then `cargo bundle --release` produces a native
+# bundle (e.g. macOS .app) that launches without a terminal and carries the
+# app icon. cargo-bundle generates the platform icon (.icns/.ico) from the PNG.
+[package.metadata.bundle]
+name = "ResearchWiki"
+identifier = "com.researchwiki.app"
+icon = ["assets/app-icon.png"]
+category = "public.app-category.productivity"
+short_description = "Gather academic articles and build a knowledge-graph wiki."
+
 [dependencies]
 anyhow = "1.0.100"
 chrono = { version = "0.4.42", features = ["serde"] }
@@ -40,6 +50,7 @@ egui_graphs = "0.27"
 egui_commonmark = "0.21"
 petgraph = { version = "0.8", default-features = false, features = ["stable_graph"] }
 egui-phosphor = "0.10"
+image = { version = "0.25.10", default-features = false, features = ["png"] }
 
 # Tray icon works on both Windows and macOS (tray-icon links system frameworks
 # natively — no pkg-config). Linux is excluded (its tray needs GTK/appindicator).

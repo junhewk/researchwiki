@@ -194,6 +194,15 @@ pub fn t(language: UiLanguage, text: &'static str) -> &'static str {
             "학술 API(OpenAlex, Crossref, Unpaywall)에 전송됩니다. Unpaywall에는 필수이며, 비워 두면 건너뜁니다. 적용하려면 다시 시작하세요."
         }
         "Save contact email" => "연락처 이메일 저장",
+
+        // Close-confirmation modal
+        "Close ResearchWiki?" => "ResearchWiki를 닫을까요?",
+        "Keep it running in the background (system tray), or quit completely?" => {
+            "백그라운드(시스템 트레이)에서 계속 실행할까요, 아니면 완전히 종료할까요?"
+        }
+        "Don't ask again" => "다시 묻지 않기",
+        "Minimize to tray" => "트레이로 최소화",
+        "Quit" => "종료",
         "unsaved changes" => "저장되지 않은 변경 사항",
         "Database" => "데이터베이스",
         "Wiki export" => "위키 내보내기",

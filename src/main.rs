@@ -1,3 +1,8 @@
+// Hide the Windows console window in release builds (keep it in debug for logs).
+// On macOS the terminal only appears when running the bare binary; a bundled
+// .app (see `cargo bundle`) launches with no terminal.
+#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+
 use researchwiki::{
     app::{DesktopApp, bootstrap_db, first_launch_seed},
     config::AppConfig,
@@ -42,12 +47,17 @@ fn main() -> eframe::Result<()> {
         .block_on(bootstrap_db(&config))
         .expect("database initialization failed");
 
+    let mut viewport = egui::ViewportBuilder::default()
+        .with_title("ResearchWiki")
+        .with_inner_size([1100.0, 720.0])
+        .with_min_inner_size([720.0, 480.0]);
+    if let Some(icon) = load_window_icon() {
+        viewport = viewport.with_icon(icon);
+    }
+
     let native_options = eframe::NativeOptions {
         persist_window: true,
-        viewport: egui::ViewportBuilder::default()
-            .with_title("ResearchWiki")
-            .with_inner_size([1100.0, 720.0])
-            .with_min_inner_size([720.0, 480.0]),
+        viewport,
         ..Default::default()
     };
 
@@ -64,4 +74,18 @@ fn main() -> eframe::Result<()> {
             )))
         }),
     )
+}
+
+/// Decodes the embedded app icon into an eframe `IconData` for the window /
+/// taskbar. Returns `None` if the asset can't be decoded (the app still runs).
+fn load_window_icon() -> Option<egui::IconData> {
+    let image = image::load_from_memory(include_bytes!("../assets/app-icon.png"))
+        .ok()?
+        .to_rgba8();
+    let (width, height) = image.dimensions();
+    Some(egui::IconData {
+        rgba: image.into_raw(),
+        width,
+        height,
+    })
 }
