@@ -58,13 +58,21 @@ pub struct FetchedContent {
 #[derive(Clone)]
 pub struct ContentFetcher {
     client: Client,
+    /// Contact email for Unpaywall OA lookups. `None` disables that strategy so
+    /// we never send a placeholder address.
+    contact_email: Option<String>,
 }
 
 type FetchStrategy = (&'static str, fn(&ArticleCandidate) -> bool);
 
 impl ContentFetcher {
-    pub fn new(client: Client) -> Self {
-        Self { client }
+    pub fn new(client: Client, contact_email: Option<String>) -> Self {
+        Self {
+            client,
+            contact_email: contact_email
+                .map(|email| email.trim().to_string())
+                .filter(|email| !email.is_empty()),
+        }
     }
 
     pub async fn fetch(&self, candidate: &ArticleCandidate) -> Option<FetchedContent> {
@@ -255,14 +263,15 @@ impl ContentFetcher {
         let Some(doi) = candidate.doi.as_deref() else {
             return Ok(None);
         };
-        let email =
-            env::var("UNPAYWALL_EMAIL").unwrap_or_else(|_| "junhewk.kim@gmail.com".to_string());
+        let Some(email) = self.contact_email.as_deref() else {
+            return Ok(None);
+        };
         let url = format!("https://api.unpaywall.org/v2/{doi}");
 
         let response = self
             .client
             .get(&url)
-            .query(&[("email", email.as_str())])
+            .query(&[("email", email)])
             .send()
             .await
             .map_err(|error| AppError::Internal(format!("unpaywall lookup failed: {error}")))?;

@@ -412,7 +412,35 @@ fn initialize_sync(database_path: &std::path::Path, embedding_dimensions: u32) -
     )?;
 
     seed_default_workspace_and_backfill(&conn)?;
+    apply_schema_migrations(&conn)?;
 
+    Ok(())
+}
+
+/// The schema version this build expects. The `CREATE TABLE IF NOT EXISTS` and
+/// `ensure_column` blocks in `initialize_sync` bring any database — fresh or
+/// from a pre-versioning build — up to v1. Future *structural* changes that
+/// can't be expressed idempotently get their own ordered arm below and bump
+/// this constant.
+const CURRENT_SCHEMA_VERSION: i64 = 1;
+
+/// Advances `PRAGMA user_version` to [`CURRENT_SCHEMA_VERSION`], running any
+/// ordered migrations in between. v1 is the baseline established by the
+/// idempotent schema setup above, so it has no extra work.
+fn apply_schema_migrations(conn: &Connection) -> Result<()> {
+    let mut version: i64 = conn.query_row("PRAGMA user_version", [], |row| row.get(0))?;
+    while version < CURRENT_SCHEMA_VERSION {
+        let next = version + 1;
+        match next {
+            // Baseline: the schema is already in place from initialize_sync.
+            1 => {}
+            other => anyhow::bail!("no migration defined for schema version {other}"),
+        }
+        version = next;
+    }
+    // user_version takes a literal integer (no bind parameters); the value is
+    // ours, not user input.
+    conn.execute_batch(&format!("PRAGMA user_version = {CURRENT_SCHEMA_VERSION};"))?;
     Ok(())
 }
 

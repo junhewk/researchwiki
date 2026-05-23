@@ -11,6 +11,10 @@ pub struct AppConfig {
     pub llm: LlmConfig,
     pub embedding: EmbeddingConfig,
     pub embedding_dimensions: u32,
+    /// Contact email sent to polite-pool APIs (OpenAlex/Crossref) and Unpaywall.
+    /// Empty when the user has not provided one — callers must then omit it
+    /// rather than impersonate anyone.
+    pub contact_email: String,
 }
 
 #[derive(Clone, Debug)]
@@ -117,6 +121,7 @@ impl AppConfig {
             llm: LlmConfig::default(),
             embedding: EmbeddingConfig::default(),
             embedding_dimensions: 1536,
+            contact_email: String::new(),
         })
     }
 
@@ -180,13 +185,60 @@ impl AppConfig {
             .and_then(|value| value.parse().ok())
             .unwrap_or(base.embedding_dimensions);
 
+        // RESEARCHWIKI_CONTACT_EMAIL is preferred; UNPAYWALL_EMAIL stays as a
+        // legacy fallback so existing setups keep working.
+        let contact_email = env::var("RESEARCHWIKI_CONTACT_EMAIL")
+            .or_else(|_| env::var("UNPAYWALL_EMAIL"))
+            .map(|value| value.trim().to_string())
+            .unwrap_or(base.contact_email);
+
         Ok(Self {
             storage,
             llm,
             embedding,
             embedding_dimensions,
+            contact_email,
         })
     }
+
+    /// The contact email as `Some` only when non-empty, so callers can cleanly
+    /// skip features that require one (e.g. Unpaywall) instead of sending a
+    /// placeholder address.
+    pub fn contact_email_opt(&self) -> Option<String> {
+        let trimmed = self.contact_email.trim();
+        (!trimmed.is_empty()).then(|| trimmed.to_string())
+    }
+
+    /// First configuration problem that would stop the app from working, or
+    /// `None` when the LLM + embedding endpoints are usable. Drives the startup
+    /// decision between the setup wizard and the main UI, so an endpoint that is
+    /// present but malformed routes to setup instead of failing mid-job.
+    pub fn validation_error(&self) -> Option<String> {
+        validate_endpoint("LLM", &self.llm.base_url, &self.llm.model).or_else(|| {
+            validate_endpoint("Embedding", &self.embedding.base_url, &self.embedding.model)
+        })
+    }
+
+    /// Whether the LLM + embedding configuration is complete and well-formed.
+    pub fn is_ready(&self) -> bool {
+        self.validation_error().is_none()
+    }
+}
+
+fn validate_endpoint(label: &str, base_url: &str, model: &str) -> Option<String> {
+    let base_url = base_url.trim();
+    if base_url.is_empty() {
+        return Some(format!("{label} endpoint URL is not set."));
+    }
+    if !(base_url.starts_with("http://") || base_url.starts_with("https://")) {
+        return Some(format!(
+            "{label} endpoint URL must start with http:// or https://."
+        ));
+    }
+    if model.trim().is_empty() {
+        return Some(format!("{label} model name is not set."));
+    }
+    None
 }
 
 pub fn normalize_api_key(value: impl AsRef<str>) -> String {

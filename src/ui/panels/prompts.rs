@@ -75,8 +75,9 @@ impl Panel {
             }
         }
 
-        style::panel_header(
+        style::panel_header_icon(
             ui,
+            style::icon::CHAT_TEXT,
             ctx.t("Prompts"),
             Some(ctx.t("Edit prompt templates (YAML). Saving creates a new version.")),
         );

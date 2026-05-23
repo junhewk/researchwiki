@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use chrono::{FixedOffset, NaiveDate, Timelike, Utc};
+use chrono::{Local, NaiveDate, Timelike};
 use tokio::sync::watch;
 use tracing::{info, warn};
 
@@ -14,7 +14,7 @@ const TICK_INTERVAL: std::time::Duration = std::time::Duration::from_secs(30);
 /// Runs the scheduler tick loop until `shutdown_rx` fires.
 ///
 /// Checks every 30 seconds whether a scheduled job should fire based on
-/// the current KST time and the configured schedule in settings.json.
+/// the current local time and the configured schedule in settings.json.
 pub async fn run_scheduler_loop(
     job_service: Arc<JobService>,
     settings_service: Arc<SettingsService>,
@@ -24,7 +24,6 @@ pub async fn run_scheduler_loop(
     info!("scheduler loop started");
 
     let mut last_fired: HashMap<&str, (NaiveDate, u8, u8)> = HashMap::new();
-    let kst = FixedOffset::east_opt(9 * 3600).expect("valid KST offset");
 
     let mut interval = tokio::time::interval(TICK_INTERVAL);
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -50,10 +49,10 @@ pub async fn run_scheduler_loop(
             continue;
         }
 
-        let now_kst = Utc::now().with_timezone(&kst);
-        let today_kst = now_kst.date_naive();
-        let current_hour = now_kst.hour() as u8;
-        let current_minute = now_kst.minute() as u8;
+        let now_local = Local::now();
+        let today_local = now_local.date_naive();
+        let current_hour = now_local.hour() as u8;
+        let current_minute = now_local.minute() as u8;
 
         for (source, job_id) in [
             ("arxiv", "arxiv_daily"),
@@ -66,14 +65,14 @@ pub async fn run_scheduler_loop(
                 continue;
             }
 
-            if last_fired.get(source) == Some(&(today_kst, sched_hour, sched_minute)) {
+            if last_fired.get(source) == Some(&(today_local, sched_hour, sched_minute)) {
                 continue;
             }
 
             info!(
                 job_id,
                 source,
-                time_kst = %now_kst.format("%Y-%m-%d %H:%M:%S KST"),
+                time_local = %now_local.format("%Y-%m-%d %H:%M:%S %Z"),
                 "scheduler: triggering scheduled job"
             );
 
@@ -94,11 +93,11 @@ pub async fn run_scheduler_loop(
                 }
             }
 
-            last_fired.insert(source, (today_kst, sched_hour, sched_minute));
+            last_fired.insert(source, (today_local, sched_hour, sched_minute));
         }
 
         // Prune stale entries.
-        last_fired.retain(|_, (date, _, _)| *date >= today_kst);
+        last_fired.retain(|_, (date, _, _)| *date >= today_local);
     }
 
     info!("scheduler loop exited");

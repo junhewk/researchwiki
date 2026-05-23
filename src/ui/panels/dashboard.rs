@@ -53,38 +53,63 @@ impl Panel {
             self.refresh(ctx, active);
         }
 
+        style::panel_header_icon(ui, style::icon::GAUGE, ctx.t("Dashboard"), None);
         ui.horizontal(|ui| {
-            ui.heading(ctx.t("Dashboard"));
-            if ui.button(ctx.t("Refresh")).clicked() {
+            if ui
+                .add_enabled(!self.loading, egui::Button::new(ctx.t("Refresh")))
+                .clicked()
+            {
                 self.refresh(ctx, active);
             }
             if self.loading {
                 ui.spinner();
             }
         });
-        ui.add_space(6.0);
-        ui.separator();
         ui.add_space(8.0);
 
         if let Some(err) = &self.error {
             ui.colored_label(egui::Color32::RED, err);
         }
 
+        // Friendly first-run state instead of a wall of zeros.
+        let is_empty = self
+            .stats
+            .as_ref()
+            .map(|s| s.total_articles == 0)
+            .unwrap_or(true);
+        if is_empty && !self.loading {
+            ui.add_space(12.0);
+            style::section_heading(ui, ctx.t("Welcome to ResearchWiki"));
+            style::body_label(
+                ui,
+                ctx.t(
+                    "No articles yet. Open Input Set to describe your research, then run a gather to start building your wiki.",
+                ),
+            );
+            return;
+        }
+
         if let Some(stats) = &self.stats {
             ui.horizontal(|ui| {
-                tile(ui, "Total articles", stats.total_articles);
-                tile(ui, "This week", stats.this_week);
-                tile(ui, "Tier 1", stats.tier1_count);
-                tile(ui, "Pending review", stats.pending_review);
+                style::metric_tile(
+                    ui,
+                    ctx.t("Total articles"),
+                    &stats.total_articles.to_string(),
+                );
+                style::metric_tile(ui, ctx.t("This week"), &stats.this_week.to_string());
+                style::metric_tile(ui, ctx.t("Tier 1"), &stats.tier1_count.to_string());
+                style::metric_tile(
+                    ui,
+                    ctx.t("Pending review"),
+                    &stats.pending_review.to_string(),
+                );
             });
         }
 
         ui.add_space(10.0);
 
         if let Some(daily) = &self.daily {
-            ui.label(
-                egui::RichText::new(format!("Articles per day (last {CHART_DAYS} days)")).strong(),
-            );
+            ui.label(egui::RichText::new(ctx.t("Articles per day (last 30 days)")).strong());
             let bars: Vec<Bar> = daily
                 .days
                 .iter()
@@ -140,13 +165,4 @@ impl Panel {
             };
         });
     }
-}
-
-fn tile(ui: &mut egui::Ui, label: &str, value: i64) {
-    egui::Frame::group(ui.style()).show(ui, |ui| {
-        ui.vertical(|ui| {
-            ui.label(egui::RichText::new(value.to_string()).heading());
-            ui.label(egui::RichText::new(label).weak());
-        });
-    });
 }

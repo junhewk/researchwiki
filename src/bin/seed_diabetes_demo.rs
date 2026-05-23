@@ -91,6 +91,9 @@ fn demo_config_from_env() -> Result<AppConfig> {
             .ok()
             .and_then(|value| value.parse().ok())
             .unwrap_or(1536),
+        contact_email: std::env::var("RESEARCHWIKI_CONTACT_EMAIL")
+            .or_else(|_| std::env::var("UNPAYWALL_EMAIL"))
+            .unwrap_or_default(),
     })
 }
 

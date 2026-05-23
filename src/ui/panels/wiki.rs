@@ -64,7 +64,7 @@ impl Panel {
         }
         self.poll_compile(ui, ctx);
 
-        style::panel_header(ui, ctx.t("Wiki"), None);
+        style::panel_header_icon(ui, style::icon::BOOK_OPEN, ctx.t("Wiki"), None);
 
         self.show_controls(ui, ctx);
         ui.add_space(8.0);

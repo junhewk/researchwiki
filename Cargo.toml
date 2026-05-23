@@ -39,10 +39,15 @@ zerocopy = { version = "0.8", features = ["derive"] }
 egui_graphs = "0.27"
 egui_commonmark = "0.21"
 petgraph = { version = "0.8", default-features = false, features = ["stable_graph"] }
+egui-phosphor = "0.10"
 
-[target.'cfg(target_os = "windows")'.dependencies]
+# Tray icon works on both Windows and macOS (tray-icon links system frameworks
+# natively — no pkg-config). Linux is excluded (its tray needs GTK/appindicator).
+[target.'cfg(any(target_os = "windows", target_os = "macos"))'.dependencies]
 raw-window-handle = "0.6"
 tray-icon = { version = "0.23.1", default-features = false }
+
+[target.'cfg(target_os = "windows")'.dependencies]
 windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_UI_WindowsAndMessaging"] }
 
 [profile.release]

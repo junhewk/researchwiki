@@ -54,8 +54,9 @@ impl Panel {
             self.load(ctx, active);
         }
 
-        style::panel_header(
+        style::panel_header_icon(
             ui,
+            style::icon::BRIDGE,
             ctx.t("Gap Bridge"),
             Some(ctx.t("From the broad primary question to the refined, next research question.")),
         );

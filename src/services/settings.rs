@@ -118,6 +118,27 @@ impl SettingsService {
         Ok(stored.embedding_dimensions)
     }
 
+    pub async fn get_contact_email(&self) -> Result<Option<String>, AppError> {
+        let stored = self.load().await?;
+        Ok(stored.contact_email)
+    }
+
+    pub async fn set_setup_complete(&self, complete: bool) -> Result<(), AppError> {
+        let _guard = self.lock.write().await;
+        let mut stored = self.load().await?;
+        stored.setup_complete = Some(complete);
+        self.save(&stored).await
+    }
+
+    pub async fn set_contact_email(&self, email: Option<String>) -> Result<(), AppError> {
+        let _guard = self.lock.write().await;
+        let mut stored = self.load().await?;
+        stored.contact_email = email
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty());
+        self.save(&stored).await
+    }
+
     pub async fn set_embedding_dimensions(&self, dim: u32) -> Result<(), AppError> {
         let _guard = self.lock.write().await;
         let mut stored = self.load().await?;
@@ -157,23 +178,66 @@ impl SettingsService {
         let raw = serde_json::to_string_pretty(stored)
             .map_err(|error| AppError::Internal(error.to_string()))?;
         tokio::fs::write(&self.settings_file, raw.as_bytes()).await?;
+        // settings.json holds API keys; restrict it to the owner on Unix.
+        // Windows relies on the per-user %APPDATA% location for access control.
+        restrict_permissions(&self.settings_file).await;
         Ok(())
     }
 }
 
+/// Best-effort `chmod 0600` so the API keys in settings.json aren't world- or
+/// group-readable. No-op on non-Unix (Windows has no equivalent mode bits).
+async fn restrict_permissions(path: &Path) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if let Ok(metadata) = tokio::fs::metadata(path).await {
+            let mut perms = metadata.permissions();
+            perms.set_mode(0o600);
+            let _ = tokio::fs::set_permissions(path, perms).await;
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = path;
+    }
+}
+
+/// Persisted startup overrides read synchronously before the tokio runtime
+/// exists. Missing/unparseable file → all-`None`; startup uses defaults.
+pub struct StartupOverrides {
+    pub llm: Option<LlmConfig>,
+    pub embedding: Option<EmbeddingConfig>,
+    pub embedding_dimensions: Option<u32>,
+    pub contact_email: Option<String>,
+}
+
 /// Sync read of settings.json overrides at startup, before the tokio runtime
 /// exists. Missing/unparseable file → all-`None`; startup uses defaults.
-pub fn load_overrides_sync(
-    settings_file: &Path,
-) -> (Option<LlmConfig>, Option<EmbeddingConfig>, Option<u32>) {
+pub fn load_overrides_sync(settings_file: &Path) -> StartupOverrides {
     let Ok(raw) = std::fs::read_to_string(settings_file) else {
-        return (None, None, None);
+        return StartupOverrides {
+            llm: None,
+            embedding: None,
+            embedding_dimensions: None,
+            contact_email: None,
+        };
     };
     let Ok(mut stored) = serde_json::from_str::<StoredSettings>(strip_utf8_bom(&raw)) else {
-        return (None, None, None);
+        return StartupOverrides {
+            llm: None,
+            embedding: None,
+            embedding_dimensions: None,
+            contact_email: None,
+        };
     };
     sanitize_stored_settings(&mut stored);
-    (stored.llm, stored.embedding, stored.embedding_dimensions)
+    StartupOverrides {
+        llm: stored.llm,
+        embedding: stored.embedding,
+        embedding_dimensions: stored.embedding_dimensions,
+        contact_email: stored.contact_email,
+    }
 }
 
 pub fn load_ui_language_sync(settings_file: &Path) -> UiLanguage {
@@ -185,6 +249,14 @@ pub fn load_ui_language_sync(settings_file: &Path) -> UiLanguage {
     };
     sanitize_stored_settings(&mut stored);
     stored.ui_language
+}
+
+/// Raw persisted `setup_complete` flag read synchronously at startup. `None`
+/// means the file is missing/unreadable or predates the field.
+pub fn load_setup_complete_sync(settings_file: &Path) -> Option<bool> {
+    let raw = std::fs::read_to_string(settings_file).ok()?;
+    let stored = serde_json::from_str::<StoredSettings>(strip_utf8_bom(&raw)).ok()?;
+    stored.setup_complete
 }
 
 fn strip_utf8_bom(raw: &str) -> &str {

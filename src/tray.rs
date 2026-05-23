@@ -4,7 +4,7 @@ pub enum TrayCommand {
     Quit,
 }
 
-#[cfg(target_os = "windows")]
+#[cfg(any(target_os = "windows", target_os = "macos"))]
 mod platform {
     use std::sync::mpsc;
 
@@ -33,10 +33,13 @@ mod platform {
             let quit = MenuItem::with_id(QUIT_ID, "Quit", true, None);
             menu.append_items(&[&open, &separator, &quit])?;
 
+            // macOS menu-bar convention: a left click opens the menu. On Windows
+            // we keep the menu on right-click and restore on left double-click.
+            let menu_on_left_click = cfg!(target_os = "macos");
             let tray = TrayIconBuilder::new()
                 .with_tooltip("ResearchWiki - scheduler active")
                 .with_menu(Box::new(menu.clone()))
-                .with_menu_on_left_click(false)
+                .with_menu_on_left_click(menu_on_left_click)
                 .with_icon(icon()?)
                 .build()?;
 
@@ -109,46 +112,66 @@ mod platform {
         Icon::from_rgba(rgba, SIZE, SIZE)
     }
 
+    // On Windows we nudge the window directly via Win32 because a hidden window
+    // may not process queued egui ViewportCommands until forced. On macOS the
+    // window show/hide is driven entirely by app.rs's ViewportCommand path
+    // (TrayCommand::Show → restore_from_tray), so these are no-ops there.
     fn restore_window(window_handle: Option<isize>) {
-        let Some(hwnd) = window_handle else {
-            return;
-        };
-
-        unsafe {
-            use windows_sys::Win32::UI::WindowsAndMessaging::{
-                BringWindowToTop, IsWindow, SW_RESTORE, SetForegroundWindow, ShowWindow,
-                ShowWindowAsync,
+        #[cfg(target_os = "windows")]
+        {
+            let Some(hwnd) = window_handle else {
+                return;
             };
 
-            let hwnd = hwnd as windows_sys::Win32::Foundation::HWND;
-            if IsWindow(hwnd) == 0 {
-                return;
-            }
+            unsafe {
+                use windows_sys::Win32::UI::WindowsAndMessaging::{
+                    BringWindowToTop, IsWindow, SW_RESTORE, SetForegroundWindow, ShowWindow,
+                    ShowWindowAsync,
+                };
 
-            ShowWindowAsync(hwnd, SW_RESTORE);
-            ShowWindow(hwnd, SW_RESTORE);
-            BringWindowToTop(hwnd);
-            SetForegroundWindow(hwnd);
+                let hwnd = hwnd as windows_sys::Win32::Foundation::HWND;
+                if IsWindow(hwnd) == 0 {
+                    return;
+                }
+
+                ShowWindowAsync(hwnd, SW_RESTORE);
+                ShowWindow(hwnd, SW_RESTORE);
+                BringWindowToTop(hwnd);
+                SetForegroundWindow(hwnd);
+            }
+        }
+        #[cfg(not(target_os = "windows"))]
+        {
+            let _ = window_handle;
         }
     }
 
     fn close_window(window_handle: Option<isize>) {
-        let Some(hwnd) = window_handle else {
-            return;
-        };
+        #[cfg(target_os = "windows")]
+        {
+            let Some(hwnd) = window_handle else {
+                return;
+            };
 
-        unsafe {
-            use windows_sys::Win32::UI::WindowsAndMessaging::{IsWindow, PostMessageW, WM_CLOSE};
+            unsafe {
+                use windows_sys::Win32::UI::WindowsAndMessaging::{
+                    IsWindow, PostMessageW, WM_CLOSE,
+                };
 
-            let hwnd = hwnd as windows_sys::Win32::Foundation::HWND;
-            if IsWindow(hwnd) != 0 {
-                PostMessageW(hwnd, WM_CLOSE, 0, 0);
+                let hwnd = hwnd as windows_sys::Win32::Foundation::HWND;
+                if IsWindow(hwnd) != 0 {
+                    PostMessageW(hwnd, WM_CLOSE, 0, 0);
+                }
             }
+        }
+        #[cfg(not(target_os = "windows"))]
+        {
+            let _ = window_handle;
         }
     }
 }
 
-#[cfg(not(target_os = "windows"))]
+#[cfg(not(any(target_os = "windows", target_os = "macos")))]
 mod platform {
     use super::TrayCommand;
 

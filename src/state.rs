@@ -88,6 +88,7 @@ impl AppState {
             library_service.clone(),
             knowledge_graph_service.clone(),
             workspace_service.clone(),
+            config.contact_email_opt(),
         ));
         let newsletter_service = std::sync::Arc::new(NewsletterService::new(
             article_service.clone(),

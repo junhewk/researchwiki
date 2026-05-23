@@ -32,9 +32,19 @@ const CROSSREF_SEARCH_URL: &str = "https://api.crossref.org/works";
 const UNPAYWALL_SEARCH_URL: &str = "https://api.unpaywall.org/v2/search";
 const SEMANTIC_SCHOLAR_SEARCH_URL: &str = "https://api.semanticscholar.org/graph/v1/paper/search";
 const CLINICAL_TRIALS_SEARCH_URL: &str = "https://clinicaltrials.gov/api/v2/studies";
-const POLITE_POOL_UA: &str = "articlegatherer-rust-backend/0.1 (mailto:junhewk.kim@gmail.com)";
-const DEFAULT_CONTACT_EMAIL: &str = "junhewk.kim@gmail.com";
+const BASE_USER_AGENT: &str = concat!("researchwiki/", env!("CARGO_PKG_VERSION"));
 const DEFAULT_SOURCE_QUERY_LIMIT: i32 = 50;
+
+/// Polite-pool User-Agent. Includes a `mailto:` only when the user has provided
+/// a contact email, so we never advertise an address we don't own.
+fn polite_pool_ua(contact_email: Option<&str>) -> String {
+    match contact_email {
+        Some(email) if !email.trim().is_empty() => {
+            format!("{BASE_USER_AGENT} (mailto:{})", email.trim())
+        }
+        _ => BASE_USER_AGENT.to_string(),
+    }
+}
 
 const ARXIV_QUERIES: &[&str] = &[
     r#"(all:"artificial intelligence" OR all:"machine learning" OR all:"large language model") AND (all:clinical OR all:healthcare OR all:medical OR all:medicine) AND (all:ethics OR all:bias OR all:fairness OR all:privacy OR all:governance)"#,
@@ -101,6 +111,10 @@ pub struct PipelineService {
     database_path: Arc<std::path::PathBuf>,
     client: Client,
     arxiv_limiter: Arc<Mutex<ArxivRequestLimiter>>,
+    /// Contact email for Unpaywall (None disables that source). The polite-pool
+    /// User-Agent is baked into `client` and `polite_ua`.
+    contact_email: Option<String>,
+    polite_ua: String,
 }
 
 #[derive(Debug, Default)]
@@ -155,9 +169,10 @@ pub struct SaveCounters {
 }
 
 impl PipelineService {
-    pub fn new(database_path: std::path::PathBuf) -> Self {
+    pub fn new(database_path: std::path::PathBuf, contact_email: Option<String>) -> Self {
+        let polite_ua = polite_pool_ua(contact_email.as_deref());
         let client = Client::builder()
-            .user_agent(POLITE_POOL_UA)
+            .user_agent(&polite_ua)
             .timeout(std::time::Duration::from_secs(60))
             .build()
             .expect("reqwest client should build");
@@ -166,6 +181,10 @@ impl PipelineService {
             database_path: Arc::new(database_path),
             client,
             arxiv_limiter: Arc::new(Mutex::new(ArxivRequestLimiter::default())),
+            contact_email: contact_email
+                .map(|email| email.trim().to_string())
+                .filter(|email| !email.is_empty()),
+            polite_ua,
         }
     }
 
@@ -1028,7 +1047,7 @@ impl PipelineService {
                 OPENALEX_SEARCH_URL,
                 &params,
                 "OpenAlex",
-                Some(POLITE_POOL_UA),
+                Some(self.polite_ua.as_str()),
             )
             .await?;
         let results = body
@@ -1088,7 +1107,7 @@ impl PipelineService {
                 CROSSREF_SEARCH_URL,
                 &params,
                 "Crossref",
-                Some(POLITE_POOL_UA),
+                Some(self.polite_ua.as_str()),
             )
             .await?;
         let items = body
@@ -1106,13 +1125,19 @@ impl PipelineService {
         days_back: i32,
         profile: &WorkspaceResearchContext,
     ) -> Result<Vec<ArticleCandidate>> {
+        let Some(email) = self.contact_email.clone() else {
+            tracing::warn!(
+                "Skipping Unpaywall source: no contact email configured (set one in Settings)."
+            );
+            return Ok(Vec::new());
+        };
         let (start, today) = date_window(days_back);
         let mut merged = BTreeMap::<String, ArticleCandidate>::new();
         let mut errors = Vec::new();
         let queries = free_text_queries(profile, SCHOLARLY_FREE_TEXT_QUERIES);
         for (index, query) in queries.iter().enumerate() {
             pause_between_source_queries(index).await;
-            match self.fetch_unpaywall_query(query).await {
+            match self.fetch_unpaywall_query(query, &email).await {
                 Ok(candidates) => merge_candidates(&mut merged, candidates),
                 Err(error) => {
                     tracing::warn!("Unpaywall query '{query}' failed: {error}");
@@ -1125,13 +1150,15 @@ impl PipelineService {
             .map(|candidates| filter_candidates_by_known_date(candidates, start, today))
     }
 
-    async fn fetch_unpaywall_query(&self, query: &str) -> Result<Vec<ArticleCandidate>> {
-        let email =
-            std::env::var("UNPAYWALL_EMAIL").unwrap_or_else(|_| DEFAULT_CONTACT_EMAIL.to_string());
+    async fn fetch_unpaywall_query(
+        &self,
+        query: &str,
+        email: &str,
+    ) -> Result<Vec<ArticleCandidate>> {
         let params = vec![
             ("query", query.to_string()),
             ("is_oa", "true".to_string()),
-            ("email", email),
+            ("email", email.to_string()),
         ];
         let body = self
             .get_json_with_retries(UNPAYWALL_SEARCH_URL, &params, "Unpaywall", None)
@@ -2506,20 +2533,22 @@ fn save_candidates_sync(
     candidates: Vec<ArticleCandidate>,
     workspace_id: i64,
 ) -> Result<SaveCounters> {
-    let conn = crate::db::open_connection(database_path)
+    let mut conn = crate::db::open_connection(database_path)
         .with_context(|| format!("failed to open database at {}", database_path.display()))?;
     let mut counters = SaveCounters::default();
 
-    conn.execute_batch("BEGIN")?;
+    // `transaction()` rolls back automatically if a candidate save fails before
+    // we reach `commit()`.
+    let tx = conn.transaction()?;
 
     for candidate in &candidates {
-        let result = save_article_sync(&conn, candidate, None, workspace_id)?;
+        let result = save_article_sync(&tx, candidate, None, workspace_id)?;
         counters.saved += result.saved;
         counters.skipped += result.skipped;
         counters.errors += result.errors;
     }
 
-    conn.execute_batch("COMMIT")?;
+    tx.commit()?;
 
     Ok(counters)
 }

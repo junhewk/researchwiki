@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
 use anyhow::{Context, anyhow};
-use chrono::{Duration, FixedOffset, Utc};
+use chrono::{Duration, Local};
 use rusqlite::{OptionalExtension, params};
 use tokio::task;
 use uuid::Uuid;
@@ -64,6 +64,7 @@ struct JobCounters {
 }
 
 impl JobService {
+    #[allow(clippy::too_many_arguments)] // service graph: each dependency is distinct
     pub fn new(
         database_path: std::path::PathBuf,
         llm_service: Arc<LlmService>,
@@ -72,10 +73,11 @@ impl JobService {
         library_service: Arc<LibraryService>,
         kg_service: Arc<KnowledgeGraphService>,
         workspace_service: Arc<WorkspaceService>,
+        contact_email: Option<String>,
     ) -> Self {
-        let pipeline_service = PipelineService::new(database_path.clone());
+        let pipeline_service = PipelineService::new(database_path.clone(), contact_email.clone());
         let screener = ArticleScreener::new(llm_service.clone());
-        let fetcher = ContentFetcher::new(http_client.clone());
+        let fetcher = ContentFetcher::new(http_client.clone(), contact_email);
         let evaluator = ArticleEvaluator::new(llm_service);
         Self {
             database_path: Arc::new(database_path),
@@ -948,8 +950,7 @@ fn manual_job(id: &str, name: &str) -> SchedulerJob {
 
 fn scheduler_job(id: &str, name: &str, hour: u8, minute: u8, enabled: bool) -> SchedulerJob {
     let next_run = if enabled {
-        let kst = FixedOffset::east_opt(9 * 3600).expect("valid KST offset");
-        let now = Utc::now().with_timezone(&kst);
+        let now = Local::now();
         let today = now.date_naive();
         let Some(today_run_naive) = today.and_hms_opt(u32::from(hour), u32::from(minute), 0) else {
             return SchedulerJob {
@@ -959,7 +960,7 @@ fn scheduler_job(id: &str, name: &str, hour: u8, minute: u8, enabled: bool) -> S
             };
         };
 
-        let Some(today_run) = today_run_naive.and_local_timezone(kst).single() else {
+        let Some(today_run) = today_run_naive.and_local_timezone(Local).single() else {
             return SchedulerJob {
                 id: id.to_string(),
                 name: name.to_string(),

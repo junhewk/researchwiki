@@ -87,7 +87,7 @@ impl Panel {
             self.load_graph(ctx);
         }
 
-        style::panel_header(ui, ctx.t("Knowledge Graph"), None);
+        style::panel_header_icon(ui, style::icon::GRAPH, ctx.t("Knowledge Graph"), None);
 
         self.show_controls(ui, ctx);
         ui.add_space(8.0);

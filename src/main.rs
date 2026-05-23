@@ -3,7 +3,7 @@ use researchwiki::{
     config::AppConfig,
     init_tracing, register_sqlite_vec,
     runtime::DesktopRuntime,
-    services::settings::{load_overrides_sync, load_ui_language_sync},
+    services::settings::{load_overrides_sync, load_setup_complete_sync, load_ui_language_sync},
 };
 
 fn main() -> eframe::Result<()> {
@@ -18,18 +18,24 @@ fn main() -> eframe::Result<()> {
     first_launch_seed(&config).expect("first-launch directory setup failed");
 
     // Overlay persisted settings so the first-run modal only fires on a fresh install.
-    let (persisted_llm, persisted_embedding, persisted_dim) =
-        load_overrides_sync(&config.storage.settings_file);
-    if let Some(llm) = persisted_llm {
+    let overrides = load_overrides_sync(&config.storage.settings_file);
+    if let Some(llm) = overrides.llm {
         config.llm = llm;
     }
-    if let Some(embedding) = persisted_embedding {
+    if let Some(embedding) = overrides.embedding {
         config.embedding = embedding;
     }
-    if let Some(dim) = persisted_dim {
+    if let Some(dim) = overrides.embedding_dimensions {
         config.embedding_dimensions = dim;
     }
+    if let Some(email) = overrides.contact_email {
+        config.contact_email = email;
+    }
     let language = load_ui_language_sync(&config.storage.settings_file);
+    // Unknown (legacy) installs that are already configured count as set up, so
+    // only genuinely fresh installs see the research-setup step.
+    let setup_complete = load_setup_complete_sync(&config.storage.settings_file)
+        .unwrap_or_else(|| config.is_ready());
 
     runtime
         .handle
@@ -48,6 +54,14 @@ fn main() -> eframe::Result<()> {
     eframe::run_native(
         "ResearchWiki",
         native_options,
-        Box::new(move |cc| Ok(Box::new(DesktopApp::new(cc, runtime, config, language)))),
+        Box::new(move |cc| {
+            Ok(Box::new(DesktopApp::new(
+                cc,
+                runtime,
+                config,
+                language,
+                setup_complete,
+            )))
+        }),
     )
 }

@@ -70,7 +70,7 @@ impl Panel {
             self.fetch(ctx);
         }
 
-        style::panel_header(ui, ctx.t("Articles"), None);
+        style::panel_header_icon(ui, style::icon::ARTICLE, ctx.t("Articles"), None);
 
         self.show_filters(ui, ctx);
         ui.add_space(4.0);

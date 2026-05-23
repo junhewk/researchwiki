@@ -297,7 +297,10 @@ async fn preview_source_candidates(
         .workspace_service
         .research_context(workspace_id)
         .await?;
-    let pipeline = PipelineService::new(workspace_db.to_path_buf());
+    let contact_email = std::env::var("RESEARCHWIKI_CONTACT_EMAIL")
+        .or_else(|_| std::env::var("UNPAYWALL_EMAIL"))
+        .ok();
+    let pipeline = PipelineService::new(workspace_db.to_path_buf(), contact_email);
     let mut total = 0usize;
     let sources = source_filter
         .map(|source| vec![source])
@@ -361,6 +364,9 @@ fn demo_config_from_env() -> Result<AppConfig> {
                 .unwrap_or_default(),
         },
         embedding_dimensions: env_parse("EMBEDDING_DIMENSIONS", 1536),
+        contact_email: std::env::var("RESEARCHWIKI_CONTACT_EMAIL")
+            .or_else(|_| std::env::var("UNPAYWALL_EMAIL"))
+            .unwrap_or_default(),
     })
 }
 
@@ -375,15 +381,18 @@ fn ensure_embedding_configured(config: &AppConfig) -> Result<()> {
 }
 
 fn apply_persisted_settings(config: &mut AppConfig) {
-    let (llm, embedding, dim) = load_overrides_sync(&config.storage.settings_file);
-    if let Some(llm) = llm {
+    let overrides = load_overrides_sync(&config.storage.settings_file);
+    if let Some(llm) = overrides.llm {
         config.llm = llm;
     }
-    if let Some(embedding) = embedding {
+    if let Some(embedding) = overrides.embedding {
         config.embedding = embedding;
     }
-    if let Some(dim) = dim {
+    if let Some(dim) = overrides.embedding_dimensions {
         config.embedding_dimensions = dim;
+    }
+    if let Some(email) = overrides.contact_email {
+        config.contact_email = email;
     }
 }
 

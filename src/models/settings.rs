@@ -108,6 +108,15 @@ pub struct StoredSettings {
     pub embedding_dimensions: Option<u32>,
     #[serde(default)]
     pub ui_language: UiLanguage,
+    /// Contact email for polite-pool/Unpaywall API requests. Unset until the
+    /// user provides one in setup or Settings.
+    #[serde(default)]
+    pub contact_email: Option<String>,
+    /// Whether the guided research-setup step has been completed. `None` means
+    /// unknown (legacy installs predating the wizard); startup treats an already
+    /// configured legacy install as complete.
+    #[serde(default)]
+    pub setup_complete: Option<bool>,
 }
 
 fn default_true() -> bool {

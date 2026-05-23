@@ -184,62 +184,67 @@ impl LibraryService {
         let database_path = self.database_path.clone();
         let uid_str = uid.to_string();
         let chunks_created = run_blocking(move || {
-            let conn = crate::db::open_connection(&*database_path)?;
-            conn.execute_batch("BEGIN")?;
+            let mut conn = crate::db::open_connection(&*database_path)?;
+            // `transaction()` rolls back automatically if we return early via `?`
+            // before reaching `commit()`.
+            let tx = conn.transaction()?;
 
             // Delete existing chunks and embeddings for this article.
             let existing_chunk_ids: Vec<i64> = {
-                let mut stmt = conn.prepare(
+                let mut stmt = tx.prepare(
                     "SELECT id FROM article_chunks WHERE article_uid = ?1",
                 )?;
                 stmt.query_map([uid_str.as_str()], |row| row.get::<_, i64>(0))?
                     .collect::<Result<Vec<_>, _>>()?
             };
             for chunk_id in &existing_chunk_ids {
-                conn.execute(
+                tx.execute(
                     "DELETE FROM vec_article_chunks WHERE chunk_id = ?1",
                     [chunk_id],
                 )?;
             }
-            conn.execute(
+            tx.execute(
                 "DELETE FROM article_chunks WHERE article_uid = ?1",
                 [uid_str.as_str()],
             )?;
 
-            // Insert new chunks.
-            let mut insert_chunk = conn.prepare(
-                "INSERT INTO article_chunks (
-                    article_uid, chunk_index, chunk_type, content, token_count,
-                    source_section, embedded_at
-                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, datetime('now'))",
-            )?;
-
-            let mut insert_vec = conn.prepare(
-                "INSERT INTO vec_article_chunks (chunk_id, embedding) VALUES (?1, ?2)",
-            )?;
-
             let mut created = 0i32;
-            for (index, (chunk, embedding)) in chunks.iter().zip(embeddings.iter()).enumerate() {
-                insert_chunk.execute(params![
-                    uid_str,
-                    index as i64,
-                    chunk.chunk_type,
-                    chunk.content,
-                    chunk.token_count,
-                    chunk.source_section,
-                ])?;
-                let chunk_id = conn.last_insert_rowid();
-                insert_vec.execute(params![chunk_id, embedding.as_bytes()])?;
-                created += 1;
+            {
+                // Insert new chunks. Scoped so the prepared statements release
+                // their borrow of `tx` before we commit it.
+                let mut insert_chunk = tx.prepare(
+                    "INSERT INTO article_chunks (
+                        article_uid, chunk_index, chunk_type, content, token_count,
+                        source_section, embedded_at
+                     ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, datetime('now'))",
+                )?;
+
+                let mut insert_vec = tx.prepare(
+                    "INSERT INTO vec_article_chunks (chunk_id, embedding) VALUES (?1, ?2)",
+                )?;
+
+                for (index, (chunk, embedding)) in chunks.iter().zip(embeddings.iter()).enumerate() {
+                    insert_chunk.execute(params![
+                        uid_str,
+                        index as i64,
+                        chunk.chunk_type,
+                        chunk.content,
+                        chunk.token_count,
+                        chunk.source_section,
+                    ])?;
+                    let chunk_id = tx.last_insert_rowid();
+                    insert_vec.execute(params![chunk_id, embedding.as_bytes()])?;
+                    created += 1;
+                }
             }
 
             // Mark article as having embeddings.
-            conn.execute(
+            tx.execute(
                 "UPDATE haie_rev SET has_embeddings = 1, updated_at = datetime('now') WHERE uid = ?1",
                 [uid_str.as_str()],
             )?;
 
-            conn.execute_batch("COMMIT")?;
+            tx.commit()?;
             Ok(created)
         })
         .await?;

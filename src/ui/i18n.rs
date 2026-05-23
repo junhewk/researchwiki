@@ -69,6 +69,45 @@ pub fn t(language: UiLanguage, text: &'static str) -> &'static str {
             "수집 제한: 각 소스는 쿼리당 약 50개 후보를 반환하며, PMC는 최근 30일만 조회합니다. 긴 조회 기간은 완전 탐색이 아니라 여러 소스의 범위를 넓히는 데 도움이 됩니다."
         }
 
+        // Setup wizard
+        "Step 1 of 2 · Connect" => "2단계 중 1단계 · 연결",
+        "Contact email (optional)" => "연락처 이메일(선택)",
+        "Sent to scholarly APIs (OpenAlex, Crossref, Unpaywall). Leave blank to skip Unpaywall." => {
+            "학술 API(OpenAlex, Crossref, Unpaywall)에 전송됩니다. 비워 두면 Unpaywall을 건너뜁니다."
+        }
+        "Email" => "이메일",
+        "Next" => "다음",
+        "(leave blank for local servers)" => "(로컬 서버는 비워 두세요)",
+        "Set up your research" => "연구 설정",
+        "Step 2 of 2 · Your research" => "2단계 중 2단계 · 연구",
+        "Tell ResearchWiki what to gather and study. You can refine this anytime in Input Set." => {
+            "ResearchWiki가 무엇을 수집하고 분석할지 알려 주세요. 입력 세트에서 언제든 다시 조정할 수 있습니다."
+        }
+        "Research name" => "연구 이름",
+        "What question are you trying to answer?" => "어떤 질문에 답하려고 하나요?",
+        "Key topics & search terms\n(one per line)" => "핵심 주제 및 검색어\n(한 줄에 하나)",
+        "Finish setup" => "설정 완료",
+        "Skip for now" => "나중에 하기",
+
+        // Input Set (plain-language)
+        "Set up what ResearchWiki gathers and studies. These settings drive every gather and the wiki it builds." => {
+            "ResearchWiki가 수집하고 분석할 내용을 설정하세요. 이 설정은 모든 수집과 생성되는 위키에 적용됩니다."
+        }
+        "Research" => "연구",
+        "Known gap / what's missing (optional)" => "알려진 갭 / 부족한 부분(선택)",
+        "Advanced settings" => "고급 설정",
+        "Days to look back" => "조회 기간(일)",
+        "Topic descriptor\n(natural-language topic)" => "주제 설명\n(자연어 주제)",
+        "used by screening + prompt rewrite" => "스크리닝 + 프롬프트 재작성에 사용",
+        "Override search queries\n(optional, one per line)" => {
+            "대체 검색 쿼리\n(선택, 한 줄에 하나)"
+        }
+        "Override queries replace your key topics when searching. Leave blank to use the topics above." => {
+            "대체 쿼리는 검색 시 핵심 주제를 대체합니다. 비워 두면 위의 주제를 사용합니다."
+        }
+        "Save & start gathering" => "저장 후 수집 시작",
+        "Create another research set" => "다른 연구 세트 만들기",
+
         "Run gather" => "수집 실행",
         "Active runs" => "실행 중인 작업",
         "Run history" => "실행 기록",
@@ -150,6 +189,11 @@ pub fn t(language: UiLanguage, text: &'static str) -> &'static str {
         "API key" => "API 키",
         "Save LLM endpoint" => "LLM 엔드포인트 저장",
         "Save embedding endpoint" => "임베딩 엔드포인트 저장",
+        "Contact email" => "연락처 이메일",
+        "Sent to scholarly APIs (OpenAlex, Crossref, Unpaywall). Required for Unpaywall; leave blank to skip it. Restart to apply." => {
+            "학술 API(OpenAlex, Crossref, Unpaywall)에 전송됩니다. Unpaywall에는 필수이며, 비워 두면 건너뜁니다. 적용하려면 다시 시작하세요."
+        }
+        "Save contact email" => "연락처 이메일 저장",
         "unsaved changes" => "저장되지 않은 변경 사항",
         "Database" => "데이터베이스",
         "Wiki export" => "위키 내보내기",
@@ -157,7 +201,7 @@ pub fn t(language: UiLanguage, text: &'static str) -> &'static str {
         "Copy" => "복사",
         "Open folder" => "폴더 열기",
         "Enable scheduled gathers" => "예약 수집 사용",
-        "Daily schedule (KST, 24h)" => "일일 일정(KST, 24시간)",
+        "Daily schedule (local time, 24h)" => "일일 일정(현지 시간, 24시간)",
         "Hour" => "시",
         "Minute" => "분",
         "Save scheduler" => "스케줄러 저장",
@@ -207,6 +251,42 @@ pub fn t(language: UiLanguage, text: &'static str) -> &'static str {
         }
         "Version history" => "버전 기록",
         "Select a prompt to edit." => "편집할 프롬프트를 선택하세요.",
+
+        // Dashboard
+        "Total articles" => "전체 논문",
+        "This week" => "이번 주",
+        "Tier 1" => "1등급",
+        "Pending review" => "검토 대기",
+        "Articles per day (last 30 days)" => "일별 논문 수(최근 30일)",
+        "No articles yet. Open Input Set to describe your research, then run a gather to start building your wiki." => {
+            "아직 논문이 없습니다. 입력 세트에서 연구를 설명한 뒤 수집을 실행하면 위키 구축이 시작됩니다."
+        }
+
+        // Traces
+        "Usage by prompt" => "프롬프트별 사용량",
+        "No traces yet — run a gather to populate." => {
+            "아직 추적이 없습니다 — 수집을 실행하면 채워집니다."
+        }
+        "Prompt" => "프롬프트",
+        "OK" => "성공",
+        "Failed" => "실패",
+        "Avg ms" => "평균 ms",
+        "Tokens" => "토큰",
+        "Cost" => "비용",
+        "Result" => "결과",
+        "any" => "전체",
+        "Loading…" => "불러오는 중…",
+        "No traces match these filters." => "이 필터에 해당하는 추적이 없습니다.",
+        "Page" => "페이지",
+        "traces" => "추적",
+        "When" => "시각",
+        "Latency" => "지연 시간",
+        "Trace detail" => "추적 세부 정보",
+        "Article UID" => "논문 UID",
+        "Input" => "입력",
+        "Output" => "출력",
+        "Failed (no error message)" => "실패(오류 메시지 없음)",
+        "All" => "전체",
         _ => text,
     }
 }

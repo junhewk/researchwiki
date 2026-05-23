@@ -30,17 +30,19 @@ pub enum Tab {
 }
 
 impl Tab {
+    // End-user flow: overview first, then set up → gather → read results →
+    // analyze, with Prompts/Traces/Settings (power-user + config) at the end.
     pub const ALL: [Tab; 10] = [
-        Tab::Workspace,
         Tab::Dashboard,
-        Tab::Articles,
+        Tab::Workspace,
         Tab::Gather,
+        Tab::Articles,
         Tab::KnowledgeGraph,
         Tab::Wiki,
         Tab::GapBridge,
         Tab::Prompts,
-        Tab::Settings,
         Tab::Traces,
+        Tab::Settings,
     ];
 
     pub fn label(self) -> &'static str {
@@ -60,6 +62,23 @@ impl Tab {
 
     pub fn label_for(self, language: UiLanguage) -> &'static str {
         i18n::t(language, self.label())
+    }
+
+    /// Phosphor glyph shown beside the tab label in the top nav.
+    pub fn icon(self) -> &'static str {
+        use crate::ui::style::icon;
+        match self {
+            Tab::Dashboard => icon::GAUGE,
+            Tab::Workspace => icon::SLIDERS_HORIZONTAL,
+            Tab::Gather => icon::DOWNLOAD_SIMPLE,
+            Tab::Articles => icon::ARTICLE,
+            Tab::KnowledgeGraph => icon::GRAPH,
+            Tab::Wiki => icon::BOOK_OPEN,
+            Tab::GapBridge => icon::BRIDGE,
+            Tab::Prompts => icon::CHAT_TEXT,
+            Tab::Traces => icon::RECEIPT,
+            Tab::Settings => icon::GEAR,
+        }
     }
 }
 

@@ -85,16 +85,18 @@ async fn main() -> Result<()> {
         .unwrap_or_else(|| "neural networks".to_string());
 
     let mut config = AppConfig::from_env().context("AppConfig")?;
-    let (persisted_llm, persisted_embedding, persisted_dim) =
-        load_overrides_sync(&config.storage.settings_file);
-    if let Some(llm) = persisted_llm {
+    let overrides = load_overrides_sync(&config.storage.settings_file);
+    if let Some(llm) = overrides.llm {
         config.llm = llm;
     }
-    if let Some(embedding) = persisted_embedding {
+    if let Some(embedding) = overrides.embedding {
         config.embedding = embedding;
     }
-    if let Some(dim) = persisted_dim {
+    if let Some(dim) = overrides.embedding_dimensions {
         config.embedding_dimensions = dim;
+    }
+    if let Some(email) = overrides.contact_email {
+        config.contact_email = email;
     }
 
     // Make sure the DB exists with the current schema. bootstrap_db creates
@@ -429,10 +431,10 @@ async fn seed_test_article(
     let db_path = config.storage.database_path.clone();
     let uid_clone = uid.clone();
     tokio::task::spawn_blocking(move || -> Result<()> {
-        let conn = Connection::open(&db_path)?;
+        let mut conn = Connection::open(&db_path)?;
         conn.busy_timeout(Duration::from_millis(5000))?;
-        conn.execute_batch("BEGIN")?;
-        conn.execute(
+        let tx = conn.transaction()?;
+        tx.execute(
             "INSERT INTO haie_rev (uid, title, first_author, category, content_type, has_embeddings)
              VALUES (?1, ?2, ?3, ?4, ?5, 1)",
             params![
@@ -443,24 +445,26 @@ async fn seed_test_article(
                 "text",
             ],
         )?;
-        let mut insert_chunk = conn.prepare(
-            "INSERT INTO article_chunks (article_uid, chunk_index, chunk_type, content, token_count, embedded_at)
-             VALUES (?1, ?2, 'body', ?3, ?4, datetime('now'))",
-        )?;
-        let mut insert_vec = conn.prepare(
-            "INSERT INTO vec_article_chunks (chunk_id, embedding) VALUES (?1, ?2)",
-        )?;
-        for (i, (text, emb)) in chunks.iter().zip(embeddings.iter()).enumerate() {
-            insert_chunk.execute(params![
-                &uid_clone,
-                i as i64,
-                text,
-                (text.len() / 4) as i64,
-            ])?;
-            let chunk_id = conn.last_insert_rowid();
-            insert_vec.execute(params![chunk_id, emb.as_bytes()])?;
+        {
+            let mut insert_chunk = tx.prepare(
+                "INSERT INTO article_chunks (article_uid, chunk_index, chunk_type, content, token_count, embedded_at)
+                 VALUES (?1, ?2, 'body', ?3, ?4, datetime('now'))",
+            )?;
+            let mut insert_vec = tx.prepare(
+                "INSERT INTO vec_article_chunks (chunk_id, embedding) VALUES (?1, ?2)",
+            )?;
+            for (i, (text, emb)) in chunks.iter().zip(embeddings.iter()).enumerate() {
+                insert_chunk.execute(params![
+                    &uid_clone,
+                    i as i64,
+                    text,
+                    (text.len() / 4) as i64,
+                ])?;
+                let chunk_id = tx.last_insert_rowid();
+                insert_vec.execute(params![chunk_id, emb.as_bytes()])?;
+            }
         }
-        conn.execute_batch("COMMIT")?;
+        tx.commit()?;
         Ok(())
     })
     .await??;

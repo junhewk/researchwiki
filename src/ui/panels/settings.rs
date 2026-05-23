@@ -42,6 +42,9 @@ pub struct Panel {
     embed_api_key: String,
     embed_dirty: bool,
 
+    contact_email: String,
+    contact_email_dirty: bool,
+
     embedding_dim_persisted: Option<u32>,
     embedding_dim_input: String,
     embedding_confirm_open: bool,
@@ -67,7 +70,7 @@ impl Panel {
             self.spawn_load(ctx);
         }
 
-        style::panel_header(ui, ctx.t("Settings"), None);
+        style::panel_header_icon(ui, style::icon::GEAR, ctx.t("Settings"), None);
 
         if self.loading && self.scheduler.is_none() {
             ui.label(ctx.t("Loading settings..."));
@@ -84,6 +87,9 @@ impl Panel {
                 ui.add_space(8.0);
                 ui.separator();
                 self.section_embedding_endpoint(ui, ctx);
+                ui.add_space(8.0);
+                ui.separator();
+                self.section_contact_email(ui, ctx);
                 ui.add_space(8.0);
                 ui.separator();
                 self.section_paths(ui, ctx);
@@ -136,6 +142,7 @@ impl Panel {
                     match what {
                         "LLM endpoint" => self.llm_dirty = false,
                         "Embedding endpoint" => self.embed_dirty = false,
+                        "Contact email" => self.contact_email_dirty = false,
                         _ => {}
                     }
                 }
@@ -155,6 +162,7 @@ impl Panel {
         self.embed_base_url = cfg.embedding.base_url.clone();
         self.embed_model = cfg.embedding.model.clone();
         self.embed_api_key = cfg.embedding.api_key.clone();
+        self.contact_email = cfg.contact_email.clone();
         self.embedding_dim_input = cfg.embedding_dimensions.to_string();
     }
 
@@ -256,6 +264,49 @@ impl Panel {
         });
     }
 
+    fn section_contact_email(&mut self, ui: &mut egui::Ui, ctx: &PanelCtx<'_>) {
+        style::section_heading(ui, ctx.t("Contact email"));
+        style::muted_label(
+            ui,
+            ctx.t(
+                "Sent to scholarly APIs (OpenAlex, Crossref, Unpaywall). Required for Unpaywall; leave blank to skip it. Restart to apply.",
+            ),
+        );
+        ui.add_space(4.0);
+
+        egui::Grid::new("settings-contact-grid")
+            .num_columns(2)
+            .spacing([8.0, 6.0])
+            .show(ui, |ui| {
+                ui.label(ctx.t("Email"));
+                if ui
+                    .add(
+                        egui::TextEdit::singleline(&mut self.contact_email)
+                            .hint_text("you@example.com"),
+                    )
+                    .changed()
+                {
+                    self.contact_email_dirty = true;
+                }
+                ui.end_row();
+            });
+
+        ui.horizontal(|ui| {
+            if ui
+                .add_enabled(
+                    self.contact_email_dirty,
+                    egui::Button::new(ctx.t("Save contact email")),
+                )
+                .clicked()
+            {
+                self.save_contact_email(ctx);
+            }
+            if self.contact_email_dirty {
+                ui.label(egui::RichText::new(ctx.t("unsaved changes")).italics());
+            }
+        });
+    }
+
     fn section_embedding_endpoint(&mut self, ui: &mut egui::Ui, ctx: &PanelCtx<'_>) {
         style::section_heading(ui, ctx.t("Embedding endpoint"));
         style::muted_label(
@@ -337,7 +388,7 @@ impl Panel {
             .changed();
 
         ui.add_space(4.0);
-        ui.label(ctx.t("Daily schedule (KST, 24h)"));
+        ui.label(ctx.t("Daily schedule (local time, 24h)"));
         egui::Grid::new("settings-sched-grid")
             .num_columns(3)
             .spacing([8.0, 4.0])
@@ -474,6 +525,25 @@ impl Panel {
             let result = svc.set_llm_config(new_llm).await;
             let _ = match result {
                 Ok(()) => tx.send(Msg::Saved("LLM endpoint")),
+                Err(err) => tx.send(Msg::SaveError(err.to_string())),
+            };
+        });
+    }
+
+    fn save_contact_email(&mut self, ctx: &PanelCtx<'_>) {
+        let Some(channel) = self.channel.as_ref() else {
+            return;
+        };
+        let tx = channel.tx.clone();
+        let email = {
+            let trimmed = self.contact_email.trim();
+            (!trimmed.is_empty()).then(|| trimmed.to_string())
+        };
+        let svc = ctx.state.settings_service.clone();
+        ctx.handle.spawn(async move {
+            let result = svc.set_contact_email(email).await;
+            let _ = match result {
+                Ok(()) => tx.send(Msg::Saved("Contact email")),
                 Err(err) => tx.send(Msg::SaveError(err.to_string())),
             };
         });

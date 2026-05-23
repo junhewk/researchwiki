@@ -3,7 +3,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use chrono::{Duration as ChronoDuration, FixedOffset, Timelike, Utc};
+use chrono::{Duration as ChronoDuration, Local, Timelike};
 use egui_extras::{Column, TableBuilder};
 
 use crate::{
@@ -128,7 +128,7 @@ impl Panel {
             self.refresh_operations(ctx);
         }
 
-        style::panel_header(ui, ctx.t("Gather"), None);
+        style::panel_header_icon(ui, style::icon::DOWNLOAD_SIMPLE, ctx.t("Gather"), None);
 
         egui::ScrollArea::vertical()
             .auto_shrink([false, false])
@@ -142,14 +142,16 @@ impl Panel {
                 self.show_history(ui, ctx);
                 style::section_break(ui);
                 self.show_kg_ops(ui, ctx);
-                style::section_break(ui);
-                egui::CollapsingHeader::new(ctx.t("Advanced diagnostics"))
-                    .default_open(false)
-                    .show(ui, |ui| {
-                        self.show_pipeline_test(ui, ctx);
-                        style::section_break(ui);
-                        self.show_scheduler_check(ui, ctx);
-                    });
+                if dev_tools_enabled() {
+                    style::section_break(ui);
+                    egui::CollapsingHeader::new(ctx.t("Advanced diagnostics"))
+                        .default_open(false)
+                        .show(ui, |ui| {
+                            self.show_pipeline_test(ui, ctx);
+                            style::section_break(ui);
+                            self.show_scheduler_check(ui, ctx);
+                        });
+                }
             });
 
         if self.detail.is_some() {
@@ -244,7 +246,7 @@ impl Panel {
                     self.action_in_flight = false;
                     self.notice = Some((
                         NoticeKind::Success,
-                        "Scheduler test armed for the next KST minute".to_string(),
+                        "Scheduler test armed for the next minute (local time)".to_string(),
                     ));
                 }
                 Msg::SchedulerRestored(settings, status) => {
@@ -492,10 +494,10 @@ impl Panel {
             let running_sources = self.running_sources();
             let all_busy = self.source_is_busy("all", &running_sources);
             if ui
-                .add_enabled(
-                    !self.action_in_flight && !all_busy,
-                    egui::Button::new(ctx.t("Run all sources")),
-                )
+                .add_enabled_ui(!self.action_in_flight && !all_busy, |ui| {
+                    style::primary_button(ui, ctx.t("Run all sources"))
+                })
+                .inner
                 .clicked()
             {
                 self.start_job(ctx, "all");
@@ -617,7 +619,7 @@ impl Panel {
             ui.label(format!("Status: {}", status.status));
             if let Some(settings) = &self.scheduler_settings {
                 ui.label(format!(
-                    "arXiv {:02}:{:02} | PMC {:02}:{:02} | PubMed {:02}:{:02} KST",
+                    "arXiv {:02}:{:02} | PMC {:02}:{:02} | PubMed {:02}:{:02} local",
                     settings.arxiv_schedule_hour,
                     settings.arxiv_schedule_minute,
                     settings.pmc_schedule_hour,
@@ -695,54 +697,52 @@ impl Panel {
                 continue;
             };
 
-            egui::Frame::group(ui.style())
-                .inner_margin(egui::Margin::same(8))
-                .show(ui, |ui| {
-                    ui.set_width(ui.available_width());
-                    ui.horizontal_wrapped(|ui| {
-                        ui.strong(format!("{} ({})", label_for(&job.source), job.status));
-                        ui.separator();
-                        ui.label(format!(
-                            "found {} | screened {} | relevant {}",
-                            job.candidates_found, job.candidates_screened, job.candidates_relevant
-                        ));
-                        ui.separator();
-                        ui.label(format!(
-                            "fetched {} | evaluated {} | saved {} | skipped {} | errors {}",
-                            job.candidates_fetched,
-                            job.candidates_evaluated,
-                            job.candidates_saved,
-                            job.candidates_skipped,
-                            job.errors
-                        ));
-                    });
-
-                    ui.add_space(4.0);
-                    ui.add(egui::Label::new(format!("Run: {}", job.run_id)).wrap());
-                    ui.add(
-                        egui::Label::new(format!(
-                            "Step: {}",
-                            job.current_step.as_deref().unwrap_or("queued")
-                        ))
-                        .wrap(),
-                    );
-                    if let Some(item) = &job.current_item {
-                        ui.add(egui::Label::new(format!("Current: {item}")).wrap());
-                    }
-
-                    ui.add_space(4.0);
-                    ui.horizontal(|ui| {
-                        if ui.button(ctx.t("Details")).clicked() {
-                            detail_request = Some(job.run_id.clone());
-                        }
-                        if ui
-                            .add_enabled(!self.action_in_flight, egui::Button::new(ctx.t("Cancel")))
-                            .clicked()
-                        {
-                            cancel_request = Some(job.run_id.clone());
-                        }
-                    });
+            style::card(ui, |ui| {
+                ui.set_width(ui.available_width());
+                ui.horizontal_wrapped(|ui| {
+                    ui.strong(format!("{} ({})", label_for(&job.source), job.status));
+                    ui.separator();
+                    ui.label(format!(
+                        "found {} | screened {} | relevant {}",
+                        job.candidates_found, job.candidates_screened, job.candidates_relevant
+                    ));
+                    ui.separator();
+                    ui.label(format!(
+                        "fetched {} | evaluated {} | saved {} | skipped {} | errors {}",
+                        job.candidates_fetched,
+                        job.candidates_evaluated,
+                        job.candidates_saved,
+                        job.candidates_skipped,
+                        job.errors
+                    ));
                 });
+
+                ui.add_space(4.0);
+                ui.add(egui::Label::new(format!("Run: {}", job.run_id)).wrap());
+                ui.add(
+                    egui::Label::new(format!(
+                        "Step: {}",
+                        job.current_step.as_deref().unwrap_or("queued")
+                    ))
+                    .wrap(),
+                );
+                if let Some(item) = &job.current_item {
+                    ui.add(egui::Label::new(format!("Current: {item}")).wrap());
+                }
+
+                ui.add_space(4.0);
+                ui.horizontal(|ui| {
+                    if ui.button(ctx.t("Details")).clicked() {
+                        detail_request = Some(job.run_id.clone());
+                    }
+                    if ui
+                        .add_enabled(!self.action_in_flight, egui::Button::new(ctx.t("Cancel")))
+                        .clicked()
+                    {
+                        cancel_request = Some(job.run_id.clone());
+                    }
+                });
+            });
             ui.add_space(6.0);
         }
 
@@ -1158,7 +1158,7 @@ impl Panel {
                 let current = settings.get_settings().await?.scheduler;
                 let backup = current.clone();
                 let mut next_settings = current;
-                let (hour, minute, scheduled_for) = next_kst_minute();
+                let (hour, minute, scheduled_for) = next_local_minute();
                 next_settings.enabled = true;
                 set_schedule_for_source(&mut next_settings, &source, hour, minute);
                 settings
@@ -1317,6 +1317,12 @@ impl Panel {
     }
 }
 
+/// Developer diagnostics (pipeline smoke test, scheduler arm-test) are hidden in
+/// release builds. Enable them in a release build with `RESEARCHWIKI_DEV=1`.
+fn dev_tools_enabled() -> bool {
+    cfg!(debug_assertions) || std::env::var("RESEARCHWIKI_DEV").is_ok()
+}
+
 fn upsert_job(jobs: &mut Vec<JobRunResponse>, run: JobRunResponse) {
     if let Some(existing) = jobs.iter_mut().find(|job| job.run_id == run.run_id) {
         *existing = run;
@@ -1402,13 +1408,12 @@ async fn load_scheduler_snapshot(
     Ok((settings, status))
 }
 
-fn next_kst_minute() -> (u8, u8, String) {
-    let kst = FixedOffset::east_opt(9 * 3600).expect("valid KST offset");
-    let next = Utc::now().with_timezone(&kst) + ChronoDuration::minutes(1);
+fn next_local_minute() -> (u8, u8, String) {
+    let next = Local::now() + ChronoDuration::minutes(1);
     (
         next.hour() as u8,
         next.minute() as u8,
-        next.format("%Y-%m-%d %H:%M KST").to_string(),
+        next.format("%Y-%m-%d %H:%M %Z").to_string(),
     )
 }
 

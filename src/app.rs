@@ -12,7 +12,10 @@ use tracing::{info, warn};
 use crate::{
     config::AppConfig,
     db,
-    models::{settings::UiLanguage, workspace::WorkspaceSummary},
+    models::{
+        settings::UiLanguage,
+        workspace::{WorkspaceSummary, WorkspaceUpdate},
+    },
     runtime::{DesktopRuntime, UiEvent},
     services::{
         scheduler::run_scheduler_loop, settings::SettingsService, workspace::WorkspaceService,
@@ -20,7 +23,7 @@ use crate::{
     state::AppState,
     tray::{TrayCommand, TrayController},
     ui::{
-        first_run::{FirstRunForm, FirstRunOutcome},
+        first_run::{FirstRunForm, FirstRunOutcome, ResearchSetupForm, ResearchSetupOutcome},
         i18n,
         panels::{PanelCtx, Panels, Tab},
         style,
@@ -57,6 +60,10 @@ pub struct DesktopApp {
     restoring_from_tray: bool,
     native_window_handle: Option<isize>,
     first_run: FirstRunForm,
+    research_setup: ResearchSetupForm,
+    /// Whether the guided research-setup step is done. While false (and the app
+    /// is activated), the research-setup modal blocks the main UI.
+    setup_complete: bool,
     panels: Panels,
     persistent: PersistentUi,
     status: Option<String>,
@@ -71,6 +78,7 @@ impl DesktopApp {
         runtime: DesktopRuntime,
         config: AppConfig,
         language: UiLanguage,
+        setup_complete: bool,
     ) -> Self {
         install_system_font_fallbacks(&cc.egui_ctx);
         style::apply_app_style(&cc.egui_ctx);
@@ -101,6 +109,8 @@ impl DesktopApp {
             restoring_from_tray: false,
             native_window_handle: native_window_handle(cc),
             first_run: FirstRunForm::default(),
+            research_setup: ResearchSetupForm::default(),
+            setup_complete,
             panels: Panels::default(),
             persistent,
             status: None,
@@ -109,8 +119,13 @@ impl DesktopApp {
             language,
         };
 
-        if app.config.llm.is_configured() {
+        // Only skip setup when both endpoints are present *and* well-formed; a
+        // malformed saved config routes to the wizard (pre-filled) instead of
+        // activating and failing mid-job.
+        if app.config.is_ready() {
             app.activate();
+        } else {
+            app.first_run.prefill_from(&app.config);
         }
 
         app
@@ -206,6 +221,72 @@ impl DesktopApp {
         self.persistent.active_workspace_id = workspace_id;
         self.state = Some(state);
         self.status = Some(i18n::t(self.language, "Ready.").to_string());
+    }
+
+    /// Renders the first-launch research-setup modal, pre-filling it once from
+    /// the active workspace's seeded defaults.
+    fn show_research_setup(&mut self, ctx: &egui::Context) {
+        if !self.research_setup.is_prefilled() {
+            let prefill = self.state.as_ref().map(|state| {
+                let svc = state.workspace_service.clone();
+                let id = self.persistent.active_workspace_id;
+                self.handle.block_on(async move { svc.get(id).await })
+            });
+            match prefill {
+                Some(Ok(ws)) => {
+                    self.research_setup
+                        .prefill(&ws.name, &ws.primary_question, &ws.seed_concepts);
+                }
+                _ => self.research_setup.prefill("", "", &[]),
+            }
+        }
+
+        match self.research_setup.show(ctx, self.language) {
+            ResearchSetupOutcome::Submitted {
+                name,
+                primary_question,
+                topics,
+            } => self.complete_research_setup(Some((name, primary_question, topics))),
+            ResearchSetupOutcome::Skipped => self.complete_research_setup(None),
+            ResearchSetupOutcome::Pending => {}
+        }
+    }
+
+    /// Saves the research-setup values (when provided) into the active workspace
+    /// and records that setup is done so the modal won't fire again.
+    fn complete_research_setup(&mut self, values: Option<(String, String, Vec<String>)>) {
+        let id = self.persistent.active_workspace_id;
+        if let (Some((name, primary_question, topics)), Some(state)) = (values, self.state.as_ref())
+        {
+            let svc = state.workspace_service.clone();
+            let update = WorkspaceUpdate {
+                name: Some(name),
+                primary_question: Some(primary_question),
+                gap_note: None,
+                refined_question: None,
+                topic_descriptor: None,
+                seed_concepts: Some(topics),
+                override_queries: None,
+                lookback_days: None,
+            };
+            if let Err(err) = self
+                .handle
+                .block_on(async move { svc.update(id, update).await })
+            {
+                warn!("failed to save research setup: {err:#}");
+            }
+        }
+
+        let path = self.config.storage.settings_file.clone();
+        if let Err(err) = self
+            .handle
+            .block_on(async move { SettingsService::new(path).set_setup_complete(true).await })
+        {
+            warn!("failed to persist setup_complete: {err:#}");
+        }
+        self.setup_complete = true;
+        // Refresh the top-bar workspace list so the chosen name shows up.
+        self.workspaces_refreshed_at = None;
     }
 
     fn drain_events(&mut self) {
@@ -338,26 +419,46 @@ impl eframe::App for DesktopApp {
         self.drain_events();
 
         if self.state.is_none() {
-            if let FirstRunOutcome::Submitted { llm, embedding } =
-                self.first_run.show(ctx, self.language)
+            if let FirstRunOutcome::Submitted {
+                llm,
+                embedding,
+                contact_email,
+            } = self.first_run.show(ctx, self.language)
             {
                 // Best-effort persist so the modal only fires once. A failed
-                // write still lets the user continue in this session.
+                // write still lets the user continue in this session. We mark
+                // setup_complete=false so a quit before the research step
+                // resumes there next launch.
                 let path = self.config.storage.settings_file.clone();
                 let llm_to_save = llm.clone();
                 let embedding_to_save = embedding.clone();
+                let contact_to_save = contact_email.clone();
                 let save_result = self.handle.block_on(async move {
                     let svc = SettingsService::new(path);
                     svc.set_llm_config(llm_to_save).await?;
-                    svc.set_embedding_config(embedding_to_save).await
+                    svc.set_embedding_config(embedding_to_save).await?;
+                    if let Some(email) = contact_to_save {
+                        svc.set_contact_email(Some(email)).await?;
+                    }
+                    svc.set_setup_complete(false).await
                 });
                 if let Err(err) = save_result {
                     warn!("failed to persist first-run config: {err:#}");
                 }
                 self.config.llm = llm;
                 self.config.embedding = embedding;
+                if let Some(email) = contact_email {
+                    self.config.contact_email = email;
+                }
                 self.activate();
             }
+            return;
+        }
+
+        // Guided research-setup step (first launch only): blocks the main UI
+        // until completed or skipped.
+        if !self.setup_complete {
+            self.show_research_setup(ctx);
             return;
         }
 
@@ -397,7 +498,7 @@ impl eframe::App for DesktopApp {
                     ui.selectable_value(
                         &mut self.persistent.active_tab,
                         tab,
-                        tab.label_for(self.language),
+                        format!("{}  {}", tab.icon(), tab.label_for(self.language)),
                     );
                 }
             });
@@ -458,6 +559,9 @@ fn native_window_handle(_cc: &eframe::CreationContext<'_>) -> Option<isize> {
 
 fn install_system_font_fallbacks(ctx: &egui::Context) {
     let mut fonts = egui::FontDefinitions::default();
+    // Phosphor icon glyphs, available as fallbacks in both families so the
+    // icon constants render anywhere text does.
+    egui_phosphor::add_to_fonts(&mut fonts, egui_phosphor::Variant::Regular);
     add_font_if_available(&mut fonts, "malgun_gothic", r"C:\Windows\Fonts\malgun.ttf");
     add_font_if_available(
         &mut fonts,
