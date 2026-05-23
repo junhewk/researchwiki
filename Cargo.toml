@@ -15,6 +15,15 @@ icon = ["assets/app-icon.png"]
 category = "public.app-category.productivity"
 short_description = "Gather academic articles and build a knowledge-graph wiki."
 
+# cargo-bundle needs per-binary metadata when `--bin researchwiki` is used;
+# otherwise it falls back to lowercase names and misses the app icon.
+[package.metadata.bundle.bin.researchwiki]
+name = "ResearchWiki"
+identifier = "com.researchwiki.app"
+icon = ["assets/app-icon.png"]
+category = "public.app-category.productivity"
+short_description = "Gather academic articles and build a knowledge-graph wiki."
+
 [dependencies]
 anyhow = "1.0.100"
 chrono = { version = "0.4.42", features = ["serde"] }

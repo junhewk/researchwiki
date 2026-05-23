@@ -40,7 +40,19 @@ key in the setup wizard.
   - **Windows:** Visual Studio Build Tools 2019+ with the "Desktop development with C++" workload.
   - **Linux:** a C compiler (`build-essential` / `gcc`).
 
-## Install / build
+## Download
+
+Pre-built desktop artifacts are attached to tagged releases:
+
+| Platform | File |
+|---|---|
+| macOS | `ResearchWiki-macos.dmg` |
+| Windows | `ResearchWiki-windows.zip` |
+
+On macOS, open the DMG and copy `ResearchWiki.app` to `/Applications`.
+On Windows, unzip `ResearchWiki-windows.zip` and run `ResearchWiki.exe` from the extracted folder.
+
+## Build from source
 
 ```sh
 git clone <repo-url>
@@ -55,7 +67,7 @@ A bundled `.app` launches from Finder with no terminal window and carries the ap
 
 ```sh
 cargo install cargo-bundle      # one time
-cargo bundle --release
+cargo bundle --release --bin researchwiki
 # → target/release/bundle/osx/ResearchWiki.app
 ```
 
@@ -71,7 +83,7 @@ monochrome glyph, ~36×36, transparent background) before bundling.
 The macOS build is **ad‑hoc signed but not Apple‑notarized**, so the first launch shows an
 "unidentified developer" / "cannot verify" warning. To open it:
 
-- **Control‑click** (right‑click) **ResearchWiki.app → Open**, then **Open** again in the dialog. macOS remembers this and won't ask again.
+- **Control‑click** (right‑click) **ResearchWiki-macos.dmg** or **ResearchWiki.app → Open**, then **Open** again in the dialog. macOS remembers this and won't ask again.
 - Or go to **System Settings → Privacy & Security** and choose **Open Anyway** for ResearchWiki.
 
 If macOS instead says the app is **"damaged and can't be opened"** (this happens with downloaded
