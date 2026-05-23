@@ -9,8 +9,8 @@ mod platform {
     use std::sync::mpsc;
 
     use tray_icon::{
-        Icon, MouseButton, TrayIcon, TrayIconBuilder, TrayIconEvent,
         menu::{Menu, MenuEvent, MenuItem, PredefinedMenuItem},
+        Icon, MouseButton, TrayIcon, TrayIconBuilder, TrayIconEvent,
     };
 
     use super::TrayCommand;
@@ -93,7 +93,9 @@ mod platform {
     }
 
     fn icon() -> anyhow::Result<Icon> {
-        let image = image::load_from_memory(include_bytes!("../assets/tray-icon.png"))?.to_rgba8();
+        let image = image::load_from_memory(include_bytes!("../assets/researchwiki_icon.png"))?
+            .resize_exact(64, 64, image::imageops::FilterType::Lanczos3)
+            .to_rgba8();
         let (width, height) = image.dimensions();
         Ok(Icon::from_rgba(image.into_raw(), width, height)?)
     }
@@ -111,8 +113,8 @@ mod platform {
 
             unsafe {
                 use windows_sys::Win32::UI::WindowsAndMessaging::{
-                    BringWindowToTop, IsWindow, SW_RESTORE, SetForegroundWindow, ShowWindow,
-                    ShowWindowAsync,
+                    BringWindowToTop, IsWindow, SetForegroundWindow, ShowWindow, ShowWindowAsync,
+                    SW_RESTORE,
                 };
 
                 let hwnd = hwnd as windows_sys::Win32::Foundation::HWND;

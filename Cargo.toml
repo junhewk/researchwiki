@@ -11,7 +11,7 @@ license = "MIT"
 [package.metadata.bundle]
 name = "ResearchWiki"
 identifier = "com.researchwiki.app"
-icon = ["assets/app-icon.png"]
+icon = ["assets/researchwiki_icon.png"]
 category = "public.app-category.productivity"
 short_description = "Gather academic articles and build a knowledge-graph wiki."
 
@@ -20,7 +20,7 @@ short_description = "Gather academic articles and build a knowledge-graph wiki."
 [package.metadata.bundle.bin.researchwiki]
 name = "ResearchWiki"
 identifier = "com.researchwiki.app"
-icon = ["assets/app-icon.png"]
+icon = ["assets/researchwiki_icon.png"]
 category = "public.app-category.productivity"
 short_description = "Gather academic articles and build a knowledge-graph wiki."
 

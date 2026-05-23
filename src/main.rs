@@ -4,7 +4,7 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 use researchwiki::{
-    app::{DesktopApp, bootstrap_db, first_launch_seed},
+    app::{bootstrap_db, first_launch_seed, DesktopApp},
     config::AppConfig,
     init_tracing, register_sqlite_vec,
     runtime::DesktopRuntime,
@@ -82,7 +82,7 @@ fn main() -> eframe::Result<()> {
 /// Decodes the embedded app icon into an eframe `IconData` for the window /
 /// taskbar. Returns `None` if the asset can't be decoded (the app still runs).
 fn load_window_icon() -> Option<egui::IconData> {
-    let image = image::load_from_memory(include_bytes!("../assets/app-icon.png"))
+    let image = image::load_from_memory(include_bytes!("../assets/researchwiki_icon.png"))
         .ok()?
         .to_rgba8();
     let (width, height) = image.dimensions();
