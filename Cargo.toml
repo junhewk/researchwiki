@@ -7,11 +7,12 @@ license = "MIT"
 
 # `cargo install cargo-bundle` then `cargo bundle --release` produces a native
 # bundle (e.g. macOS .app) that launches without a terminal and carries the
-# app icon. cargo-bundle generates the platform icon (.icns/.ico) from the PNG.
+# app icon. cargo-bundle needs a standard icon size so it can generate the
+# platform icon (.icns/.ico) from the PNG.
 [package.metadata.bundle]
 name = "ResearchWiki"
 identifier = "com.researchwiki.app"
-icon = ["assets/researchwiki_icon.png"]
+icon = ["assets/app-icon.png"]
 category = "public.app-category.productivity"
 short_description = "Gather academic articles and build a knowledge-graph wiki."
 
@@ -20,7 +21,7 @@ short_description = "Gather academic articles and build a knowledge-graph wiki."
 [package.metadata.bundle.bin.researchwiki]
 name = "ResearchWiki"
 identifier = "com.researchwiki.app"
-icon = ["assets/researchwiki_icon.png"]
+icon = ["assets/app-icon.png"]
 category = "public.app-category.productivity"
 short_description = "Gather academic articles and build a knowledge-graph wiki."
 

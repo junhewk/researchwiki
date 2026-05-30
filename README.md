@@ -71,8 +71,9 @@ cargo bundle --release --bin researchwiki
 # → target/release/bundle/osx/ResearchWiki.app
 ```
 
-The bundled app, window/taskbar icon, and tray/menu-bar icon all use
-`assets/researchwiki_icon.png`. The tray icon is downscaled in memory for the platform tray API.
+The bundled app icon uses `assets/app-icon.png`; the window/taskbar icon and
+tray/menu-bar icon use `assets/researchwiki_icon.png`. The tray icon is
+downscaled in memory for the platform tray API.
 
 > On Windows, release builds run without a console window. On macOS, running the bare
 > binary from a terminal will show logs; launch the bundled `.app` for a clean experience.
