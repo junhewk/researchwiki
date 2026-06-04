@@ -44,6 +44,8 @@ key in the setup wizard.
 
 Pre-built desktop artifacts are attached to tagged releases:
 
+Latest release: **v0.1.1**.
+
 | Platform | File |
 |---|---|
 | macOS | `ResearchWiki-macos.dmg` |
@@ -51,6 +53,13 @@ Pre-built desktop artifacts are attached to tagged releases:
 
 On macOS, open the DMG and copy `ResearchWiki.app` to `/Applications`.
 On Windows, unzip `ResearchWiki-windows.zip` and run `ResearchWiki.exe` from the extracted folder.
+
+### What's new in v0.1.1
+
+- arXiv gather now uses OAI-PMH plus the official RSS feed instead of the throttled
+  export search endpoint, reducing 429 failures during normal source listing.
+- PMC gather treats NCBI ELink PubMed linkage as best-effort, so transient ELink 500s
+  no longer fail the whole PMC source.
 
 ## Build from source
 
@@ -137,9 +146,9 @@ LLM behavior can be tuned with `LLM_DISABLE_THINKING`, `LLM_REQUEST_TIMEOUT_SECO
   so it catches up the next time you launch (or fires live if you keep the app in the
   tray). Auto‑runs look back far enough to cover the gap since the last run.
 
-Notes on sources: arXiv enforces a polite request rate (the app spaces and retries
-requests); **Semantic Scholar** needs an API key (see above). You can sanity‑check every
-source's connectivity with the bundled tool:
+Notes on sources: arXiv gather uses OAI-PMH plus the official RSS feed and spaces
+requests politely; **Semantic Scholar** needs an API key (see above). You can sanity‑check
+every source's connectivity with the bundled tool:
 
 ```sh
 QUERY="diabetes" DAYS_BACK=365 cargo run --bin check_sources
@@ -172,8 +181,10 @@ templates) · **Traces** (LLM call log) · **Settings**.
 
 ## Troubleshooting
 
-- **arXiv returns "Rate exceeded" (429):** arXiv throttles shared/datacenter IPs hard. On a
-  normal connection the app's spacing + retry handles it; otherwise try again later.
+- **arXiv returns "Rate exceeded" (429):** normal gathers use OAI-PMH/RSS instead of
+  export search, but shared/datacenter IPs can still be throttled. Try again later.
+- **PMC/NCBI ELink returns HTTP 500:** PMC articles still list and save; PubMed ID links
+  are skipped for any ELink batch that fails.
 - **Semantic Scholar returns nothing:** set `SEMANTIC_SCHOLAR_API_KEY` (free from
   semanticscholar.org) in Settings — the keyless tier is unusable.
 - **"endpoint not set / invalid" on startup:** the setup wizard reappears if the saved LLM

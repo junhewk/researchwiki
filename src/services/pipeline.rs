@@ -5,22 +5,22 @@ use std::{
 };
 
 use anyhow::{Context, Result, anyhow, bail};
-use chrono::{DateTime, Datelike, Days, NaiveDate, Utc};
+use chrono::{Datelike, Days, NaiveDate, Utc};
 use quick_xml::{Reader, events::Event};
-use reqwest::{Client, StatusCode, header};
+use reqwest::{Client, StatusCode};
 use rusqlite::{Connection, params};
 use serde_json::Value;
 use tokio::{sync::Mutex, task};
 
 use crate::models::workspace::WorkspaceResearchContext;
 
-const ARXIV_API_URL: &str = "https://export.arxiv.org/api/query";
 const ARXIV_OAI_URL: &str = "https://oaipmh.arxiv.org/oai";
+const ARXIV_RSS_BASE_URL: &str = "https://rss.arxiv.org/rss";
 const ARXIV_MIN_REQUEST_INTERVAL: Duration = Duration::from_secs(3);
-const ARXIV_MAX_RETRY_DELAY: Duration = Duration::from_secs(15 * 60);
 const NCBI_ESEARCH_URL: &str = "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/esearch.fcgi";
 const NCBI_ESUMMARY_URL: &str = "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/esummary.fcgi";
 const NCBI_ELINK_URL: &str = "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/elink.fcgi";
+const NCBI_ELINK_BATCH_SIZE: usize = 10;
 const EUROPE_PMC_SEARCH_URL: &str = "https://www.ebi.ac.uk/europepmc/webservices/rest/search";
 const RXIV_MAX_CANDIDATES: usize = 200;
 const RXIV_WINDOW_DAYS: i64 = 30;
@@ -46,13 +46,6 @@ fn polite_pool_ua(contact_email: Option<&str>) -> String {
     }
 }
 
-const ARXIV_QUERIES: &[&str] = &[
-    r#"(all:"artificial intelligence" OR all:"machine learning" OR all:"large language model") AND (all:clinical OR all:healthcare OR all:medical OR all:medicine) AND (all:ethics OR all:bias OR all:fairness OR all:privacy OR all:governance)"#,
-    r#"all:"clinical decision support" AND (all:ethics OR all:bias OR all:fairness OR all:accountability)"#,
-    r#"(all:"human in the loop" OR all:"human oversight") AND (all:healthcare OR all:clinical OR all:medical)"#,
-    r#"(all:"AI governance" OR all:"algorithmic fairness") AND (all:healthcare OR all:clinical OR all:medical)"#,
-];
-
 const ARXIV_OAI_SETS: &[&str] = &[
     "cs:cs:AI",
     "cs:cs:LG",
@@ -62,6 +55,7 @@ const ARXIV_OAI_SETS: &[&str] = &[
     "stat:stat:ML",
 ];
 const ARXIV_OAI_MAX_PAGES_PER_SET: usize = 4;
+const ARXIV_RSS_CATEGORIES: &[&str] = &["cs.AI", "cs.LG", "cs.CL", "cs.CY", "cs.HC", "stat.ML"];
 
 const PMC_QUERY: &str = r#"("artificial intelligence"[All Fields] OR "machine learning"[All Fields] OR "large language model"[All Fields] OR "clinical decision support"[All Fields]) AND (ethics[All Fields] OR bias[All Fields] OR fairness[All Fields] OR privacy[All Fields] OR governance[All Fields] OR accountability[All Fields]) AND open access[filter]"#;
 const PUBMED_QUERY: &str = r#"(("Artificial Intelligence"[Mesh] OR "Machine Learning"[Mesh] OR "artificial intelligence"[Title/Abstract] OR "machine learning"[Title/Abstract] OR "large language model"[Title/Abstract] OR "clinical decision support"[Title/Abstract]) AND (ethics[Title/Abstract] OR bias[Title/Abstract] OR fairness[Title/Abstract] OR privacy[Title/Abstract] OR governance[Title/Abstract] OR accountability[Title/Abstract]) AND hasabstract[text])"#;
@@ -138,14 +132,6 @@ impl ArxivRequestLimiter {
 
     fn mark_request_started(&mut self) {
         self.next_request_at = Some(Instant::now() + ARXIV_MIN_REQUEST_INTERVAL);
-    }
-
-    fn defer_for(&mut self, delay: Duration) {
-        let next_request_at = Instant::now() + delay.max(ARXIV_MIN_REQUEST_INTERVAL);
-        self.next_request_at = Some(match self.next_request_at {
-            Some(existing) => existing.max(next_request_at),
-            None => next_request_at,
-        });
     }
 }
 
@@ -300,26 +286,47 @@ impl PipelineService {
             .checked_sub_days(Days::new(days_back.max(1) as u64))
             .unwrap_or(today);
 
-        if !profile.query_terms().is_empty() {
-            return self.list_arxiv_legacy_search(start, today, profile).await;
-        }
+        let mut merged = BTreeMap::<String, ArticleCandidate>::new();
+        let mut errors = Vec::new();
+        let mut successful_sources = 0;
 
-        match self.list_arxiv_oai(start, today).await {
-            Ok(candidates) => return Ok(candidates),
+        match self.list_arxiv_oai(start, today, profile).await {
+            Ok(candidates) => {
+                successful_sources += 1;
+                merge_candidates(&mut merged, candidates);
+            }
             Err(error) => {
-                tracing::warn!(
-                    "arXiv OAI-PMH harvest failed; falling back to legacy search API: {error}"
-                );
+                tracing::warn!("arXiv OAI-PMH harvest failed: {error}");
+                errors.push(error);
             }
         }
 
-        self.list_arxiv_legacy_search(start, today, profile).await
+        match self.list_arxiv_rss(start, today, profile).await {
+            Ok(candidates) => {
+                successful_sources += 1;
+                merge_candidates(&mut merged, candidates);
+            }
+            Err(error) => {
+                tracing::warn!("arXiv RSS harvest failed: {error}");
+                errors.push(error);
+            }
+        }
+
+        if merged.is_empty() && successful_sources == 0 && !errors.is_empty() {
+            bail!(
+                "all arXiv harvests failed; first error: {}",
+                errors.remove(0)
+            );
+        }
+
+        Ok(merged.into_values().collect())
     }
 
     async fn list_arxiv_oai(
         &self,
         start: NaiveDate,
         end: NaiveDate,
+        profile: &WorkspaceResearchContext,
     ) -> Result<Vec<ArticleCandidate>> {
         let mut merged = std::collections::BTreeMap::<String, ArticleCandidate>::new();
         let mut errors = Vec::new();
@@ -339,6 +346,7 @@ impl PipelineService {
         }
 
         finish_merged_source("arXiv OAI-PMH", merged, errors)
+            .map(|candidates| filter_arxiv_candidates_for_profile(candidates, profile))
     }
 
     async fn fetch_arxiv_oai_set(
@@ -370,15 +378,15 @@ impl PipelineService {
 
             let page = parse_arxiv_oai_records(&body)?;
             if page.no_records_match {
-                return Ok(filter_arxiv_oai_candidates(candidates));
+                return Ok(candidates);
             }
             candidates.extend(page.candidates);
 
             let Some(token) = page.resumption_token else {
-                return Ok(filter_arxiv_oai_candidates(candidates));
+                return Ok(candidates);
             };
             if token.trim().is_empty() {
-                return Ok(filter_arxiv_oai_candidates(candidates));
+                return Ok(candidates);
             }
             resumption_token = Some(token);
         }
@@ -391,146 +399,49 @@ impl PipelineService {
             );
         }
 
-        Ok(filter_arxiv_oai_candidates(candidates))
+        Ok(candidates)
     }
 
-    async fn list_arxiv_legacy_search(
+    async fn list_arxiv_rss(
         &self,
         start: NaiveDate,
         today: NaiveDate,
         profile: &WorkspaceResearchContext,
     ) -> Result<Vec<ArticleCandidate>> {
-        let mut merged = std::collections::BTreeMap::<String, ArticleCandidate>::new();
-        let mut errors = Vec::new();
-        let queries = arxiv_queries(profile);
-        for (index, query) in queries.iter().enumerate() {
-            if index > 0 {
-                tokio::time::sleep(ARXIV_MIN_REQUEST_INTERVAL).await;
-            }
-            match self.fetch_arxiv_query(query, start, today).await {
-                Ok(candidates) => {
-                    for candidate in candidates {
-                        merged
-                            .entry(candidate.source_id.clone())
-                            .or_insert(candidate);
-                    }
-                }
-                Err(error) => {
-                    let rate_limited = error.to_string().contains("HTTP 429");
-                    tracing::warn!("arXiv query '{query}' failed: {error}");
-                    errors.push(error);
-                    if rate_limited {
-                        break;
-                    }
-                }
-            }
-        }
-
-        if merged.is_empty() && !errors.is_empty() {
-            bail!(
-                "all arXiv queries failed; first error: {}",
-                errors.remove(0)
-            );
-        }
-
-        Ok(merged.into_values().collect())
-    }
-
-    async fn fetch_arxiv_query(
-        &self,
-        query: &str,
-        start: NaiveDate,
-        end: NaiveDate,
-    ) -> Result<Vec<ArticleCandidate>> {
-        let from_str = format!("{}0000", start.format("%Y%m%d"));
-        let to_str = format!("{}0000", end.format("%Y%m%d"));
-        let search_query = format!("{query} AND submittedDate:[{from_str} TO {to_str}]");
-
-        // arXiv recommends ≥3s between requests (handled by the limiter) and
-        // returns HTTP 429 on bursts. Retry a few times with a short, interactive
-        // back-off, honoring Retry-After when the server provides it.
-        const MAX_ATTEMPTS: usize = 3;
-        const RETRY_DELAYS: [Duration; 3] = [
-            Duration::from_secs(5),
-            Duration::from_secs(15),
-            Duration::from_secs(30),
-        ];
-
-        for attempt in 1..=MAX_ATTEMPTS {
-            let response = self.send_arxiv_query_request(&search_query).await?;
-
-            let status = response.status();
-            let retry_after = parse_retry_after(response.headers().get(header::RETRY_AFTER));
-            let body = response
-                .text()
-                .await
-                .context("failed to read arXiv response body")?;
-
-            if status.is_success() {
-                return parse_arxiv_feed(&body);
-            }
-
-            let snippet = body.chars().take(240).collect::<String>();
-            let retryable = status == StatusCode::TOO_MANY_REQUESTS || status.is_server_error();
-            if retryable && attempt < MAX_ATTEMPTS {
-                let fallback = RETRY_DELAYS[(attempt - 1).min(RETRY_DELAYS.len() - 1)];
-                let delay = if status == StatusCode::TOO_MANY_REQUESTS {
-                    retry_after.unwrap_or(fallback)
-                } else {
-                    fallback
-                }
-                .clamp(ARXIV_MIN_REQUEST_INTERVAL, ARXIV_MAX_RETRY_DELAY);
-                self.defer_arxiv_requests(delay).await;
-                tracing::warn!(
-                    "arXiv query '{query}' returned HTTP {}; backing off for {} seconds",
-                    status.as_u16(),
-                    delay.as_secs()
-                );
-                tokio::time::sleep(delay).await;
-                continue;
-            }
-
-            bail!(
-                "arXiv query '{query}' returned HTTP {}: {}",
-                status.as_u16(),
-                snippet
-            );
-        }
-
-        unreachable!("arXiv retry loop always returns or bails")
-    }
-
-    async fn send_arxiv_query_request(&self, search_query: &str) -> Result<reqwest::Response> {
         let mut limiter = self.arxiv_limiter.lock().await;
         limiter.wait_for_turn().await;
         limiter.mark_request_started();
+        drop(limiter);
 
-        let params = vec![
-            ("search_query", search_query.to_string()),
-            ("start", "0".to_string()),
-            ("sortBy", "submittedDate".to_string()),
-            ("sortOrder", "descending".to_string()),
-            (
-                "max_results",
-                DEFAULT_SOURCE_QUERY_LIMIT.clamp(1, 100).to_string(),
-            ),
-        ];
-        let request = if search_query.len() > 1400 {
-            self.client.post(ARXIV_API_URL).form(&params)
-        } else {
-            self.client.get(ARXIV_API_URL).query(&params)
-        };
-
-        request
+        let categories = ARXIV_RSS_CATEGORIES.join("+");
+        let url = format!("{ARXIV_RSS_BASE_URL}/{categories}");
+        let response = self
+            .client
+            .get(url)
             .send()
             .await
-            .context("failed to request arXiv query")
+            .context("failed to request arXiv RSS")?;
+        let status = response.status();
+        let body = response
+            .text()
+            .await
+            .context("failed to read arXiv RSS response body")?;
+
+        if !status.is_success() {
+            let snippet = body.chars().take(240).collect::<String>();
+            bail!("arXiv RSS returned HTTP {}: {}", status.as_u16(), snippet);
+        }
+
+        let candidates = parse_arxiv_rss_feed(&body)?;
+        let candidates = filter_candidates_by_known_date(candidates, start, today);
+        Ok(filter_arxiv_candidates_for_profile(candidates, profile))
     }
 
     async fn send_arxiv_oai_request(&self, params: &[(&str, String)]) -> Result<String> {
         let mut limiter = self.arxiv_limiter.lock().await;
         limiter.wait_for_turn().await;
         limiter.mark_request_started();
+        drop(limiter);
 
         let response = self
             .client
@@ -555,11 +466,6 @@ impl PipelineService {
             status.as_u16(),
             snippet
         )
-    }
-
-    async fn defer_arxiv_requests(&self, delay: Duration) {
-        let mut limiter = self.arxiv_limiter.lock().await;
-        limiter.defer_for(delay);
     }
 
     async fn list_pmc(
@@ -606,55 +512,7 @@ impl PipelineService {
             )
             .await?;
 
-        let links = self
-            .get_ncbi_json(
-                NCBI_ELINK_URL,
-                vec![
-                    ("dbfrom", "pmc".to_string()),
-                    ("db", "pubmed".to_string()),
-                    ("id", ids_csv),
-                    ("retmode", "json".to_string()),
-                ],
-                "PMC elink",
-            )
-            .await?;
-
-        let mut pmc_to_pubmed = std::collections::HashMap::<String, String>::new();
-        for linkset in links
-            .get("linksets")
-            .and_then(Value::as_array)
-            .into_iter()
-            .flatten()
-        {
-            let source_pmc_id = linkset
-                .get("ids")
-                .and_then(Value::as_array)
-                .and_then(|ids| ids.first())
-                .and_then(Value::as_str)
-                .map(ToOwned::to_owned);
-
-            let pubmed_id = linkset
-                .get("linksetdbs")
-                .and_then(Value::as_array)
-                .into_iter()
-                .flatten()
-                .find_map(|entry| {
-                    if entry.get("dbto").and_then(Value::as_str) != Some("pubmed") {
-                        return None;
-                    }
-
-                    entry
-                        .get("links")
-                        .and_then(Value::as_array)
-                        .and_then(|links| links.first())
-                        .and_then(Value::as_str)
-                        .map(ToOwned::to_owned)
-                });
-
-            if let (Some(pmc_id), Some(pubmed_id)) = (source_pmc_id, pubmed_id) {
-                pmc_to_pubmed.insert(pmc_id, pubmed_id);
-            }
-        }
+        let pmc_to_pubmed = self.fetch_pmc_pubmed_links(&ids).await;
 
         let result = summaries.get("result").unwrap_or(&Value::Null);
         let mut candidates = Vec::new();
@@ -703,6 +561,43 @@ impl PipelineService {
         }
 
         Ok(candidates)
+    }
+
+    async fn fetch_pmc_pubmed_links(
+        &self,
+        ids: &[String],
+    ) -> std::collections::HashMap<String, String> {
+        let mut merged = std::collections::HashMap::<String, String>::new();
+
+        for chunk in ids.chunks(NCBI_ELINK_BATCH_SIZE.max(1)) {
+            let ids_csv = chunk.join(",");
+            match self
+                .get_ncbi_json_with_attempts(
+                    NCBI_ELINK_URL,
+                    vec![
+                        ("dbfrom", "pmc".to_string()),
+                        ("db", "pubmed".to_string()),
+                        ("id", ids_csv),
+                        ("retmode", "json".to_string()),
+                    ],
+                    "PMC elink",
+                    2,
+                )
+                .await
+            {
+                Ok(links) => {
+                    merged.extend(pmc_pubmed_links_from_response(&links));
+                }
+                Err(error) => {
+                    tracing::warn!(
+                        "PMC elink failed for {} ids; continuing without PubMed links: {error}",
+                        chunk.len()
+                    );
+                }
+            }
+        }
+
+        merged
     }
 
     async fn list_pubmed(
@@ -1393,10 +1288,21 @@ impl PipelineService {
         params: Vec<(&'static str, String)>,
         label: &str,
     ) -> Result<Value> {
-        const MAX_ATTEMPTS: usize = 4;
-        let mut delay = std::time::Duration::from_millis(1100);
+        self.get_ncbi_json_with_attempts(url, params, label, 4)
+            .await
+    }
 
-        for attempt in 1..=MAX_ATTEMPTS {
+    async fn get_ncbi_json_with_attempts(
+        &self,
+        url: &str,
+        params: Vec<(&'static str, String)>,
+        label: &str,
+        max_attempts: usize,
+    ) -> Result<Value> {
+        let mut delay = std::time::Duration::from_millis(1100);
+        let max_attempts = max_attempts.max(1);
+
+        for attempt in 1..=max_attempts {
             let response = self
                 .client
                 .get(url)
@@ -1417,7 +1323,7 @@ impl PipelineService {
             }
 
             let retryable = status == StatusCode::TOO_MANY_REQUESTS || status.is_server_error();
-            if retryable && attempt < MAX_ATTEMPTS {
+            if retryable && attempt < max_attempts {
                 tracing::warn!(
                     label,
                     attempt,
@@ -1504,55 +1410,6 @@ fn europe_pmc_queries(profile: &WorkspaceResearchContext) -> Vec<String> {
             .collect();
     }
     vec![format!("({}) AND OPEN_ACCESS:Y", quoted_or(&concepts, ""))]
-}
-
-fn arxiv_queries(profile: &WorkspaceResearchContext) -> Vec<String> {
-    let concepts = source_query_terms(profile);
-    if concepts.is_empty() {
-        return ARXIV_QUERIES.iter().map(|q| (*q).to_string()).collect();
-    }
-
-    concepts
-        .iter()
-        .filter_map(|query| arxiv_query_from_workspace_query(query))
-        .collect()
-}
-
-fn arxiv_query_from_workspace_query(query: &str) -> Option<String> {
-    let mut clauses = Vec::new();
-    let domains = ordered_focused_query_tokens(query)
-        .into_iter()
-        .filter(|token| WORKSPACE_DOMAIN_TOKENS.contains(&token.as_str()))
-        .map(|token| format!("all:{token}"))
-        .collect::<Vec<_>>();
-    if !domains.is_empty() {
-        clauses.push(format!("({})", domains.join(" OR ")));
-    }
-
-    let phrase_group = arxiv_interest_phrase_clauses(query);
-    if !phrase_group.is_empty() {
-        clauses.push(format!("({})", phrase_group.join(" OR ")));
-    }
-
-    if clauses.len() < 2 {
-        for token in ordered_focused_query_tokens(query) {
-            if WORKSPACE_DOMAIN_TOKENS.contains(&token.as_str()) {
-                continue;
-            }
-            if arxiv_phrase_covers_token(query, &token) {
-                continue;
-            }
-            let clause = format!("all:{token}");
-            if !clauses.contains(&clause) {
-                clauses.push(clause);
-            }
-            if clauses.len() >= 3 {
-                break;
-            }
-        }
-    }
-
-    (!clauses.is_empty()).then(|| clauses.join(" AND "))
 }
 
 fn filter_candidates_by_workspace_terms(
@@ -1656,80 +1513,6 @@ fn focused_query_tokens(query: &str) -> Vec<String> {
         .into_iter()
         .filter(|token| !WORKSPACE_QUERY_STOPWORDS.contains(&token.as_str()))
         .collect()
-}
-
-fn ordered_focused_query_tokens(query: &str) -> Vec<String> {
-    let normalized = normalized_search_text(query);
-    let mut seen = std::collections::BTreeSet::new();
-    normalized
-        .split_whitespace()
-        .filter(|token| token.len() >= 3)
-        .map(str::to_string)
-        .filter(|token| !WORKSPACE_QUERY_STOPWORDS.contains(&token.as_str()))
-        .filter(|token| seen.insert(token.clone()))
-        .collect()
-}
-
-fn arxiv_interest_phrase_clauses(query: &str) -> Vec<String> {
-    let lower = query.to_ascii_lowercase();
-    let mut clauses = Vec::new();
-    let mut push = |clause: &str| {
-        let clause = clause.to_string();
-        if !clauses.contains(&clause) {
-            clauses.push(clause);
-        }
-    };
-
-    if lower.contains("large language model") || lower.contains("large language models") {
-        push(r#"all:"large language model""#);
-        push("all:llm");
-    }
-    if lower.contains("chatbot") || lower.contains("chat bot") || lower.contains("chat-bot") {
-        push("all:chatbot");
-    }
-    if lower.contains("chatgpt") {
-        push("all:chatgpt");
-    }
-    if lower.contains("conversational agent") || lower.contains("conversational agents") {
-        push(r#"all:"conversational agent""#);
-    }
-    if lower.contains("virtual coach") || lower.contains("virtual coaching") {
-        push(r#"all:"virtual coach""#);
-    }
-    if lower.contains("digital coach") || lower.contains("digital coaching") {
-        push(r#"all:"digital coach""#);
-    }
-    if lower.contains("counseling") {
-        push("all:counseling");
-    }
-    if lower.contains("counselling") {
-        push("all:counselling");
-    }
-
-    clauses
-}
-
-fn arxiv_phrase_covers_token(query: &str, token: &str) -> bool {
-    let lower = query.to_ascii_lowercase();
-    match token {
-        "llm" => lower.contains("large language model") || lower.contains("large language models"),
-        "chatbot" => {
-            lower.contains("chatbot") || lower.contains("chat bot") || lower.contains("chat-bot")
-        }
-        "chatgpt" => lower.contains("chatgpt"),
-        "conversational" | "agent" => {
-            lower.contains("conversational agent") || lower.contains("conversational agents")
-        }
-        "virtual" | "coach" | "coaching" => {
-            lower.contains("virtual coach")
-                || lower.contains("virtual coaching")
-                || lower.contains("digital coach")
-                || lower.contains("digital coaching")
-        }
-        "counseling" => lower.contains("counseling"),
-        "counselling" => lower.contains("counselling"),
-        _ => false,
-    }
 }
 
 fn tokenize_search_text(text: &str) -> Vec<String> {
@@ -1913,25 +1696,46 @@ fn parse_candidate_date(value: &str) -> Option<NaiveDate> {
         .or_else(|| NaiveDate::parse_from_str(value, "%Y/%m/%d").ok())
 }
 
-fn parse_retry_after(value: Option<&header::HeaderValue>) -> Option<Duration> {
-    let value = value?.to_str().ok()?.trim();
-    if value.is_empty() {
-        return None;
+fn pmc_pubmed_links_from_response(body: &Value) -> std::collections::HashMap<String, String> {
+    let mut pmc_to_pubmed = std::collections::HashMap::<String, String>::new();
+
+    for linkset in body
+        .get("linksets")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+    {
+        let source_pmc_id = linkset
+            .get("ids")
+            .and_then(Value::as_array)
+            .and_then(|ids| ids.first())
+            .and_then(Value::as_str)
+            .map(ToOwned::to_owned);
+
+        let pubmed_id = linkset
+            .get("linksetdbs")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .find_map(|entry| {
+                if entry.get("dbto").and_then(Value::as_str) != Some("pubmed") {
+                    return None;
+                }
+
+                entry
+                    .get("links")
+                    .and_then(Value::as_array)
+                    .and_then(|links| links.first())
+                    .and_then(Value::as_str)
+                    .map(ToOwned::to_owned)
+            });
+
+        if let (Some(pmc_id), Some(pubmed_id)) = (source_pmc_id, pubmed_id) {
+            pmc_to_pubmed.insert(pmc_id, pubmed_id);
+        }
     }
 
-    if let Ok(seconds) = value.parse::<u64>() {
-        return Some(Duration::from_secs(seconds));
-    }
-
-    let retry_at = DateTime::parse_from_rfc2822(value)
-        .ok()?
-        .with_timezone(&Utc);
-    let now = Utc::now();
-    if retry_at <= now {
-        return Some(ARXIV_MIN_REQUEST_INTERVAL);
-    }
-
-    retry_at.signed_duration_since(now).to_std().ok()
+    pmc_to_pubmed
 }
 
 async fn pause_between_source_queries(index: usize) {
@@ -3095,14 +2899,21 @@ fn apply_arxiv_oai_text(
     }
 }
 
-fn filter_arxiv_oai_candidates(candidates: Vec<ArticleCandidate>) -> Vec<ArticleCandidate> {
+fn filter_arxiv_candidates_for_profile(
+    candidates: Vec<ArticleCandidate>,
+    profile: &WorkspaceResearchContext,
+) -> Vec<ArticleCandidate> {
+    if !profile.query_terms().is_empty() {
+        return candidates;
+    }
+
     candidates
         .into_iter()
-        .filter(arxiv_oai_matches_research_scope)
+        .filter(arxiv_matches_default_research_scope)
         .collect()
 }
 
-fn arxiv_oai_matches_research_scope(candidate: &ArticleCandidate) -> bool {
+fn arxiv_matches_default_research_scope(candidate: &ArticleCandidate) -> bool {
     let text = format!(
         "{} {}",
         candidate.title,
@@ -3159,95 +2970,65 @@ fn has_any_phrase(text: &str, phrases: &[&str]) -> bool {
     phrases.iter().any(|phrase| text.contains(phrase))
 }
 
-fn parse_arxiv_feed(xml: &str) -> Result<Vec<ArticleCandidate>> {
+fn parse_arxiv_rss_feed(xml: &str) -> Result<Vec<ArticleCandidate>> {
     let mut reader = Reader::from_str(xml);
     reader.config_mut().trim_text(true);
 
     let mut buf = Vec::new();
     let mut candidates = Vec::new();
-    let mut current = ArxivEntry::default();
+    let mut current = ArxivRssEntry::default();
     let mut current_text_tag: Option<Vec<u8>> = None;
-    let mut in_entry = false;
-    let mut in_author = false;
+    let mut in_item = false;
 
     loop {
         match reader.read_event_into(&mut buf) {
             Ok(Event::Start(event)) => {
                 let tag = event.local_name().as_ref().to_vec();
-                if tag.as_slice() == b"entry" {
-                    current = ArxivEntry::default();
-                    in_entry = true;
-                } else if in_entry && tag.as_slice() == b"author" {
-                    in_author = true;
-                } else if in_entry && tag.as_slice() == b"link" {
-                    let mut title = None;
-                    let mut href = None;
-                    for attr in event.attributes().flatten() {
-                        match attr.key.local_name().as_ref() {
-                            b"title" => title = Some(attr.unescape_value()?.into_owned()),
-                            b"href" => href = Some(attr.unescape_value()?.into_owned()),
-                            _ => {}
-                        }
-                    }
-                    if title.as_deref() == Some("pdf") {
-                        current.pdf_url = href.map(|value| value.replace("http://", "https://"));
-                    }
-                } else if in_entry {
+                if tag.as_slice() == b"item" {
+                    current = ArxivRssEntry::default();
+                    in_item = true;
+                } else if in_item {
                     current_text_tag = Some(tag);
                 }
             }
             Ok(Event::Text(event)) => {
-                if !in_entry {
+                if !in_item {
                     buf.clear();
                     continue;
                 }
                 let text = event
                     .decode()
-                    .context("failed to decode arXiv XML text")?
+                    .context("failed to decode arXiv RSS XML text")?
                     .into_owned();
-                apply_arxiv_text(
-                    &mut current,
-                    current_text_tag.as_deref(),
-                    in_author,
-                    text.as_str(),
-                );
+                append_arxiv_rss_text(&mut current, current_text_tag.as_deref(), text.as_str());
             }
             Ok(Event::CData(event)) => {
-                if !in_entry {
+                if !in_item {
                     buf.clear();
                     continue;
                 }
                 let text = event
                     .decode()
-                    .context("failed to decode arXiv XML cdata")?
+                    .context("failed to decode arXiv RSS XML cdata")?
                     .into_owned();
-                apply_arxiv_text(
-                    &mut current,
-                    current_text_tag.as_deref(),
-                    in_author,
-                    text.as_str(),
-                );
+                append_arxiv_rss_text(&mut current, current_text_tag.as_deref(), text.as_str());
             }
             Ok(Event::End(event)) => match event.local_name().as_ref() {
-                b"entry" => {
-                    in_entry = false;
-                    in_author = false;
+                b"item" => {
+                    in_item = false;
                     current_text_tag = None;
                     if let Some(candidate) = current.clone().into_candidate() {
                         candidates.push(candidate);
                     }
-                    current = ArxivEntry::default();
+                    current = ArxivRssEntry::default();
                 }
-                b"author" => {
-                    in_author = false;
+                _ if in_item => {
                     current_text_tag = None;
                 }
-                _ => {
-                    current_text_tag = None;
-                }
+                _ => {}
             },
             Ok(Event::Eof) => break,
-            Err(error) => return Err(anyhow!("failed to parse arXiv feed: {error}")),
+            Err(error) => return Err(anyhow!("failed to parse arXiv RSS feed: {error}")),
             _ => {}
         }
 
@@ -3257,7 +3038,7 @@ fn parse_arxiv_feed(xml: &str) -> Result<Vec<ArticleCandidate>> {
     Ok(candidates)
 }
 
-fn apply_arxiv_text(current: &mut ArxivEntry, tag: Option<&[u8]>, in_author: bool, text: &str) {
+fn append_arxiv_rss_text(current: &mut ArxivRssEntry, tag: Option<&[u8]>, text: &str) {
     let Some(tag) = tag else {
         return;
     };
@@ -3268,14 +3049,157 @@ fn apply_arxiv_text(current: &mut ArxivEntry, tag: Option<&[u8]>, in_author: boo
     }
 
     match tag {
-        b"id" => current.id = Some(trimmed.to_string()),
-        b"title" => current.title = Some(trimmed.to_string()),
-        b"summary" => current.summary = Some(trimmed.to_string()),
-        b"published" => current.published = Some(trimmed.to_string()),
-        b"name" if in_author => current.authors.push(trimmed.to_string()),
-        b"doi" => current.doi = Some(trimmed.to_string()),
+        b"guid" | b"id" | b"identifier" | b"link" => append_text(&mut current.id, trimmed),
+        b"title" => append_text(&mut current.title, trimmed),
+        b"description" | b"summary" => append_text(&mut current.description, trimmed),
+        b"creator" | b"author" => append_text(&mut current.authors, trimmed),
+        b"date" | b"pubDate" | b"published" => append_text(&mut current.pub_date, trimmed),
+        b"doi" => append_text(&mut current.doi, trimmed),
         _ => {}
     }
+}
+
+fn append_text(slot: &mut Option<String>, text: &str) {
+    match slot {
+        Some(value) if !value.is_empty() => {
+            value.push(' ');
+            value.push_str(text);
+        }
+        Some(value) => value.push_str(text),
+        None => *slot = Some(text.to_string()),
+    }
+}
+
+fn arxiv_source_id_from_value(value: &str) -> Option<String> {
+    let mut id = value.trim();
+    if let Some(rest) = id.strip_prefix("arXiv:") {
+        id = rest.trim();
+    }
+    if let Some(index) = id.find("/abs/") {
+        id = &id[(index + "/abs/".len())..];
+    } else if let Some(index) = id.find("/pdf/") {
+        id = &id[(index + "/pdf/".len())..];
+    }
+
+    let end = id
+        .find(|character| character == '?' || character == '#')
+        .unwrap_or(id.len());
+    let id = id[..end]
+        .trim()
+        .trim_end_matches(".pdf")
+        .trim_end_matches('/');
+
+    (!id.is_empty()).then(|| id.to_string())
+}
+
+fn clean_arxiv_rss_title(value: &str) -> String {
+    let title = clean_text(value);
+    if let Some(rest) = title.strip_prefix('[') {
+        if let Some(end) = rest.find(']') {
+            return rest[(end + 1)..].trim().to_string();
+        }
+    }
+    title
+}
+
+fn arxiv_rss_description_field(description: &str, label: &str) -> Option<String> {
+    let cleaned = decode_basic_html_entities(&clean_text(description));
+    let lower = cleaned.to_ascii_lowercase();
+    let marker = format!("{}:", label.to_ascii_lowercase());
+    let start = lower.find(&marker)? + marker.len();
+    let mut end = cleaned.len();
+
+    for next in [
+        "authors:",
+        "abstract:",
+        "subjects:",
+        "comments:",
+        "journal-ref:",
+        "doi:",
+    ] {
+        if next == marker {
+            continue;
+        }
+        if let Some(offset) = lower[start..].find(next) {
+            end = end.min(start + offset);
+        }
+    }
+
+    let value = clean_text(cleaned[start..end].trim());
+    (!value.is_empty()).then_some(value)
+}
+
+fn arxiv_rss_summary(description: Option<&str>) -> Option<String> {
+    let description = description?;
+    if let Some(abstract_text) = arxiv_rss_description_field(description, "Abstract") {
+        return Some(abstract_text);
+    }
+
+    let cleaned = decode_basic_html_entities(&clean_text(description));
+    (!cleaned.is_empty()
+        && !cleaned.to_ascii_lowercase().contains("authors:")
+        && !cleaned.to_ascii_lowercase().contains("subjects:"))
+    .then_some(cleaned)
+}
+
+fn arxiv_rss_authors(entry_authors: Option<&str>, description: Option<&str>) -> Option<String> {
+    let authors = entry_authors
+        .map(decode_basic_html_entities)
+        .map(|value| clean_text(&value))
+        .filter(|value| !value.is_empty())
+        .or_else(|| description.and_then(|value| arxiv_rss_description_field(value, "Authors")))?;
+    let authors = authors
+        .trim()
+        .trim_start_matches("Authors:")
+        .trim_start_matches("Author:")
+        .trim()
+        .to_string();
+    (!authors.is_empty()).then_some(authors)
+}
+
+fn first_author_from_author_list(authors: Option<&str>) -> String {
+    authors
+        .and_then(|value| {
+            value
+                .split(|character| character == ',' || character == ';')
+                .next()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(ToOwned::to_owned)
+        })
+        .unwrap_or_else(|| "Unknown".to_string())
+}
+
+fn parse_arxiv_rss_date(value: Option<&str>) -> Option<String> {
+    let value = value?.trim();
+    if value.is_empty() {
+        return None;
+    }
+
+    NaiveDate::parse_from_str(value, "%Y-%m-%d")
+        .ok()
+        .or_else(|| {
+            value
+                .split('T')
+                .next()
+                .and_then(|date| NaiveDate::parse_from_str(date, "%Y-%m-%d").ok())
+        })
+        .or_else(|| {
+            chrono::DateTime::parse_from_rfc2822(value)
+                .ok()
+                .map(|date| date.date_naive())
+        })
+        .map(|date| date.format("%Y-%m-%d").to_string())
+}
+
+fn decode_basic_html_entities(value: &str) -> String {
+    value
+        .replace("&amp;", "&")
+        .replace("&lt;", "<")
+        .replace("&gt;", ">")
+        .replace("&quot;", "\"")
+        .replace("&#39;", "'")
+        .replace("&apos;", "'")
 }
 
 fn extract_authors(value: Option<&Value>) -> (Option<String>, Option<String>) {
@@ -3419,58 +3343,48 @@ impl ArxivOaiAuthor {
 }
 
 #[derive(Debug, Default, Clone)]
-struct ArxivEntry {
+struct ArxivRssEntry {
     id: Option<String>,
     title: Option<String>,
-    summary: Option<String>,
-    published: Option<String>,
-    authors: Vec<String>,
-    pdf_url: Option<String>,
+    description: Option<String>,
+    authors: Option<String>,
+    pub_date: Option<String>,
     doi: Option<String>,
 }
 
-impl ArxivEntry {
+impl ArxivRssEntry {
     fn into_candidate(self) -> Option<ArticleCandidate> {
-        let id = self.id?;
-        let source_id = id
-            .trim()
-            .trim_start_matches("http://arxiv.org/abs/")
-            .trim_start_matches("https://arxiv.org/abs/")
-            .to_string();
-        let title = self.title?.trim().to_string();
+        let source_id = arxiv_source_id_from_value(self.id.as_deref()?)?;
+        let title = clean_arxiv_rss_title(self.title.as_deref()?);
         if source_id.is_empty() || title.is_empty() {
             return None;
         }
 
-        let first_author = self
-            .authors
-            .first()
-            .cloned()
-            .unwrap_or_else(|| "Unknown".to_string());
-        let authors = if self.authors.is_empty() {
-            None
-        } else {
-            Some(self.authors.join(", "))
-        };
-        let pub_date = self
-            .published
-            .as_deref()
-            .and_then(|value| value.split('T').next())
-            .map(ToOwned::to_owned);
-        let url = self
-            .pdf_url
-            .unwrap_or_else(|| format!("https://arxiv.org/pdf/{source_id}.pdf"));
+        let authors = arxiv_rss_authors(self.authors.as_deref(), self.description.as_deref());
+        let first_author = first_author_from_author_list(authors.as_deref());
+        let summary = arxiv_rss_summary(self.description.as_deref());
+        let doi = self
+            .doi
+            .or_else(|| {
+                self.description
+                    .as_deref()
+                    .and_then(|value| arxiv_rss_description_field(value, "DOI"))
+            })
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty());
+        let pub_date = parse_arxiv_rss_date(self.pub_date.as_deref());
+        let url = format!("https://arxiv.org/pdf/{source_id}.pdf");
 
         Some(ArticleCandidate {
             source: "arxiv".to_string(),
             source_id,
             title,
-            summary: self.summary.map(|value| value.trim().to_string()),
+            summary,
             first_author,
             authors,
             pub_date,
             journal: Some("arXiv".to_string()),
-            doi: self.doi.map(|value| value.trim().to_string()),
+            doi,
             url,
         })
     }
@@ -3564,19 +3478,6 @@ mod tests {
     }
 
     #[test]
-    fn arxiv_workspace_queries_are_split_and_focused() {
-        let profile = diabetes_chatbot_context();
-
-        let queries = arxiv_queries(&profile);
-
-        assert_eq!(queries.len(), 3);
-        assert!(queries[0].contains("all:diabetes"));
-        assert!(queries[0].contains("all:chatbot"));
-        assert!(!queries[0].contains(" OR all:\"diabetes conversational"));
-        assert!(queries[2].contains(r#"all:"large language model""#));
-    }
-
-    #[test]
     fn rxiv_date_windows_are_recent_first() {
         let windows = rxiv_date_windows(
             NaiveDate::from_ymd_opt(2026, 3, 1).unwrap(),
@@ -3609,6 +3510,31 @@ mod tests {
             rxiv_total_from_body(&json!({ "messages": [{ "total": 12 }] })),
             Some(12)
         );
+    }
+
+    #[test]
+    fn parses_pmc_pubmed_elink_response() {
+        let body = json!({
+            "linksets": [
+                {
+                    "ids": ["12345"],
+                    "linksetdbs": [
+                        { "dbto": "pubmed", "links": ["987654"] }
+                    ]
+                },
+                {
+                    "ids": ["67890"],
+                    "linksetdbs": [
+                        { "dbto": "pmc", "links": ["111"] }
+                    ]
+                }
+            ]
+        });
+
+        let links = pmc_pubmed_links_from_response(&body);
+
+        assert_eq!(links.get("12345").map(String::as_str), Some("987654"));
+        assert!(!links.contains_key("67890"));
     }
 
     #[test]
@@ -3736,7 +3662,42 @@ mod tests {
         assert_eq!(candidate.first_author, "Rui Chu");
         assert_eq!(candidate.pub_date.as_deref(), Some("2026-05-15"));
         assert_eq!(candidate.doi.as_deref(), Some("10.1000/example"));
-        assert!(arxiv_oai_matches_research_scope(candidate));
+        assert!(arxiv_matches_default_research_scope(candidate));
+    }
+
+    #[test]
+    fn parses_arxiv_rss_items() {
+        let xml = r#"
+            <rss version="2.0">
+              <channel>
+                <item>
+                  <title>[cs.CL] Fair Clinical Large Language Models</title>
+                  <link>https://arxiv.org/abs/2605.16113</link>
+                  <description><![CDATA[
+                    <p>Authors: Rui Chu, Ada Lovelace</p>
+                    <p>Abstract: Privacy &amp; bias governance for healthcare LLM systems.</p>
+                    <p>Subjects: Computation and Language (cs.CL)</p>
+                  ]]></description>
+                  <pubDate>Mon, 18 May 2026 00:00:00 GMT</pubDate>
+                </item>
+              </channel>
+            </rss>
+        "#;
+
+        let candidates = parse_arxiv_rss_feed(xml).expect("RSS items");
+
+        assert_eq!(candidates.len(), 1);
+        let candidate = &candidates[0];
+        assert_eq!(candidate.uid(), "arxiv:2605.16113");
+        assert_eq!(candidate.title, "Fair Clinical Large Language Models");
+        assert_eq!(candidate.first_author, "Rui Chu");
+        assert_eq!(candidate.authors.as_deref(), Some("Rui Chu, Ada Lovelace"));
+        assert_eq!(
+            candidate.summary.as_deref(),
+            Some("Privacy & bias governance for healthcare LLM systems")
+        );
+        assert_eq!(candidate.pub_date.as_deref(), Some("2026-05-18"));
+        assert_eq!(candidate.url, "https://arxiv.org/pdf/2605.16113.pdf");
     }
 
     #[test]
@@ -3751,23 +3712,6 @@ mod tests {
 
         assert!(page.no_records_match);
         assert!(page.candidates.is_empty());
-    }
-
-    #[test]
-    fn parses_retry_after_seconds() {
-        let value = header::HeaderValue::from_static("120");
-
-        assert_eq!(
-            parse_retry_after(Some(&value)),
-            Some(Duration::from_secs(120))
-        );
-    }
-
-    #[test]
-    fn ignores_invalid_retry_after_values() {
-        let value = header::HeaderValue::from_static("not-a-date");
-
-        assert_eq!(parse_retry_after(Some(&value)), None);
     }
 
     #[test]
