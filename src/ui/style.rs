@@ -49,7 +49,8 @@ pub enum Tone {
 }
 
 impl Tone {
-    fn colors(self) -> (egui::Color32, egui::Color32) {
+    /// `(background, foreground)` pair for this tone.
+    pub(crate) fn colors(self) -> (egui::Color32, egui::Color32) {
         match self {
             Tone::Neutral => (color::SURFACE_SUNKEN, color::MUTED),
             Tone::Accent => (color::ACCENT_WEAK, color::ACCENT),

@@ -23,6 +23,7 @@ use crate::{
         i18n,
         panels::{PanelCtx, Panels, Tab},
         style,
+        toast::{ToastKind, Toasts},
     },
 };
 
@@ -100,6 +101,7 @@ pub struct DesktopApp {
     panels: Panels,
     persistent: PersistentUi,
     status: Option<String>,
+    toasts: Toasts,
     workspaces: Vec<WorkspaceSummary>,
     workspaces_refreshed_at: Option<std::time::Instant>,
     language: UiLanguage,
@@ -152,6 +154,7 @@ impl DesktopApp {
             panels: Panels::default(),
             persistent,
             status: None,
+            toasts: Toasts::default(),
             workspaces: Vec::new(),
             workspaces_refreshed_at: None,
             language,
@@ -323,9 +326,14 @@ impl DesktopApp {
         while let Ok(evt) = self.ui_rx.try_recv() {
             match evt {
                 UiEvent::Status(msg) => self.status = Some(msg),
+                UiEvent::Toast { kind, message } => self.toasts.push(kind, message),
+                UiEvent::SwitchTab(tab) => self.persistent.active_tab = tab,
                 UiEvent::LanguageChanged(language) => {
                     self.language = language;
-                    self.status = Some(i18n::t(language, "Language updated.").to_string());
+                    self.toasts.push(
+                        ToastKind::Success,
+                        i18n::t(language, "Language updated."),
+                    );
                 }
                 UiEvent::JobProgress {
                     run_id,
@@ -340,10 +348,17 @@ impl DesktopApp {
                     message,
                 } => {
                     let outcome = if success { "ok" } else { "failed" };
-                    self.status = Some(match message {
+                    let line = match message {
                         Some(m) => format!("[{run_id}] {outcome}: {m}"),
                         None => format!("[{run_id}] {outcome}"),
-                    });
+                    };
+                    let kind = if success {
+                        ToastKind::Success
+                    } else {
+                        ToastKind::Error
+                    };
+                    self.toasts.push(kind, line.clone());
+                    self.status = Some(line);
                 }
             }
         }
@@ -407,7 +422,10 @@ impl DesktopApp {
         ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
         ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
         ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
-        self.status = Some(i18n::t(self.language, "Restored from system tray.").to_string());
+        self.toasts.push(
+            ToastKind::Info,
+            i18n::t(self.language, "Restored from system tray."),
+        );
     }
 
     fn hide_to_tray_if_minimized(&mut self, ctx: &egui::Context) {
@@ -430,12 +448,12 @@ impl DesktopApp {
             self.hidden_to_tray = true;
             ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
             ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
-            self.status = Some(
+            self.toasts.push(
+                ToastKind::Info,
                 i18n::t(
                     self.language,
                     "Minimized to system tray. Scheduler remains active.",
-                )
-                .to_string(),
+                ),
             );
         }
     }
@@ -472,12 +490,12 @@ impl DesktopApp {
     fn minimize_to_tray(&mut self, ctx: &egui::Context) {
         self.hidden_to_tray = true;
         ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
-        self.status = Some(
+        self.toasts.push(
+            ToastKind::Info,
             i18n::t(
                 self.language,
                 "Minimized to system tray. Scheduler remains active.",
-            )
-            .to_string(),
+            ),
         );
     }
 
@@ -764,9 +782,15 @@ impl eframe::App for DesktopApp {
             self.build_state_for_workspace(new_id);
         }
 
-        egui::TopBottomPanel::bottom("status").show(ctx, |ui| {
-            ui.label(self.status.as_deref().unwrap_or(""));
-        });
+        egui::TopBottomPanel::bottom("status")
+            .frame(
+                egui::Frame::new()
+                    .fill(style::color::SURFACE_ALT)
+                    .inner_margin(egui::Margin::symmetric(12, 4)),
+            )
+            .show(ctx, |ui| {
+                style::muted_label(ui, self.status.as_deref().unwrap_or(""));
+            });
 
         egui::CentralPanel::default().show(ctx, |ui| {
             if let Some(state) = &self.state {
@@ -780,6 +804,8 @@ impl eframe::App for DesktopApp {
                 self.panels.show(self.persistent.active_tab, ui, &panel_ctx);
             }
         });
+
+        self.toasts.show(ctx);
     }
 
     fn save(&mut self, storage: &mut dyn eframe::Storage) {

@@ -6,10 +6,15 @@ use tokio::{
 };
 
 use crate::models::settings::UiLanguage;
+use crate::ui::{panels::Tab, toast::ToastKind};
 
 #[derive(Debug, Clone)]
 pub enum UiEvent {
     Status(String),
+    /// Transient notification rendered in the top-right toast stack.
+    Toast { kind: ToastKind, message: String },
+    /// Navigate the main window to a tab (e.g. from an empty-state action).
+    SwitchTab(Tab),
     LanguageChanged(UiLanguage),
     JobProgress {
         run_id: String,
