@@ -12,9 +12,13 @@ use crate::{
     },
 };
 
-const EVAL_TEXT_HEAD_CHARS: usize = 10_000;
+const EVAL_TEXT_HEAD_CHARS: usize = 8_000;
+/// A window sampled from the centre of the article, so the middle sections
+/// (methods detail, results) are represented rather than invisible.
+const EVAL_TEXT_MIDDLE_CHARS: usize = 4_000;
 const EVAL_TEXT_TAIL_CHARS: usize = 4_000;
-const EVAL_TEXT_MAX_CHARS: usize = EVAL_TEXT_HEAD_CHARS + EVAL_TEXT_TAIL_CHARS;
+const EVAL_TEXT_MAX_CHARS: usize =
+    EVAL_TEXT_HEAD_CHARS + EVAL_TEXT_MIDDLE_CHARS + EVAL_TEXT_TAIL_CHARS;
 
 #[derive(Clone)]
 pub struct ArticleEvaluator {
@@ -145,6 +149,9 @@ fn overlay_candidate_metadata(fields: &mut Map<String, Value>, candidate: &Artic
     }
 }
 
+/// Bounds the evaluation input to `EVAL_TEXT_MAX_CHARS` by sampling head, a
+/// centred middle window, and tail — so no region of a long article is
+/// entirely invisible to the evaluator.
 fn compact_evaluation_text(text: &str) -> String {
     let char_count = text.chars().count();
     if char_count <= EVAL_TEXT_MAX_CHARS {
@@ -154,8 +161,23 @@ fn compact_evaluation_text(text: &str) -> String {
     let head = text.chars().take(EVAL_TEXT_HEAD_CHARS).collect::<String>();
     let tail_start = char_count.saturating_sub(EVAL_TEXT_TAIL_CHARS);
     let tail = text.chars().skip(tail_start).collect::<String>();
+
+    // Centre the middle window, clamped so it never overlaps the head or
+    // tail. char_count > MAX guarantees at least MIDDLE chars of room between
+    // them.
+    let middle_start = ((char_count - EVAL_TEXT_MIDDLE_CHARS) / 2)
+        .clamp(
+            EVAL_TEXT_HEAD_CHARS,
+            tail_start - EVAL_TEXT_MIDDLE_CHARS,
+        );
+    let middle = text
+        .chars()
+        .skip(middle_start)
+        .take(EVAL_TEXT_MIDDLE_CHARS)
+        .collect::<String>();
+
     format!(
-        "{head}\n\n[... middle of article omitted to keep local LLM evaluation bounded ...]\n\n{tail}"
+        "{head}\n\n[... part of the article omitted to keep local LLM evaluation bounded ...]\n\n{middle}\n\n[... part of the article omitted to keep local LLM evaluation bounded ...]\n\n{tail}"
     )
 }
 
@@ -193,20 +215,27 @@ mod tests {
     use serde_json::json;
 
     #[test]
-    fn compact_evaluation_text_keeps_head_and_tail() {
+    fn compact_evaluation_text_samples_head_middle_and_tail() {
+        // Short input passes through untouched.
+        assert_eq!(compact_evaluation_text("short article"), "short article");
+
         let text = format!(
             "{}{}{}",
-            "A".repeat(EVAL_TEXT_HEAD_CHARS + 100),
-            "MIDDLE",
-            "Z".repeat(EVAL_TEXT_TAIL_CHARS + 100)
+            "A".repeat(EVAL_TEXT_HEAD_CHARS + 2_000),
+            "M".repeat(EVAL_TEXT_MIDDLE_CHARS),
+            "Z".repeat(EVAL_TEXT_TAIL_CHARS + 2_000)
         );
 
         let compacted = compact_evaluation_text(&text);
 
         assert!(compacted.starts_with("AAA"));
-        assert!(compacted.contains("middle of article omitted"));
         assert!(compacted.ends_with("ZZZ"));
-        assert!(compacted.len() < text.len());
+        assert!(
+            compacted.contains('M'),
+            "centre of the article is sampled into the middle window"
+        );
+        assert_eq!(compacted.matches("omitted").count(), 2);
+        assert!(compacted.chars().count() < text.chars().count());
     }
 
     #[test]

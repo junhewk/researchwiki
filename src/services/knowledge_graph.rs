@@ -43,7 +43,15 @@ use crate::{
 const WS_ENTITY_SCOPE: &str = "(SELECT kae.entity_id FROM kg_article_entities kae \
      JOIN haie_rev h ON h.uid = kae.article_uid WHERE h.workspace_id = ?)";
 
-const KG_TEXT_MAX_CHARS: usize = 8_000;
+/// Budget for the text handed to chunked entity extraction. Sized so the
+/// bounded text still fits inside [`KG_MAX_CHUNKS`] 450-word chunks
+/// (~24k chars ≈ 4k words ≈ 11 chunks) — raising it past that silently drops
+/// the tail again.
+const KG_TEXT_MAX_CHARS: usize = 24_000;
+/// Portion of [`KG_TEXT_MAX_CHARS`] reserved for the document tail when the
+/// text is longer than the budget, so conclusions/limitations still reach the
+/// extractor instead of only the front matter.
+const KG_TEXT_TAIL_CHARS: usize = 8_000;
 const KG_CHUNK_WORDS: usize = 450;
 const KG_CHUNK_OVERLAP_WORDS: usize = 60;
 const KG_MAX_CHUNKS: usize = 12;
@@ -4498,7 +4506,25 @@ fn prepare_kg_text(title: Option<&str>, content: Option<&str>) -> String {
         }
     }
 
-    text.chars().take(KG_TEXT_MAX_CHARS).collect()
+    bound_kg_text(&text)
+}
+
+/// Bounds the extraction text to [`KG_TEXT_MAX_CHARS`]. Overlong documents are
+/// sampled head + tail rather than head-only, so results, discussion, and
+/// conclusions contribute entities too.
+fn bound_kg_text(text: &str) -> String {
+    let char_count = text.chars().count();
+    if char_count <= KG_TEXT_MAX_CHARS {
+        return text.to_string();
+    }
+
+    let head_chars = KG_TEXT_MAX_CHARS - KG_TEXT_TAIL_CHARS;
+    let head: String = text.chars().take(head_chars).collect();
+    let tail: String = text
+        .chars()
+        .skip(char_count - KG_TEXT_TAIL_CHARS)
+        .collect();
+    format!("{head}\n\n[... middle of document omitted ...]\n\n{tail}")
 }
 
 fn chunk_text_for_kg(text: &str) -> Vec<String> {
@@ -4637,12 +4663,31 @@ fn json_object<const N: usize>(pairs: [(&str, JsonValue); N]) -> Map<String, Jso
 #[cfg(test)]
 mod tests {
     use super::{
-        canonicalize_relationship, is_metadata_entity_name, validate_extraction,
-        validate_synthesis_output,
+        KG_TEXT_MAX_CHARS, KG_TEXT_TAIL_CHARS, bound_kg_text, canonicalize_relationship,
+        is_metadata_entity_name, validate_extraction, validate_synthesis_output,
     };
     use crate::models::knowledge_graph::{
         ChunkExtraction, ExtractedEntity, ExtractedRelationship, SynthesisGenerationOutput,
     };
+
+    #[test]
+    fn kg_text_bound_samples_head_and_tail() {
+        // Short input passes through untouched.
+        assert_eq!(bound_kg_text("short"), "short");
+
+        let text = format!(
+            "{}{}",
+            "A".repeat(KG_TEXT_MAX_CHARS),
+            "Z".repeat(KG_TEXT_TAIL_CHARS)
+        );
+
+        let bounded = bound_kg_text(&text);
+
+        assert!(bounded.starts_with("AAA"));
+        assert!(bounded.ends_with("ZZZ"), "document tail is preserved");
+        assert!(bounded.contains("middle of document omitted"));
+        assert!(bounded.chars().count() < text.chars().count());
+    }
 
     #[test]
     fn relationship_canonicalization_normalizes_and_flips_passive_voice() {
