@@ -7,6 +7,12 @@ pub const GRAPH_LABEL_TEXT_SIZE: f32 = 13.0;
 pub const RADIUS_CARD: u8 = 8;
 pub const RADIUS_CONTROL: u8 = 6;
 
+/// Spacing scale shared by helpers and panels.
+pub const SPACE_XS: f32 = 4.0;
+pub const SPACE_S: f32 = 8.0;
+pub const SPACE_M: f32 = 12.0;
+pub const SPACE_L: f32 = 16.0;
+
 /// Light "Tailwind-ish" design tokens. One source of truth for every surface,
 /// border, text, and accent color used by the component helpers and theme.
 pub mod color {
@@ -28,6 +34,8 @@ pub mod color {
     pub const WARNING: Color32 = Color32::from_rgb(0xB4, 0x54, 0x09);
     pub const WARNING_WEAK: Color32 = Color32::from_rgb(0xFE, 0xF3, 0xC7);
     pub const ON_ACCENT: Color32 = Color32::WHITE;
+    /// Pressed-control fill; one step darker than [`ACCENT_WEAK`] so press ≠ hover.
+    pub const ACCENT_PRESSED: Color32 = Color32::from_rgb(0xE0, 0xE7, 0xFF);
 }
 
 /// Tone for [`badge`] and status pills.
@@ -120,16 +128,16 @@ fn light_visuals() -> egui::Visuals {
     v.widgets.inactive.fg_stroke = text;
     v.widgets.inactive.corner_radius = radius;
 
-    // Hover.
+    // Hover: soft accent wash with a lighter outline.
     v.widgets.hovered.bg_fill = color::ACCENT_WEAK;
     v.widgets.hovered.weak_bg_fill = color::ACCENT_WEAK;
-    v.widgets.hovered.bg_stroke = Stroke::new(1.0, color::ACCENT);
+    v.widgets.hovered.bg_stroke = Stroke::new(1.0, color::ACCENT_HOVER);
     v.widgets.hovered.fg_stroke = text;
     v.widgets.hovered.corner_radius = radius;
 
-    // Pressed / active.
-    v.widgets.active.bg_fill = color::ACCENT_WEAK;
-    v.widgets.active.weak_bg_fill = color::ACCENT_WEAK;
+    // Pressed / active: one step darker than hover so the press registers.
+    v.widgets.active.bg_fill = color::ACCENT_PRESSED;
+    v.widgets.active.weak_bg_fill = color::ACCENT_PRESSED;
     v.widgets.active.bg_stroke = Stroke::new(1.0, color::ACCENT);
     v.widgets.active.fg_stroke = text;
     v.widgets.active.corner_radius = radius;
@@ -295,6 +303,213 @@ pub fn field<R>(
     }
     ui.add_space(6.0);
     result
+}
+
+/// Centered empty-state block: large muted icon, strong title, muted
+/// description, and an optional primary action. Returns the action button's
+/// `Response` when `action` is provided so callers can react to clicks.
+pub fn empty_state(
+    ui: &mut egui::Ui,
+    glyph: &str,
+    title: &str,
+    description: &str,
+    action: Option<&str>,
+) -> Option<egui::Response> {
+    let mut action_response = None;
+    ui.add_space(SPACE_L * 2.0);
+    ui.vertical_centered(|ui| {
+        ui.label(egui::RichText::new(glyph).size(40.0).color(color::MUTED));
+        ui.add_space(SPACE_S);
+        ui.label(
+            egui::RichText::new(title)
+                .size(SECTION_TEXT_SIZE)
+                .strong()
+                .color(color::TEXT),
+        );
+        ui.add_space(SPACE_XS);
+        ui.add(
+            egui::Label::new(
+                egui::RichText::new(description)
+                    .size(HELP_TEXT_SIZE)
+                    .color(color::MUTED),
+            )
+            .wrap(),
+        );
+        if let Some(action) = action {
+            ui.add_space(SPACE_M);
+            action_response = Some(primary_button(ui, action));
+        }
+    });
+    ui.add_space(SPACE_L * 2.0);
+    action_response
+}
+
+/// Small muted "?" glyph that reveals a tooltip on hover. Place beside labels
+/// for advanced or ambiguous fields.
+pub fn help_icon(ui: &mut egui::Ui, text: &str) -> egui::Response {
+    ui.add(
+        egui::Label::new(
+            egui::RichText::new(icon::QUESTION)
+                .size(HELP_TEXT_SIZE)
+                .color(color::MUTED),
+        )
+        .sense(egui::Sense::hover()),
+    )
+    .on_hover_text(text)
+}
+
+/// What the user chose on an [`error_notice`].
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum NoticeAction {
+    None,
+    Retry,
+    Dismiss,
+}
+
+/// Persistent error card: danger-toned, wrapped message, optional retry
+/// button, and a dismiss button. Stays visible until the caller clears it.
+pub fn error_notice(ui: &mut egui::Ui, message: &str, retry_label: Option<&str>) -> NoticeAction {
+    let mut action = NoticeAction::None;
+    egui::Frame::new()
+        .fill(color::DANGER_WEAK)
+        .stroke(egui::Stroke::new(1.0, color::DANGER))
+        .corner_radius(egui::CornerRadius::same(RADIUS_CARD))
+        .inner_margin(egui::Margin::symmetric(12, 8))
+        .show(ui, |ui| {
+            ui.horizontal(|ui| {
+                ui.label(
+                    egui::RichText::new(icon::WARNING_CIRCLE)
+                        .size(SECTION_TEXT_SIZE)
+                        .color(color::DANGER),
+                );
+                let reserved = if retry_label.is_some() { 110.0 } else { 40.0 };
+                ui.add_sized(
+                    [(ui.available_width() - reserved).max(80.0), 0.0],
+                    egui::Label::new(
+                        egui::RichText::new(message)
+                            .size(HELP_TEXT_SIZE)
+                            .color(color::DANGER),
+                    )
+                    .wrap(),
+                );
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if ui
+                        .add(
+                            egui::Button::new(
+                                egui::RichText::new(icon::X)
+                                    .size(HELP_TEXT_SIZE)
+                                    .color(color::DANGER),
+                            )
+                            .frame(false),
+                        )
+                        .clicked()
+                    {
+                        action = NoticeAction::Dismiss;
+                    }
+                    if let Some(label) = retry_label {
+                        if ui
+                            .add(
+                                egui::Button::new(
+                                    egui::RichText::new(label)
+                                        .size(HELP_TEXT_SIZE)
+                                        .color(color::DANGER)
+                                        .strong(),
+                                )
+                                .fill(color::SURFACE)
+                                .stroke(egui::Stroke::new(1.0, color::DANGER))
+                                .corner_radius(egui::CornerRadius::same(RADIUS_CONTROL)),
+                            )
+                            .clicked()
+                        {
+                            action = NoticeAction::Retry;
+                        }
+                    }
+                });
+            });
+        });
+    action
+}
+
+/// Inline spinner with a muted label, for any in-flight async operation.
+pub fn loading_indicator(ui: &mut egui::Ui, label: &str) {
+    ui.horizontal(|ui| {
+        ui.spinner();
+        muted_label(ui, label);
+    });
+}
+
+/// Single-line secret input with a reveal toggle. `revealed` lives in the
+/// caller's struct so the toggle persists across frames.
+pub fn secret_edit(
+    ui: &mut egui::Ui,
+    value: &mut String,
+    revealed: &mut bool,
+    hint: &str,
+) -> egui::Response {
+    ui.horizontal(|ui| {
+        let response = ui.add(
+            egui::TextEdit::singleline(value)
+                .password(!*revealed)
+                .hint_text(hint)
+                .desired_width(ui.available_width() - 36.0),
+        );
+        let glyph = if *revealed {
+            icon::EYE_SLASH
+        } else {
+            icon::EYE
+        };
+        if ui
+            .add(egui::Button::new(egui::RichText::new(glyph).color(color::MUTED)).frame(false))
+            .clicked()
+        {
+            *revealed = !*revealed;
+        }
+        response
+    })
+    .inner
+}
+
+/// Top-navigation tab: icon + label, accent text and a 2px underline when
+/// selected, soft accent fill on hover.
+pub fn nav_tab(ui: &mut egui::Ui, selected: bool, glyph: &str, label: &str) -> egui::Response {
+    let fg = if selected { color::ACCENT } else { color::MUTED };
+    let text = egui::RichText::new(format!("{glyph}  {label}"))
+        .size(HELP_TEXT_SIZE)
+        .color(fg);
+    let text = if selected { text.strong() } else { text };
+    let response = ui.add(
+        egui::Button::new(text)
+            .fill(egui::Color32::TRANSPARENT)
+            .stroke(egui::Stroke::NONE)
+            .corner_radius(egui::CornerRadius::same(RADIUS_CONTROL)),
+    );
+    if response.hovered() && !selected {
+        ui.painter().rect_filled(
+            response.rect,
+            egui::CornerRadius::same(RADIUS_CONTROL),
+            color::ACCENT_WEAK.gamma_multiply(0.6),
+        );
+    }
+    if selected {
+        let rect = response.rect;
+        let underline = egui::Rect::from_min_max(
+            egui::pos2(rect.left() + 4.0, rect.bottom() - 2.0),
+            egui::pos2(rect.right() - 4.0, rect.bottom()),
+        );
+        ui.painter()
+            .rect_filled(underline, egui::CornerRadius::same(1), color::ACCENT);
+    }
+    response
+}
+
+/// Bold muted small text for table/grid headers.
+pub fn table_header(ui: &mut egui::Ui, text: &str) {
+    ui.label(
+        egui::RichText::new(text)
+            .size(HELP_TEXT_SIZE)
+            .strong()
+            .color(color::MUTED),
+    );
 }
 
 /// A dashboard metric card: large value over a muted label.
