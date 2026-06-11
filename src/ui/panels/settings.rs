@@ -22,6 +22,9 @@ enum Msg {
 pub struct Panel {
     channel: Option<MsgChannel<Msg>>,
     initialized: bool,
+    /// Tracks the workspace whose `AppState` the form was populated from, so a
+    /// switch re-populates — unless the user has unsaved edits.
+    loaded_workspace: Option<i64>,
     loading: bool,
 
     ui_language: UiLanguage,
@@ -66,8 +69,17 @@ impl Panel {
         self.drain();
         if !self.initialized {
             self.initialized = true;
+            self.loaded_workspace = Some(ctx.active_workspace_id);
             self.populate_from_state(ctx);
             self.spawn_load(ctx);
+        } else if self.loaded_workspace != Some(ctx.active_workspace_id) {
+            self.loaded_workspace = Some(ctx.active_workspace_id);
+            let dirty =
+                self.llm_dirty || self.embed_dirty || self.contact_email_dirty || self.s2_dirty;
+            if !dirty {
+                self.populate_from_state(ctx);
+                self.spawn_load(ctx);
+            }
         }
 
         style::panel_header_icon(ui, style::icon::GEAR, ctx.t("Settings"), None);
@@ -450,6 +462,10 @@ impl Panel {
     }
 
     fn show_embedding_confirm(&mut self, egui_ctx: &egui::Context, ctx: &PanelCtx<'_>) {
+        if egui_ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
+            self.embedding_confirm_open = false;
+            return;
+        }
         let mut close = false;
         let mut confirm = false;
         let new_dim = self.embedding_dim_input.trim().parse::<u32>().unwrap_or(0);

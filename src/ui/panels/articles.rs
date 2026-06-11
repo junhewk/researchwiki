@@ -38,6 +38,9 @@ struct Filters {
 pub struct Panel {
     channel: Option<MsgChannel<Msg>>,
     initialized: bool,
+    /// Workspace the current data was fetched for; a mismatch triggers a
+    /// refetch while keeping the user's filters/sort/page-size intact.
+    loaded_workspace: Option<i64>,
 
     items: Vec<ArticleResponse>,
     total: i64,
@@ -67,6 +70,17 @@ impl Panel {
             self.initialized = true;
             self.page = 1;
             self.page_size = 100;
+        }
+        if self.loaded_workspace != Some(ctx.active_workspace_id) {
+            self.loaded_workspace = Some(ctx.active_workspace_id);
+            self.items.clear();
+            self.total = 0;
+            self.pages = 0;
+            self.page = 1;
+            self.selected_uid = None;
+            self.selected_index = None;
+            self.detail_open = false;
+            self.error = None;
             self.fetch(ctx);
         }
 
@@ -371,6 +385,10 @@ impl Panel {
     }
 
     fn show_detail_window(&mut self, egui_ctx: &egui::Context) {
+        if egui_ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
+            self.detail_open = false;
+            return;
+        }
         let Some(idx) = self.selected_index else {
             self.detail_open = false;
             return;

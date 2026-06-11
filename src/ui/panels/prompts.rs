@@ -20,6 +20,9 @@ enum Msg {
 pub struct Panel {
     channel: Option<MsgChannel<Msg>>,
     loaded: bool,
+    /// Workspace the prompt list was loaded from; prompts live in the
+    /// workspace DB, so a switch reloads and clears the editor.
+    loaded_workspace: Option<i64>,
     prompts: Vec<PromptResponse>,
     selected: Option<String>,
     editor: String,
@@ -65,6 +68,15 @@ impl Panel {
             }
         }
 
+        if self.loaded_workspace != Some(ctx.active_workspace_id) {
+            self.loaded_workspace = Some(ctx.active_workspace_id);
+            self.prompts.clear();
+            self.selected = None;
+            self.editor.clear();
+            self.versions.clear();
+            self.status = None;
+            self.loaded = false;
+        }
         if !self.loaded && !self.busy {
             self.load_list(ctx);
         }

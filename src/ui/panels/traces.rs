@@ -403,6 +403,10 @@ impl Panel {
     }
 
     fn show_detail_window(&mut self, egui_ctx: &egui::Context, ctx: &PanelCtx<'_>) {
+        if egui_ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
+            self.detail = None;
+            return;
+        }
         let mut open = true;
         let Some(detail) = self.detail.as_ref() else {
             return;

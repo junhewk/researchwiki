@@ -24,6 +24,9 @@ enum Msg {
 pub struct Panel {
     channel: Option<MsgChannel<Msg>>,
     initialized: bool,
+    /// Workspace the current data was fetched for; a mismatch refetches while
+    /// keeping search/filter inputs.
+    loaded_workspace: Option<i64>,
 
     // List + search.
     search: String,
@@ -60,6 +63,16 @@ impl Panel {
         if !self.initialized {
             self.initialized = true;
             self.limit = 50;
+        }
+        if self.loaded_workspace != Some(ctx.active_workspace_id) {
+            self.loaded_workspace = Some(ctx.active_workspace_id);
+            self.list.clear();
+            self.total = 0;
+            self.stale_count = 0;
+            self.is_search_results = false;
+            self.offset = 0;
+            self.selected = None;
+            self.error = None;
             self.fetch_list(ctx);
         }
         self.poll_compile(ui, ctx);

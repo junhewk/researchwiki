@@ -31,6 +31,9 @@ enum Msg {
 pub struct Panel {
     channel: Option<MsgChannel<Msg>>,
     initialized: bool,
+    /// Workspace the current graph was loaded for; a mismatch reloads while
+    /// keeping search/filter inputs.
+    loaded_workspace: Option<i64>,
 
     // Entity search.
     search: String,
@@ -82,6 +85,16 @@ impl Panel {
             self.initialized = true;
             self.limit = 200;
             self.min_degree = 0;
+        }
+        if self.loaded_workspace != Some(ctx.active_workspace_id) {
+            self.loaded_workspace = Some(ctx.active_workspace_id);
+            self.nodes.clear();
+            self.edges.clear();
+            self.results.clear();
+            self.selected_entity = None;
+            self.detail = None;
+            self.stats = None;
+            self.error = None;
             self.reset_view_transform();
             self.load_stats(ctx);
             self.load_graph(ctx);

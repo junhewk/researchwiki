@@ -64,6 +64,9 @@ struct SchedulerTestState {
 pub struct Panel {
     channel: Option<MsgChannel<Msg>>,
     initialized: bool,
+    /// Workspace the current jobs/statuses belong to; a mismatch clears them
+    /// and forces every poller to refetch, keeping the user's inputs.
+    loaded_workspace: Option<i64>,
 
     days_back: i32,
     jobs: Vec<JobRunResponse>,
@@ -118,6 +121,21 @@ impl Panel {
             self.days_back = 2;
             self.kg_batch_size = 5;
             self.wiki_batch_size = 5;
+        }
+        if self.loaded_workspace != Some(ctx.active_workspace_id) {
+            self.loaded_workspace = Some(ctx.active_workspace_id);
+            self.jobs.clear();
+            self.selected_run_id = None;
+            self.detail = None;
+            self.kg_stats = None;
+            self.kg_backfill_status = None;
+            self.kg_synthesis_status = None;
+            self.kg_full_status = None;
+            self.scheduler_settings = None;
+            self.scheduler_status = None;
+            self.last_refresh = None;
+            self.last_ops_refresh = None;
+            self.last_scheduler_refresh = None;
             self.refresh(ctx);
             self.refresh_operations(ctx);
             self.refresh_scheduler(ctx);
@@ -837,6 +855,10 @@ impl Panel {
     }
 
     fn show_detail_window(&mut self, egui_ctx: &egui::Context) {
+        if egui_ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
+            self.detail = None;
+            return;
+        }
         let mut open = true;
         let mut clear_detail = false;
 
