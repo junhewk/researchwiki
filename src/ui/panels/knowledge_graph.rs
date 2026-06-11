@@ -8,7 +8,9 @@ use crate::{
     ui::style,
 };
 
-use super::{MsgChannel, PanelCtx};
+use crate::runtime::UiEvent;
+
+use super::{MsgChannel, PanelCtx, Tab};
 
 const GRAPH_PADDING: f32 = 28.0;
 const MAX_LABELS: usize = 24;
@@ -223,15 +225,21 @@ impl Panel {
 
     fn show_graph(&mut self, ui: &mut egui::Ui, ctx: &PanelCtx<'_>) {
         if self.nodes.is_empty() {
-            ui.centered_and_justified(|ui| {
-                style::body_label(
+            if !self.graph_loading
+                && let Some(action) = style::empty_state(
                     ui,
+                    style::icon::GRAPH,
+                    ctx.t("No graph data"),
                     ctx.t(
-                        "No graph data. Adjust the filters and click \"Load graph\", or populate \
-                         the knowledge graph from the Gather tab (Run gather + KG smoke test).",
+                        "Adjust the filters and click \"Load graph\", or populate the knowledge \
+                         graph by running a gather first.",
                     ),
-                );
-            });
+                    Some(ctx.t("Open Gather")),
+                )
+                && action.clicked()
+            {
+                let _ = ctx.ui_tx.send(UiEvent::SwitchTab(Tab::Gather));
+            }
             return;
         }
 

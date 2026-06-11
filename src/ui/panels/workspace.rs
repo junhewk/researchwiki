@@ -127,10 +127,22 @@ impl Panel {
                         .num_columns(2)
                         .spacing([12.0, 8.0])
                         .show(ui, |ui| {
-                            ui.label(ctx.t("Days to look back"));
-                            ui.add(
-                                egui::DragValue::new(&mut self.form.lookback_days).range(1..=3650),
-                            );
+                            ui.horizontal(|ui| {
+                                ui.label(ctx.t("Days to look back"));
+                                style::help_icon(
+                                    ui,
+                                    ctx.t(
+                                        "How far back gathers search for articles (1–3650 days). Scheduled gathers auto-extend to cover the gap since the last run.",
+                                    ),
+                                );
+                            });
+                            ui.horizontal(|ui| {
+                                ui.add(
+                                    egui::DragValue::new(&mut self.form.lookback_days)
+                                        .range(1..=3650),
+                                );
+                                style::muted_label(ui, ctx.t("1–3650 days"));
+                            });
                             ui.end_row();
 
                             ui.label(ctx.t("Topic descriptor\n(natural-language topic)"));

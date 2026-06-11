@@ -15,6 +15,8 @@ pub struct FirstRunForm {
     pub embed_api_key: String,
     pub contact_email: String,
     pub error: Option<String>,
+    llm_key_revealed: bool,
+    embed_key_revealed: bool,
 }
 
 impl Default for FirstRunForm {
@@ -29,8 +31,25 @@ impl Default for FirstRunForm {
             embed_api_key: String::new(),
             contact_email: String::new(),
             error: None,
+            llm_key_revealed: false,
+            embed_key_revealed: false,
         }
     }
+}
+
+/// True when a Base URL is filled in but missing the scheme `validate()` will
+/// reject — used for a live inline warning before submit.
+fn missing_scheme(value: &str) -> bool {
+    let v = value.trim();
+    !v.is_empty() && !(v.starts_with("http://") || v.starts_with("https://"))
+}
+
+fn scheme_warning(ui: &mut egui::Ui, language: UiLanguage) {
+    ui.label(
+        egui::RichText::new(i18n::t(language, "Must start with http:// or https://"))
+            .size(style::HELP_TEXT_SIZE)
+            .color(style::color::WARNING),
+    );
 }
 
 // Built once and consumed immediately on submit, so the size gap doesn't matter.
@@ -109,13 +128,18 @@ impl FirstRunForm {
                         ui.label(i18n::t(language, "Base URL"));
                         ui.text_edit_singleline(&mut self.llm_base_url);
                         ui.end_row();
+                        if missing_scheme(&self.llm_base_url) {
+                            ui.label("");
+                            scheme_warning(ui, language);
+                            ui.end_row();
+                        }
 
                         ui.label(i18n::t(language, "Model"));
                         ui.text_edit_singleline(&mut self.llm_model);
                         ui.end_row();
 
                         ui.label(i18n::t(language, "API key"));
-                        ui.add(egui::TextEdit::singleline(&mut self.llm_api_key).password(true));
+                        style::secret_edit(ui, &mut self.llm_api_key, &mut self.llm_key_revealed, "");
                         ui.end_row();
                     });
 
@@ -135,16 +159,22 @@ impl FirstRunForm {
                         ui.label(i18n::t(language, "Base URL"));
                         ui.text_edit_singleline(&mut self.embed_base_url);
                         ui.end_row();
+                        if missing_scheme(&self.embed_base_url) {
+                            ui.label("");
+                            scheme_warning(ui, language);
+                            ui.end_row();
+                        }
 
                         ui.label(i18n::t(language, "Model"));
                         ui.text_edit_singleline(&mut self.embed_model);
                         ui.end_row();
 
                         ui.label(i18n::t(language, "API key"));
-                        ui.add(
-                            egui::TextEdit::singleline(&mut self.embed_api_key)
-                                .password(true)
-                                .hint_text(i18n::t(language, "(leave blank for local servers)")),
+                        style::secret_edit(
+                            ui,
+                            &mut self.embed_api_key,
+                            &mut self.embed_key_revealed,
+                            i18n::t(language, "(leave blank for local servers)"),
                         );
                         ui.end_row();
                     });

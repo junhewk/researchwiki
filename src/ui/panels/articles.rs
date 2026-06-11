@@ -2,10 +2,11 @@ use egui_extras::{Column, TableBuilder};
 
 use crate::{
     models::article::{ArticleListQuery, ArticleListResponse, ArticleResponse},
+    runtime::UiEvent,
     ui::style,
 };
 
-use super::{MsgChannel, PanelCtx};
+use super::{MsgChannel, PanelCtx, Tab};
 
 enum Msg {
     Page(ArticleListResponse),
@@ -101,7 +102,7 @@ impl Panel {
             ui.add_space(4.0);
         }
 
-        self.show_table(ui);
+        self.show_table(ui, ctx);
         ui.add_space(4.0);
         self.show_pagination(ui, ctx);
 
@@ -233,7 +234,42 @@ impl Panel {
             });
     }
 
-    fn show_table(&mut self, ui: &mut egui::Ui) {
+    fn show_table(&mut self, ui: &mut egui::Ui, ctx: &PanelCtx<'_>) {
+        if self.items.is_empty() && !self.loading && self.error.is_none() {
+            let f = &self.filters;
+            let has_filters = [
+                &f.search,
+                &f.category,
+                &f.tier,
+                &f.min_score,
+                &f.max_score,
+                &f.date_from,
+                &f.date_to,
+            ]
+            .iter()
+            .any(|v| !v.trim().is_empty());
+            let (title, description, action) = if has_filters {
+                (
+                    ctx.t("No matching articles"),
+                    ctx.t("No articles match these filters. Try widening or resetting them."),
+                    None,
+                )
+            } else {
+                (
+                    ctx.t("No articles yet"),
+                    ctx.t("Run a gather to fetch and score articles for this research set."),
+                    Some(ctx.t("Open Gather")),
+                )
+            };
+            if let Some(response) =
+                style::empty_state(ui, style::icon::ARTICLE, title, description, action)
+                && response.clicked()
+            {
+                let _ = ctx.ui_tx.send(UiEvent::SwitchTab(Tab::Gather));
+            }
+            return;
+        }
+
         let text_height = egui::TextStyle::Body.resolve(ui.style()).size + 6.0;
 
         let available_height = ui.available_height() - 80.0;

@@ -116,7 +116,13 @@ impl Panel {
     fn show_summary(&self, ui: &mut egui::Ui, ctx: &PanelCtx<'_>) {
         style::section_heading(ui, ctx.t("Usage by prompt"));
         if self.summary.is_empty() {
-            style::muted_label(ui, ctx.t("No traces yet — run a gather to populate."));
+            style::empty_state(
+                ui,
+                style::icon::RECEIPT,
+                ctx.t("No traces yet"),
+                ctx.t("LLM calls are logged here once a gather or synthesis runs."),
+                None,
+            );
             return;
         }
 
@@ -274,7 +280,21 @@ impl Panel {
             return;
         };
         if list.items.is_empty() {
-            style::muted_label(ui, ctx.t("No traces match these filters."));
+            if let Some(response) = style::empty_state(
+                ui,
+                style::icon::RECEIPT,
+                ctx.t("No matching traces"),
+                ctx.t("No traces match these filters."),
+                Some(ctx.t("Clear filters")),
+            ) && response.clicked()
+            {
+                self.prompt_filter.clear();
+                self.model_filter.clear();
+                self.article_uid_filter.clear();
+                self.success_filter = SuccessFilter::All;
+                self.page = 1;
+                self.refresh(ctx);
+            }
             return;
         }
 

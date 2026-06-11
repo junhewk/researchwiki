@@ -35,17 +35,20 @@ pub struct Panel {
     llm_base_url: String,
     llm_model: String,
     llm_api_key: String,
+    llm_key_revealed: bool,
     llm_dirty: bool,
 
     embed_base_url: String,
     embed_model: String,
     embed_api_key: String,
+    embed_key_revealed: bool,
     embed_dirty: bool,
 
     contact_email: String,
     contact_email_dirty: bool,
 
     semantic_scholar_api_key: String,
+    s2_key_revealed: bool,
     s2_dirty: bool,
 
     embedding_dim_persisted: Option<u32>,
@@ -252,10 +255,11 @@ impl Panel {
                 ui.end_row();
 
                 ui.label(ctx.t("API key"));
-                let resp = ui.add(
-                    egui::TextEdit::singleline(&mut self.llm_api_key)
-                        .password(true)
-                        .hint_text("(unchanged)"),
+                let resp = style::secret_edit(
+                    ui,
+                    &mut self.llm_api_key,
+                    &mut self.llm_key_revealed,
+                    ctx.t("(no key set)"),
                 );
                 if resp.changed() {
                     self.llm_dirty = true;
@@ -342,13 +346,13 @@ impl Panel {
             .spacing([8.0, 6.0])
             .show(ui, |ui| {
                 ui.label(ctx.t("API key"));
-                if ui
-                    .add(
-                        egui::TextEdit::singleline(&mut self.semantic_scholar_api_key)
-                            .password(true)
-                            .hint_text(ctx.t("(leave blank to skip Semantic Scholar)")),
-                    )
-                    .changed()
+                if style::secret_edit(
+                    ui,
+                    &mut self.semantic_scholar_api_key,
+                    &mut self.s2_key_revealed,
+                    ctx.t("(leave blank to skip Semantic Scholar)"),
+                )
+                .changed()
                 {
                     self.s2_dirty = true;
                 }
@@ -398,10 +402,11 @@ impl Panel {
                 ui.end_row();
 
                 ui.label(ctx.t("API key"));
-                let resp = ui.add(
-                    egui::TextEdit::singleline(&mut self.embed_api_key)
-                        .password(true)
-                        .hint_text("(leave blank for local servers)"),
+                let resp = style::secret_edit(
+                    ui,
+                    &mut self.embed_api_key,
+                    &mut self.embed_key_revealed,
+                    ctx.t("(leave blank for local servers)"),
                 );
                 if resp.changed() {
                     self.embed_dirty = true;

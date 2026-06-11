@@ -334,12 +334,20 @@ impl Panel {
 
         ui.horizontal_wrapped(|ui| {
             ui.label(ctx.t("KG batch"));
+            style::help_icon(
+                ui,
+                ctx.t("Articles processed per backfill batch. Larger batches finish faster but use more LLM tokens per run."),
+            );
             ui.add(
                 egui::DragValue::new(&mut self.kg_batch_size)
                     .range(1..=100)
                     .speed(0.5),
             );
             ui.label(ctx.t("Wiki batch"));
+            style::help_icon(
+                ui,
+                ctx.t("Entities synthesized per compile batch. Larger batches finish faster but use more LLM tokens per run."),
+            );
             ui.add(
                 egui::DragValue::new(&mut self.wiki_batch_size)
                     .range(1..=100)
@@ -485,6 +493,12 @@ impl Panel {
     fn show_controls(&mut self, ui: &mut egui::Ui, ctx: &PanelCtx<'_>) {
         ui.horizontal_wrapped(|ui| {
             ui.label(ctx.t("Days back"));
+            style::help_icon(
+                ui,
+                ctx.t(
+                    "Gather caps: each source returns ~50 candidates per query; PMC only looks back 30 days. A long lookback broadens coverage across sources rather than exhaustively.",
+                ),
+            );
             ui.add(
                 egui::DragValue::new(&mut self.days_back)
                     .range(1..=30)

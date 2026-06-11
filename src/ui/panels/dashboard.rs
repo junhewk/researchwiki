@@ -1,8 +1,9 @@
 use egui_plot::{Bar, BarChart, Plot};
 
-use super::{MsgChannel, PanelCtx};
+use super::{MsgChannel, PanelCtx, Tab};
 use crate::{
     models::article::{ArticleResponse, ArticleStats, DailyStatsResponse},
+    runtime::UiEvent,
     ui::style,
 };
 
@@ -86,14 +87,18 @@ impl Panel {
             .map(|s| s.total_articles == 0)
             .unwrap_or(true);
         if is_empty && !self.loading {
-            ui.add_space(12.0);
-            style::section_heading(ui, ctx.t("Welcome to ResearchWiki"));
-            style::body_label(
+            if let Some(response) = style::empty_state(
                 ui,
+                style::icon::ROCKET_LAUNCH,
+                ctx.t("Welcome to ResearchWiki"),
                 ctx.t(
                     "No articles yet. Open Input Set to describe your research, then run a gather to start building your wiki.",
                 ),
-            );
+                Some(ctx.t("Open Input Set")),
+            ) && response.clicked()
+            {
+                let _ = ctx.ui_tx.send(UiEvent::SwitchTab(Tab::Workspace));
+            }
             return;
         }
 

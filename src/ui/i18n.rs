@@ -336,6 +336,48 @@ pub fn t(language: UiLanguage, text: &'static str) -> &'static str {
         "Output" => "출력",
         "Failed (no error message)" => "실패(오류 메시지 없음)",
         "All" => "전체",
+
+        // Feedback & empty states (UI polish)
+        "Retry" => "다시 시도",
+        "Saving…" => "저장 중…",
+        "No articles yet" => "아직 논문이 없습니다",
+        "Run a gather to fetch and score articles for this research set." => {
+            "수집을 실행하면 이 연구 세트의 논문을 가져와 평가합니다."
+        }
+        "No matching articles" => "조건에 맞는 논문이 없습니다",
+        "No articles match these filters. Try widening or resetting them." => {
+            "이 필터에 해당하는 논문이 없습니다. 조건을 넓히거나 초기화해 보세요."
+        }
+        "Open Gather" => "수집 탭 열기",
+        "Open Input Set" => "입력 세트 열기",
+        "No wiki articles yet" => "아직 위키 문서가 없습니다",
+        "Populate the knowledge graph from the Gather tab, then compile \
+         syntheses. Only entities cited by >=3 articles appear." => {
+            "수집 탭에서 지식 그래프를 채운 뒤 종합을 컴파일하세요. 3개 이상의 논문에 인용된 개체만 표시됩니다."
+        }
+        "No graph data" => "그래프 데이터가 없습니다",
+        "Adjust the filters and click \"Load graph\", or populate the knowledge \
+         graph by running a gather first." => {
+            "필터를 조정하고 \"그래프 불러오기\"를 클릭하거나, 먼저 수집을 실행해 지식 그래프를 채우세요."
+        }
+        "No traces yet" => "아직 추적이 없습니다",
+        "LLM calls are logged here once a gather or synthesis runs." => {
+            "수집이나 종합이 실행되면 LLM 호출이 여기에 기록됩니다."
+        }
+        "No matching traces" => "조건에 맞는 추적이 없습니다",
+        "Clear filters" => "필터 초기화",
+        "Articles processed per backfill batch. Larger batches finish faster but use more LLM tokens per run." => {
+            "백필 배치당 처리되는 논문 수입니다. 배치가 클수록 빨리 끝나지만 실행당 LLM 토큰을 더 사용합니다."
+        }
+        "Entities synthesized per compile batch. Larger batches finish faster but use more LLM tokens per run." => {
+            "컴파일 배치당 종합되는 개체 수입니다. 배치가 클수록 빨리 끝나지만 실행당 LLM 토큰을 더 사용합니다."
+        }
+        "How far back gathers search for articles (1–3650 days). Scheduled gathers auto-extend to cover the gap since the last run." => {
+            "수집이 논문을 검색하는 기간입니다(1–3650일). 예약 수집은 마지막 실행 이후 공백을 자동으로 보완합니다."
+        }
+        "1–3650 days" => "1–3650일",
+        "Must start with http:// or https://" => "http:// 또는 https://로 시작해야 합니다",
+        "(no key set)" => "(키 없음)",
         _ => text,
     }
 }

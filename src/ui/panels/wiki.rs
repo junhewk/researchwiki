@@ -10,7 +10,9 @@ use crate::{
     ui::style,
 };
 
-use super::{MsgChannel, PanelCtx};
+use crate::runtime::UiEvent;
+
+use super::{MsgChannel, PanelCtx, Tab};
 
 enum Msg {
     List(KGSynthesisListResponse),
@@ -253,13 +255,21 @@ impl Panel {
             .max_height(ui.available_height() - 36.0)
             .show(ui, |ui| {
                 if self.list.is_empty() {
-                    style::body_label(
-                        ui,
-                        ctx.t(
-                            "No syntheses yet. Populate the knowledge graph (Gather tab), then \
-                             click \"Compile syntheses\". Only entities cited by >=3 articles appear.",
-                        ),
-                    );
+                    if !self.loading
+                        && let Some(action) = style::empty_state(
+                            ui,
+                            style::icon::BOOK_OPEN,
+                            ctx.t("No wiki articles yet"),
+                            ctx.t(
+                                "Populate the knowledge graph from the Gather tab, then compile \
+                                 syntheses. Only entities cited by >=3 articles appear.",
+                            ),
+                            Some(ctx.t("Open Gather")),
+                        )
+                        && action.clicked()
+                    {
+                        let _ = ctx.ui_tx.send(UiEvent::SwitchTab(Tab::Gather));
+                    }
                     return;
                 }
                 let mut clicked: Option<String> = None;
