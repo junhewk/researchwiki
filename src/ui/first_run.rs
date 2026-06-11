@@ -41,7 +41,7 @@ impl Default for FirstRunForm {
 /// reject — used for a live inline warning before submit.
 fn missing_scheme(value: &str) -> bool {
     let v = value.trim();
-    !v.is_empty() && !(v.starts_with("http://") || v.starts_with("https://"))
+    !(v.is_empty() || v.starts_with("http://") || v.starts_with("https://"))
 }
 
 fn scheme_warning(ui: &mut egui::Ui, language: UiLanguage) {
