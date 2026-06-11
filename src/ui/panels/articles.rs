@@ -11,6 +11,7 @@ use super::{MsgChannel, PanelCtx, Tab};
 enum Msg {
     Page(ArticleListResponse),
     Error(String),
+    Reextracted(Result<bool, String>),
 }
 
 #[derive(Clone, Copy, Default, PartialEq, Eq)]
@@ -20,17 +21,13 @@ enum SortCol {
     Date,
     Title,
     Category,
-    Score,
-    Tier,
+    Evaluated,
 }
 
 #[derive(Clone, Default)]
 struct Filters {
     search: String,
     category: String,
-    tier: String,
-    min_score: String,
-    max_score: String,
     date_from: String,
     date_to: String,
 }
@@ -56,6 +53,10 @@ pub struct Panel {
     selected_uid: Option<String>,
     selected_index: Option<usize>,
     detail_open: bool,
+
+    reextracting: bool,
+    reextract_notice: Option<String>,
+    reextract_refetch: bool,
 
     loading: bool,
     error: Option<String>,
@@ -106,8 +107,13 @@ impl Panel {
         ui.add_space(4.0);
         self.show_pagination(ui, ctx);
 
+        if self.reextract_refetch {
+            self.reextract_refetch = false;
+            self.fetch(ctx);
+        }
+
         if self.detail_open {
-            self.show_detail_window(ui.ctx());
+            self.show_detail_window(ui.ctx(), ctx);
         }
     }
 
@@ -137,6 +143,22 @@ impl Panel {
                 Msg::Error(err) => {
                     self.loading = false;
                     self.error = Some(format!("Load failed: {err}"));
+                }
+                Msg::Reextracted(result) => {
+                    self.reextracting = false;
+                    match result {
+                        Ok(true) => {
+                            self.reextract_notice = Some("Re-extraction complete.".to_string());
+                            self.reextract_refetch = true;
+                        }
+                        Ok(false) => {
+                            self.reextract_notice =
+                                Some("Extraction still produced no text.".to_string());
+                        }
+                        Err(err) => {
+                            self.reextract_notice = Some(format!("Re-extraction failed: {err}"));
+                        }
+                    }
                 }
             }
         }
@@ -176,45 +198,6 @@ impl Panel {
                                 .desired_width(120.0),
                         );
                         ui.end_row();
-
-                        ui.label(ctx.t("Min score"));
-                        ui.add(
-                            egui::TextEdit::singleline(&mut self.filters.min_score)
-                                .desired_width(60.0),
-                        );
-                        ui.label(ctx.t("Max score"));
-                        ui.add(
-                            egui::TextEdit::singleline(&mut self.filters.max_score)
-                                .desired_width(60.0),
-                        );
-                        ui.end_row();
-
-                        ui.label(ctx.t("Tier"));
-                        egui::ComboBox::new("articles-tier-combo", "")
-                            .selected_text(if self.filters.tier.is_empty() {
-                                "(any)"
-                            } else {
-                                self.filters.tier.as_str()
-                            })
-                            .show_ui(ui, |ui| {
-                                ui.selectable_value(&mut self.filters.tier, String::new(), "(any)");
-                                ui.selectable_value(
-                                    &mut self.filters.tier,
-                                    "Tier1".into(),
-                                    "Tier1",
-                                );
-                                ui.selectable_value(
-                                    &mut self.filters.tier,
-                                    "Tier2".into(),
-                                    "Tier2",
-                                );
-                                ui.selectable_value(
-                                    &mut self.filters.tier,
-                                    "Tier3".into(),
-                                    "Tier3",
-                                );
-                            });
-                        ui.end_row();
                     });
 
                 ui.horizontal(|ui| {
@@ -237,17 +220,9 @@ impl Panel {
     fn show_table(&mut self, ui: &mut egui::Ui, ctx: &PanelCtx<'_>) {
         if self.items.is_empty() && !self.loading && self.error.is_none() {
             let f = &self.filters;
-            let has_filters = [
-                &f.search,
-                &f.category,
-                &f.tier,
-                &f.min_score,
-                &f.max_score,
-                &f.date_from,
-                &f.date_to,
-            ]
-            .iter()
-            .any(|v| !v.trim().is_empty());
+            let has_filters = [&f.search, &f.category, &f.date_from, &f.date_to]
+                .iter()
+                .any(|v| !v.trim().is_empty());
             let (title, description, action) = if has_filters {
                 (
                     ctx.t("No matching articles"),
@@ -257,7 +232,7 @@ impl Panel {
             } else {
                 (
                     ctx.t("No articles yet"),
-                    ctx.t("Run a gather to fetch and score articles for this research set."),
+                    ctx.t("Run a gather to fetch and evaluate articles for this research set."),
                     Some(ctx.t("Open Gather")),
                 )
             };
@@ -283,8 +258,7 @@ impl Panel {
             .column(Column::initial(95.0).at_least(80.0))
             .column(Column::remainder().at_least(200.0))
             .column(Column::initial(120.0).at_least(80.0))
-            .column(Column::initial(70.0).at_least(50.0))
-            .column(Column::initial(80.0).at_least(60.0))
+            .column(Column::initial(95.0).at_least(80.0))
             .min_scrolled_height(0.0)
             .max_scroll_height(available_height.max(120.0))
             .sense(egui::Sense::click())
@@ -300,10 +274,8 @@ impl Panel {
                         sort_request.or(self.header_label(ui, "Category", SortCol::Category))
                 });
                 header.col(|ui| {
-                    sort_request = sort_request.or(self.header_label(ui, "Score", SortCol::Score))
-                });
-                header.col(|ui| {
-                    sort_request = sort_request.or(self.header_label(ui, "Tier", SortCol::Tier))
+                    sort_request =
+                        sort_request.or(self.header_label(ui, "Evaluated", SortCol::Evaluated))
                 });
             })
             .body(|body| {
@@ -333,16 +305,13 @@ impl Panel {
                         })
                         .1,
                         row.col(|ui| {
-                            ui.label(
-                                article
-                                    .total_score
-                                    .map(|s| s.to_string())
-                                    .unwrap_or_else(|| "—".into()),
-                            );
-                        })
-                        .1,
-                        row.col(|ui| {
-                            ui.label(article.priority.as_deref().unwrap_or("—"));
+                            // evaluated_at is "YYYY-MM-DD HH:MM:SS"; the date is enough here.
+                            let evaluated = article
+                                .evaluated_at
+                                .as_deref()
+                                .map(|v| v.split_whitespace().next().unwrap_or(v))
+                                .unwrap_or("—");
+                            ui.label(evaluated);
                         })
                         .1,
                     ];
@@ -428,7 +397,7 @@ impl Panel {
         });
     }
 
-    fn show_detail_window(&mut self, egui_ctx: &egui::Context) {
+    fn show_detail_window(&mut self, egui_ctx: &egui::Context, ctx: &PanelCtx<'_>) {
         if egui_ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
             self.detail_open = false;
             return;
@@ -455,6 +424,41 @@ impl Panel {
                 if let Some(url) = &article.url {
                     ui.hyperlink_to(url, url);
                 }
+                if article.pdf_path.is_some() {
+                    ui.horizontal(|ui| {
+                        if ui
+                            .add_enabled(
+                                !self.reextracting,
+                                egui::Button::new(ctx.t("Re-extract PDF")),
+                            )
+                            .on_hover_text(ctx.t(
+                                "Runs text extraction again over the stored PDF and refreshes embeddings and the knowledge graph.",
+                            ))
+                            .clicked()
+                            && let Some(channel) = self.channel.as_ref()
+                        {
+                            self.reextracting = true;
+                            self.reextract_notice = None;
+                            let tx = channel.tx.clone();
+                            let svc = ctx.state.job_service.clone();
+                            let uid = article.uid.clone();
+                            let workspace_id = ctx.active_workspace_id;
+                            ctx.handle.spawn(async move {
+                                let result = svc
+                                    .re_extract_article(&uid, workspace_id)
+                                    .await
+                                    .map_err(|error| error.to_string());
+                                let _ = tx.send(Msg::Reextracted(result));
+                            });
+                        }
+                        if self.reextracting {
+                            style::loading_indicator(ui, ctx.t("Extracting…"));
+                        }
+                    });
+                    if let Some(notice) = &self.reextract_notice {
+                        style::muted_label(ui, notice);
+                    }
+                }
                 ui.add_space(4.0);
                 egui::ScrollArea::vertical()
                     .auto_shrink([false, false])
@@ -468,42 +472,8 @@ impl Panel {
                                 detail_kv(ui, "Pub date", article.pub_date.as_deref());
                                 detail_kv(ui, "Reg date", article.reg_date.as_deref());
                                 detail_kv(ui, "Category", article.category.as_deref());
-                                detail_kv(ui, "Tier", article.priority.as_deref());
-                                detail_kv(
-                                    ui,
-                                    "Total score",
-                                    article.total_score.map(|v| v.to_string()).as_deref(),
-                                );
-                                detail_kv(
-                                    ui,
-                                    "Scholarly rigor",
-                                    article.scholarly_rigor.map(|v| v.to_string()).as_deref(),
-                                );
-                                detail_kv(
-                                    ui,
-                                    "Novelty",
-                                    article.novelty.map(|v| v.to_string()).as_deref(),
-                                );
-                                detail_kv(
-                                    ui,
-                                    "Relevance",
-                                    article.relevance_score.map(|v| v.to_string()).as_deref(),
-                                );
-                                detail_kv(
-                                    ui,
-                                    "Practical impact",
-                                    article.practical_impact.map(|v| v.to_string()).as_deref(),
-                                );
-                                detail_kv(
-                                    ui,
-                                    "Interdisciplinary",
-                                    article.interdisciplinary.map(|v| v.to_string()).as_deref(),
-                                );
-                                detail_kv(
-                                    ui,
-                                    "Critical concerns",
-                                    article.critical_concerns.map(|v| v.to_string()).as_deref(),
-                                );
+                                detail_kv(ui, "Evaluated", article.evaluated_at.as_deref());
+                                detail_kv(ui, "Content", article.content_type.as_deref());
                             });
                         ui.add_space(8.0);
                         detail_block(ui, "Byline summary", article.byline_summary.as_deref());
@@ -547,8 +517,7 @@ impl Panel {
                 SortCol::Date => a.reg_date.cmp(&b.reg_date),
                 SortCol::Title => a.title.cmp(&b.title),
                 SortCol::Category => a.category.cmp(&b.category),
-                SortCol::Score => a.total_score.cmp(&b.total_score),
-                SortCol::Tier => a.priority.cmp(&b.priority),
+                SortCol::Evaluated => a.evaluated_at.cmp(&b.evaluated_at),
             };
             if asc { ord } else { ord.reverse() }
         });
@@ -579,11 +548,8 @@ fn build_query(filters: &Filters, page: u32, page_size: u32) -> ArticleListQuery
         page_size,
         search: opt(&filters.search),
         category: opt(&filters.category),
-        tier: opt(&filters.tier),
         date_from: opt(&filters.date_from),
         date_to: opt(&filters.date_to),
-        min_score: filters.min_score.trim().parse().ok(),
-        max_score: filters.max_score.trim().parse().ok(),
     }
 }
 

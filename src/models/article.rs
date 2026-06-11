@@ -8,10 +8,6 @@ pub struct ArticleListQuery {
     pub page_size: u32,
     pub date_from: Option<String>,
     pub date_to: Option<String>,
-    pub min_score: Option<i32>,
-    pub max_score: Option<i32>,
-    #[serde(default, alias = "priority")]
-    pub tier: Option<String>,
     pub category: Option<String>,
     pub search: Option<String>,
 }
@@ -49,14 +45,9 @@ pub struct ArticleResponse {
     pub empirical_weaknesses: Option<String>,
     pub byline_summary: Option<String>,
     pub why_it_matters: Option<String>,
-    pub scholarly_rigor: Option<i32>,
-    pub novelty: Option<i32>,
-    pub relevance_score: Option<i32>,
-    pub practical_impact: Option<i32>,
-    pub interdisciplinary: Option<i32>,
-    pub critical_concerns: Option<i32>,
-    pub total_score: Option<i32>,
-    pub priority: Option<String>,
+    pub evaluated_at: Option<String>,
+    pub content_type: Option<String>,
+    pub pdf_path: Option<String>,
     pub reg_date: Option<String>,
     pub created_at: Option<String>,
     pub updated_at: Option<String>,
@@ -75,8 +66,8 @@ pub struct ArticleListResponse {
 pub struct ArticleStats {
     pub total_articles: i64,
     pub this_week: i64,
-    pub tier1_count: i64,
-    pub pending_review: i64,
+    pub evaluated_count: i64,
+    pub pending_evaluation: i64,
 }
 
 #[derive(Debug, Deserialize)]
@@ -91,7 +82,6 @@ pub struct RecentArticlesQuery {
     pub days: u32,
     #[serde(default = "default_recent_limit")]
     pub limit: u32,
-    pub min_score: Option<i32>,
 }
 
 #[derive(Debug, Deserialize)]

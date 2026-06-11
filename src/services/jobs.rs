@@ -20,8 +20,8 @@ use crate::{
         library::LibraryService,
         llm::LlmService,
         pipeline::{
-            ArticleCandidate, GATHER_SOURCE_IDS, PipelineService, SaveCounters, is_gather_source,
-            source_label,
+            ArticleCandidate, FetchedArticleContent, GATHER_SOURCE_IDS, PipelineService,
+            SaveCounters, is_gather_source, source_label,
         },
         screener::ArticleScreener,
         settings::SettingsService,
@@ -75,6 +75,7 @@ impl JobService {
         workspace_service: Arc<WorkspaceService>,
         contact_email: Option<String>,
         semantic_scholar_api_key: Option<String>,
+        pdf_dir: std::path::PathBuf,
     ) -> Self {
         let pipeline_service = PipelineService::new(
             database_path.clone(),
@@ -82,7 +83,7 @@ impl JobService {
             semantic_scholar_api_key,
         );
         let screener = ArticleScreener::new(llm_service.clone());
-        let fetcher = ContentFetcher::new(http_client.clone(), contact_email);
+        let fetcher = ContentFetcher::new(http_client.clone(), contact_email, pdf_dir);
         let evaluator = ArticleEvaluator::new(llm_service);
         Self {
             database_path: Arc::new(database_path),
@@ -456,6 +457,11 @@ impl JobService {
 
         let mut counters = JobCounters::default();
         let mut last_error = None::<String>;
+        // The same paper often arrives from several sources under different
+        // uids (arXiv + Crossref + OpenAlex). Track DOI/title keys across the
+        // whole run so only the first sighting is screened and processed.
+        let mut seen_dois = std::collections::HashSet::<String>::new();
+        let mut seen_titles = std::collections::HashSet::<String>::new();
 
         for current_source in sources {
             if self.is_cancelled(&run_id).await? {
@@ -522,12 +528,44 @@ impl JobService {
                 .check_duplicates_batch(&uids)
                 .await
                 .unwrap_or_default();
-            let dedup_skipped = existing.len() as i32;
-            counters.skipped += dedup_skipped;
+            let known = self
+                .pipeline_service
+                .check_known_duplicates(&candidates, workspace_id)
+                .await
+                .unwrap_or_default();
+            let mut dedup_skipped = 0_i32;
+            let mut cross_source_skipped = 0_i32;
             let candidates: Vec<_> = candidates
                 .into_iter()
-                .filter(|c| !existing.contains(&c.uid()))
+                .filter(|c| {
+                    let uid = c.uid();
+                    if existing.contains(&uid) || known.contains(&uid) {
+                        dedup_skipped += 1;
+                        return false;
+                    }
+                    // Earlier sources in this run claim the DOI/title key.
+                    let doi_key = c
+                        .doi
+                        .as_deref()
+                        .map(crate::services::pipeline::normalize_doi)
+                        .filter(|value| !value.is_empty());
+                    let title_key = crate::services::pipeline::normalized_duplicate_title(&c.title);
+                    let doi_seen = doi_key.as_deref().is_some_and(|key| seen_dois.contains(key));
+                    let title_seen = !title_key.is_empty() && seen_titles.contains(&title_key);
+                    if doi_seen || title_seen {
+                        cross_source_skipped += 1;
+                        return false;
+                    }
+                    if let Some(key) = doi_key {
+                        seen_dois.insert(key);
+                    }
+                    if !title_key.is_empty() {
+                        seen_titles.insert(title_key);
+                    }
+                    true
+                })
                 .collect();
+            counters.skipped += dedup_skipped + cross_source_skipped;
 
             if self.is_cancelled(&run_id).await? {
                 return Ok(());
@@ -552,6 +590,7 @@ impl JobService {
                     "screened": candidates.len(),
                     "relevant": relevant.len(),
                     "dedup_skipped": dedup_skipped,
+                    "cross_source_skipped": cross_source_skipped,
                 }),
             )
             .await?;
@@ -703,18 +742,32 @@ impl JobService {
             }
         };
 
-        // 3. Save article (with evaluation if available, metadata-only otherwise).
-        let save_result = if let Some(ref eval_fields) = evaluation {
-            self.pipeline_service
-                .save_evaluated_candidate(candidate, eval_fields, workspace_id)
-                .await
-                .map_err(|error| AppError::Internal(error.to_string()))?
-        } else {
-            self.pipeline_service
-                .save_candidates(vec![candidate.clone()], workspace_id)
-                .await
-                .map_err(|error| AppError::Internal(error.to_string()))?
+        // 3. Save the article with the fetched full text (and stored-PDF path)
+        // regardless of whether the evaluation succeeded — the text is what the
+        // embedding and KG stages read from the database afterwards.
+        let fetched_payload = FetchedArticleContent {
+            full_text: content
+                .content
+                .as_text()
+                .map(str::trim)
+                .filter(|text| !text.is_empty())
+                .map(str::to_string),
+            content_type: Some(content.content_type.as_str().to_string()),
+            pdf_path: content
+                .pdf_path
+                .as_ref()
+                .map(|path| path.to_string_lossy().into_owned()),
         };
+        let save_result = self
+            .pipeline_service
+            .save_processed_candidate(
+                candidate,
+                evaluation.as_ref(),
+                Some(fetched_payload),
+                workspace_id,
+            )
+            .await
+            .map_err(|error| AppError::Internal(error.to_string()))?;
         apply_save_counters(counters, save_result);
 
         // Post-save: embedding and KG extraction (fire-and-forget).
@@ -753,6 +806,88 @@ impl JobService {
         }
 
         Ok(())
+    }
+
+    /// Re-runs MarkItDown over an article's stored PDF and, on success, swaps
+    /// the extracted markdown into `full_text` and refreshes the embedding/KG
+    /// stages. Returns `false` when extraction still produces nothing.
+    pub async fn re_extract_article(
+        &self,
+        uid: &str,
+        workspace_id: i64,
+    ) -> Result<bool, AppError> {
+        let database_path = self.database_path.clone();
+        let uid_owned = uid.to_string();
+        let pdf_path: Option<String> = run_blocking_db(move || {
+            let conn = crate::db::open_connection(&*database_path)?;
+            conn.query_row(
+                "SELECT pdf_path FROM haie_rev WHERE uid = ?1",
+                [uid_owned.as_str()],
+                |row| row.get(0),
+            )
+            .optional()
+            .map(Option::flatten)
+        })
+        .await?;
+
+        let Some(pdf_path) = pdf_path.filter(|path| !path.trim().is_empty()) else {
+            return Err(AppError::BadRequest(format!(
+                "article {uid} has no stored PDF to re-extract"
+            )));
+        };
+
+        let markdown = self
+            .fetcher
+            .re_extract_stored_pdf(std::path::Path::new(&pdf_path))
+            .await?
+            .map(|text| text.trim().to_string())
+            .filter(|text| !text.is_empty());
+        let Some(markdown) = markdown else {
+            return Ok(false);
+        };
+
+        let database_path = self.database_path.clone();
+        let uid_owned = uid.to_string();
+        run_blocking_db(move || {
+            let conn = crate::db::open_connection(&*database_path)?;
+            conn.execute(
+                "UPDATE haie_rev
+                 SET full_text = ?1,
+                     content_type = 'pdf',
+                     has_embeddings = 0,
+                     updated_at = datetime('now')
+                 WHERE uid = ?2",
+                params![markdown, uid_owned],
+            )?;
+            Ok::<_, rusqlite::Error>(())
+        })
+        .await?;
+
+        let context = self
+            .workspace_service
+            .research_context(workspace_id)
+            .await
+            .unwrap_or_default();
+        let (library_enabled, kg_enabled) = self
+            .settings_service
+            .get_feature_flags()
+            .await
+            .unwrap_or((true, true));
+        if library_enabled
+            && let Err(error) = self.library_service.process_article(uid).await
+        {
+            tracing::warn!("re-embedding after re-extraction failed for {uid}: {error}");
+        }
+        if kg_enabled
+            && let Err(error) = self
+                .kg_service
+                .insert_articles_with_context(vec![uid.to_string()], context)
+                .await
+        {
+            tracing::warn!("KG refresh after re-extraction failed for {uid}: {error}");
+        }
+
+        Ok(true)
     }
 
     async fn mark_running(&self, run_id: &str) -> Result<(), AppError> {

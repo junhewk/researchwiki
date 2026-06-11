@@ -12,61 +12,6 @@ use crate::{
     },
 };
 
-pub(crate) fn ensure_evaluation_scores(evaluation: &mut Map<String, Value>) {
-    let raw_total = clamp_score(evaluation, "scholarly_rigor", 0, 5)
-        + clamp_score(evaluation, "novelty", 0, 5)
-        + clamp_score(evaluation, "relevance_score", 0, 5)
-        + clamp_score(evaluation, "practical_impact", 0, 5)
-        + clamp_score(evaluation, "interdisciplinary", 0, 4)
-        + clamp_score(evaluation, "critical_concerns", -5, 0);
-    let normalized_total = ((raw_total.max(0) * 100) + 12) / 24;
-    let normalized_total = normalized_total.clamp(0, 100);
-    let priority = priority_for_score(normalized_total);
-
-    evaluation.insert("total_score".to_string(), Value::from(normalized_total));
-    evaluation.insert("priority".to_string(), Value::String(priority.to_string()));
-}
-
-fn clamp_score(evaluation: &mut Map<String, Value>, field: &str, min: i64, max: i64) -> i64 {
-    let value = evaluation
-        .get(field)
-        .and_then(score_value_as_i64)
-        .unwrap_or(0)
-        .clamp(min, max);
-    evaluation.insert(field.to_string(), Value::from(value));
-    value
-}
-
-fn score_value_as_i64(value: &Value) -> Option<i64> {
-    value
-        .as_i64()
-        .or_else(|| value.as_f64().map(|value| value as i64))
-        .or_else(|| value.as_str().and_then(parse_score_string))
-}
-
-fn parse_score_string(value: &str) -> Option<i64> {
-    let trimmed = value.trim();
-    if trimmed.is_empty() {
-        return None;
-    }
-
-    trimmed.parse::<i64>().ok().or_else(|| {
-        trimmed
-            .split_once('/')
-            .and_then(|(score, _)| score.trim().parse::<i64>().ok())
-    })
-}
-
-fn priority_for_score(total_score: i64) -> &'static str {
-    if total_score >= 75 {
-        "Tier1"
-    } else if total_score >= 40 {
-        "Tier2"
-    } else {
-        "Tier3"
-    }
-}
-
 const EVAL_TEXT_HEAD_CHARS: usize = 10_000;
 const EVAL_TEXT_TAIL_CHARS: usize = 4_000;
 const EVAL_TEXT_MAX_CHARS: usize = EVAL_TEXT_HEAD_CHARS + EVAL_TEXT_TAIL_CHARS;
@@ -97,6 +42,20 @@ impl ArticleEvaluator {
                     candidate,
                 )
                 .await
+            }
+            (ContentType::Xml | ContentType::Html, ContentData::Text(text)) => {
+                // Strip markup before evaluation; fall back to the raw payload
+                // if extraction yields nothing.
+                let extracted = crate::services::text_extractor::extract_from_content(
+                    text,
+                    content.content_type.as_str(),
+                );
+                let evaluation_text = if extracted.full_text.trim().is_empty() {
+                    text.as_str()
+                } else {
+                    extracted.full_text.as_str()
+                };
+                self.evaluate_with_text(evaluation_text, candidate).await
             }
             (_, ContentData::Text(text)) => self.evaluate_with_text(text, candidate).await,
             (_, ContentData::Binary(_)) => {
@@ -160,7 +119,6 @@ impl ArticleEvaluator {
 
         overlay_candidate_metadata(&mut fields, candidate);
 
-        ensure_evaluation_scores(&mut fields);
         Ok(Some(fields))
     }
 }
@@ -233,65 +191,6 @@ fn flatten_nested_json(map: Map<String, Value>) -> Map<String, Value> {
 mod tests {
     use super::*;
     use serde_json::json;
-
-    #[test]
-    fn evaluation_scores_are_normalized_to_100_point_scale() {
-        let mut evaluation = Map::from_iter([
-            ("scholarly_rigor".to_string(), json!(5)),
-            ("novelty".to_string(), json!(4)),
-            ("relevance_score".to_string(), json!(5)),
-            ("practical_impact".to_string(), json!(4)),
-            ("interdisciplinary".to_string(), json!(4)),
-            ("critical_concerns".to_string(), json!(0)),
-        ]);
-
-        ensure_evaluation_scores(&mut evaluation);
-
-        assert_eq!(evaluation.get("total_score"), Some(&json!(92)));
-        assert_eq!(evaluation.get("priority"), Some(&json!("Tier1")));
-    }
-
-    #[test]
-    fn evaluation_scores_are_clamped_before_tiering() {
-        let mut evaluation = Map::from_iter([
-            ("scholarly_rigor".to_string(), json!(99)),
-            ("novelty".to_string(), json!(-2)),
-            ("relevance_score".to_string(), json!(5)),
-            ("practical_impact".to_string(), json!(5)),
-            ("interdisciplinary".to_string(), json!(4)),
-            ("critical_concerns".to_string(), json!(-99)),
-            ("total_score".to_string(), json!(999)),
-            ("priority".to_string(), json!("Tier1")),
-        ]);
-
-        ensure_evaluation_scores(&mut evaluation);
-
-        assert_eq!(evaluation.get("scholarly_rigor"), Some(&json!(5)));
-        assert_eq!(evaluation.get("novelty"), Some(&json!(0)));
-        assert_eq!(evaluation.get("critical_concerns"), Some(&json!(-5)));
-        assert_eq!(evaluation.get("total_score"), Some(&json!(58)));
-        assert_eq!(evaluation.get("priority"), Some(&json!("Tier2")));
-    }
-
-    #[test]
-    fn evaluation_scores_accept_numeric_strings() {
-        let mut evaluation = Map::from_iter([
-            ("scholarly_rigor".to_string(), json!("5")),
-            ("novelty".to_string(), json!("4/5")),
-            ("relevance_score".to_string(), json!(5)),
-            ("practical_impact".to_string(), json!("3")),
-            ("interdisciplinary".to_string(), json!("2/4")),
-            ("critical_concerns".to_string(), json!("-1")),
-        ]);
-
-        ensure_evaluation_scores(&mut evaluation);
-
-        assert_eq!(evaluation.get("scholarly_rigor"), Some(&json!(5)));
-        assert_eq!(evaluation.get("novelty"), Some(&json!(4)));
-        assert_eq!(evaluation.get("critical_concerns"), Some(&json!(-1)));
-        assert_eq!(evaluation.get("total_score"), Some(&json!(75)));
-        assert_eq!(evaluation.get("priority"), Some(&json!("Tier1")));
-    }
 
     #[test]
     fn compact_evaluation_text_keeps_head_and_tail() {

@@ -18,9 +18,8 @@ const ARTICLE_COLUMNS: &str = r#"
     ai_tech, clinical_domain, ethics_framework, primary_issue, key_stakeholders,
     practical_impl, secondary_issues, key_argument, main_findings, normative_claims,
     limitations, theoretical_strengths, theoretical_weaknesses, empirical_strengths,
-    empirical_weaknesses, byline_summary, why_it_matters, scholarly_rigor, novelty,
-    relevance_score, practical_impact, interdisciplinary, critical_concerns,
-    total_score, priority, reg_date, created_at, updated_at
+    empirical_weaknesses, byline_summary, why_it_matters, evaluated_at,
+    content_type, pdf_path, reg_date, created_at, updated_at
 "#;
 
 #[derive(Clone)]
@@ -69,7 +68,7 @@ impl ArticleService {
 
             let sql = format!(
                 "SELECT {ARTICLE_COLUMNS} FROM haie_rev{where_clause}
-                 ORDER BY COALESCE(reg_date, '') DESC, COALESCE(total_score, -999) DESC
+                 ORDER BY COALESCE(reg_date, '') DESC, COALESCE(created_at, '') DESC, uid
                  LIMIT ? OFFSET ?"
             );
 
@@ -238,17 +237,16 @@ impl ArticleService {
                 append_ws(&mut sql, &mut params, workspace_id, true);
                 conn.query_row(&sql, params_from_iter(params.iter()), |row| row.get(0))?
             };
-            let tier1_count: i64 = {
+            let evaluated_count: i64 = {
                 let mut sql =
-                    String::from("SELECT COUNT(uid) FROM haie_rev WHERE priority = 'Tier1'");
+                    String::from("SELECT COUNT(uid) FROM haie_rev WHERE evaluated_at IS NOT NULL");
                 let mut params: Vec<Value> = Vec::new();
                 append_ws(&mut sql, &mut params, workspace_id, true);
                 conn.query_row(&sql, params_from_iter(params.iter()), |row| row.get(0))?
             };
-            let pending_review: i64 = {
-                let mut sql = String::from(
-                    "SELECT COUNT(uid) FROM haie_rev WHERE (priority IS NULL OR priority = '')",
-                );
+            let pending_evaluation: i64 = {
+                let mut sql =
+                    String::from("SELECT COUNT(uid) FROM haie_rev WHERE evaluated_at IS NULL");
                 let mut params: Vec<Value> = Vec::new();
                 append_ws(&mut sql, &mut params, workspace_id, true);
                 conn.query_row(&sql, params_from_iter(params.iter()), |row| row.get(0))?
@@ -257,8 +255,8 @@ impl ArticleService {
             Ok::<_, anyhow::Error>(ArticleStats {
                 total_articles,
                 this_week,
-                tier1_count,
-                pending_review,
+                evaluated_count,
+                pending_evaluation,
             })
         })
         .await
@@ -324,7 +322,6 @@ impl ArticleService {
         &self,
         days: u32,
         limit: u32,
-        min_score: Option<i32>,
         workspace_id: Option<i64>,
     ) -> Result<Vec<ArticleResponse>, AppError> {
         let database_path = self.database_path.clone();
@@ -337,11 +334,9 @@ impl ArticleService {
             let mut sql = format!("SELECT {ARTICLE_COLUMNS} FROM haie_rev WHERE reg_date >= ?");
             let mut params = vec![Value::Text(threshold)];
             append_ws(&mut sql, &mut params, workspace_id, true);
-            if let Some(min_score) = min_score {
-                sql.push_str(" AND total_score >= ?");
-                params.push(Value::Integer(i64::from(min_score)));
-            }
-            sql.push_str(" ORDER BY COALESCE(total_score, -999) DESC LIMIT ?");
+            sql.push_str(
+                " ORDER BY COALESCE(reg_date, '') DESC, COALESCE(created_at, '') DESC LIMIT ?",
+            );
             params.push(Value::Integer(i64::from(limit.clamp(1, 50))));
 
             let mut stmt = conn.prepare(&sql)?;
@@ -352,7 +347,7 @@ impl ArticleService {
         .await
     }
 
-    pub async fn get_top_articles(
+    pub async fn get_latest_articles(
         &self,
         days: u32,
         limit: u32,
@@ -367,13 +362,15 @@ impl ArticleService {
             let mut sql = format!("SELECT {ARTICLE_COLUMNS} FROM haie_rev WHERE reg_date >= ?");
             let mut params = vec![Value::Text(threshold)];
             append_ws(&mut sql, &mut params, workspace_id, true);
-            sql.push_str(" ORDER BY COALESCE(total_score, -999) DESC LIMIT ?");
+            sql.push_str(
+                " ORDER BY COALESCE(reg_date, '') DESC, COALESCE(created_at, '') DESC LIMIT ?",
+            );
             params.push(Value::Integer(i64::from(limit.clamp(1, 20))));
 
             let mut stmt = conn.prepare(&sql)?;
             let rows = stmt.query_map(params_from_iter(params.iter()), map_article_row)?;
             rows.collect::<Result<Vec<_>, _>>()
-                .context("failed to query top articles")
+                .context("failed to query latest articles")
         })
         .await
     }
@@ -402,130 +399,6 @@ impl ArticleService {
         .await
     }
 
-    pub async fn save_fetched_abstract(
-        &self,
-        uid: &str,
-        abstract_text: &str,
-    ) -> Result<ArticleResponse, AppError> {
-        let database_path = self.database_path.clone();
-        let uid = uid.to_string();
-        let abstract_text = abstract_text.to_string();
-
-        task::spawn_blocking(move || {
-            let conn = crate::db::open_connection(&*database_path)?;
-            let updated = conn.execute(
-                "UPDATE haie_rev
-                 SET full_text = ?1,
-                     content_type = 'abstract_only',
-                     updated_at = datetime('now')
-                 WHERE uid = ?2",
-                [&abstract_text, uid.as_str()],
-            )?;
-
-            if updated == 0 {
-                return Err(anyhow::anyhow!("Article {uid} not found"));
-            }
-
-            let sql = format!("SELECT {ARTICLE_COLUMNS} FROM haie_rev WHERE uid = ?1");
-            let mut stmt = conn.prepare(&sql)?;
-            let article = stmt.query_row([uid.as_str()], map_article_row)?;
-
-            Ok::<_, anyhow::Error>(article)
-        })
-        .await
-        .map_err(|error| AppError::Internal(error.to_string()))?
-        .map_err(|error| map_anyhow_not_found(error, "Article"))
-    }
-
-    pub async fn apply_reevaluation(
-        &self,
-        uid: &str,
-        evaluation: &serde_json::Map<String, serde_json::Value>,
-    ) -> Result<ArticleResponse, AppError> {
-        let database_path = self.database_path.clone();
-        let uid = uid.to_string();
-        let evaluation = evaluation.clone();
-
-        task::spawn_blocking(move || {
-            let conn = crate::db::open_connection(&*database_path)?;
-
-            let text_fields = [
-                "ai_tech",
-                "clinical_domain",
-                "ethics_framework",
-                "primary_issue",
-                "key_stakeholders",
-                "practical_impl",
-                "secondary_issues",
-                "key_argument",
-                "main_findings",
-                "normative_claims",
-                "limitations",
-                "theoretical_strengths",
-                "theoretical_weaknesses",
-                "empirical_strengths",
-                "empirical_weaknesses",
-                "byline_summary",
-                "why_it_matters",
-                "priority",
-            ];
-            let score_fields = [
-                "scholarly_rigor",
-                "novelty",
-                "relevance_score",
-                "practical_impact",
-                "interdisciplinary",
-                "critical_concerns",
-                "total_score",
-            ];
-
-            let mut assignments = Vec::new();
-            let mut params = Vec::new();
-
-            for field in text_fields {
-                match evaluation.get(field) {
-                    Some(serde_json::Value::String(value)) if !value.is_empty() => {
-                        assignments.push(format!("{field} = ?"));
-                        params.push(Value::Text(value.clone()));
-                    }
-                    _ => {}
-                }
-            }
-
-            for field in score_fields {
-                if let Some(value) = evaluation.get(field).and_then(json_number_to_i64) {
-                    assignments.push(format!("{field} = ?"));
-                    params.push(Value::Integer(value));
-                }
-            }
-
-            if assignments.is_empty() {
-                return Err(anyhow::anyhow!(
-                    "Re-evaluation produced no updatable fields"
-                ));
-            }
-
-            params.push(Value::Text(uid.clone()));
-            let sql = format!(
-                "UPDATE haie_rev SET {}, updated_at = datetime('now') WHERE uid = ?",
-                assignments.join(", ")
-            );
-            let updated = conn.execute(&sql, params_from_iter(params.iter()))?;
-
-            if updated == 0 {
-                return Err(anyhow::anyhow!("Article {uid} not found"));
-            }
-
-            let sql = format!("SELECT {ARTICLE_COLUMNS} FROM haie_rev WHERE uid = ?1");
-            let mut stmt = conn.prepare(&sql)?;
-            let article = stmt.query_row([uid.as_str()], map_article_row)?;
-
-            Ok::<_, anyhow::Error>(article)
-        })
-        .await
-        .map_err(|error| AppError::Internal(error.to_string()))?
-        .map_err(|error| map_anyhow_not_found(error, "Article"))
-    }
 }
 
 /// Appends a workspace scope to a query when an id is provided. `has_where`
@@ -543,15 +416,6 @@ fn append_ws(
             " WHERE workspace_id = ?"
         });
         params.push(Value::Integer(id));
-    }
-}
-
-fn json_number_to_i64(value: &serde_json::Value) -> Option<i64> {
-    match value {
-        serde_json::Value::Number(number) => number
-            .as_i64()
-            .or_else(|| number.as_f64().map(|v| v as i64)),
-        _ => None,
     }
 }
 
@@ -580,10 +444,7 @@ fn build_article_update(
             | "empirical_strengths"
             | "empirical_weaknesses"
             | "byline_summary"
-            | "why_it_matters"
-            | "priority" => key.as_str(),
-            "scholarly_rigor" | "novelty" | "relevance_score" | "practical_impact"
-            | "interdisciplinary" | "critical_concerns" | "total_score" => key.as_str(),
+            | "why_it_matters" => key.as_str(),
             _ => continue,
         };
 
@@ -599,17 +460,10 @@ fn json_value_to_sql_value(key: &str, value: &serde_json::Value) -> Result<Value
         return Ok(Value::Null);
     }
 
-    match key {
-        "scholarly_rigor" | "novelty" | "relevance_score" | "practical_impact"
-        | "interdisciplinary" | "critical_concerns" | "total_score" => value
-            .as_i64()
-            .map(Value::Integer)
-            .ok_or_else(|| anyhow::anyhow!("Field '{key}' must be an integer or null")),
-        _ => value
-            .as_str()
-            .map(|text| Value::Text(text.to_string()))
-            .ok_or_else(|| anyhow::anyhow!("Field '{key}' must be a string or null")),
-    }
+    value
+        .as_str()
+        .map(|text| Value::Text(text.to_string()))
+        .ok_or_else(|| anyhow::anyhow!("Field '{key}' must be a string or null"))
 }
 
 fn map_anyhow_not_found(error: anyhow::Error, entity_name: &str) -> AppError {
@@ -641,18 +495,6 @@ fn article_where_clause(
     if let Some(date_to) = query.date_to.as_ref().filter(|value| !value.is_empty()) {
         conditions.push("reg_date <= ?".to_string());
         params.push(Value::Text(date_to.clone()));
-    }
-    if let Some(min_score) = query.min_score {
-        conditions.push("total_score >= ?".to_string());
-        params.push(Value::Integer(i64::from(min_score)));
-    }
-    if let Some(max_score) = query.max_score {
-        conditions.push("total_score <= ?".to_string());
-        params.push(Value::Integer(i64::from(max_score)));
-    }
-    if let Some(tier) = query.tier.as_ref().filter(|value| !value.is_empty()) {
-        conditions.push("priority = ?".to_string());
-        params.push(Value::Text(tier.clone()));
     }
     if let Some(category) = query.category.as_ref().filter(|value| !value.is_empty()) {
         conditions.push("LOWER(COALESCE(category, '')) = LOWER(?)".to_string());
@@ -702,16 +544,11 @@ fn map_article_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ArticleResponse>
         empirical_weaknesses: row.get(22)?,
         byline_summary: row.get(23)?,
         why_it_matters: row.get(24)?,
-        scholarly_rigor: row.get(25)?,
-        novelty: row.get(26)?,
-        relevance_score: row.get(27)?,
-        practical_impact: row.get(28)?,
-        interdisciplinary: row.get(29)?,
-        critical_concerns: row.get(30)?,
-        total_score: row.get(31)?,
-        priority: row.get(32)?,
-        reg_date: row.get(33)?,
-        created_at: row.get(34)?,
-        updated_at: row.get(35)?,
+        evaluated_at: row.get(25)?,
+        content_type: row.get(26)?,
+        pdf_path: row.get(27)?,
+        reg_date: row.get(28)?,
+        created_at: row.get(29)?,
+        updated_at: row.get(30)?,
     })
 }

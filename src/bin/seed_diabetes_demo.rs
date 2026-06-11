@@ -70,6 +70,7 @@ fn demo_config_from_env() -> Result<AppConfig> {
             prompts_dir: env_path("PROMPTS_DIR", root.join("prompts")),
             settings_file: env_path("SETTINGS_FILE", root.join("settings.json")),
             wiki_export_dir: env_path("WIKI_EXPORT_DIR", root.join("wiki")),
+            pdf_dir: env_path("PDF_DIR", root.join("pdfs")),
         },
         llm: LlmConfig {
             base_url: std::env::var("LLM_BASE_URL")
@@ -458,16 +459,15 @@ fn seed_articles(conn: &Connection, workspace_id: i64) -> Result<()> {
             "INSERT INTO haie_rev
                 (uid, url, category, reg_date, title, first_author, authors, pub_date, journal, doi,
                  ai_tech, clinical_domain, primary_issue, secondary_issues, key_stakeholders,
-                 byline_summary, why_it_matters, main_findings, limitations, scholarly_rigor,
-                 novelty, relevance_score, practical_impact, interdisciplinary, critical_concerns,
-                 total_score, priority, full_text, content_type, has_embeddings, has_kg_entities,
+                 byline_summary, why_it_matters, main_findings, limitations,
+                 full_text, content_type, evaluated_at, has_embeddings, has_kg_entities,
                  workspace_id)
              VALUES
                 (?1, ?2, ?3, date('now'), ?4, ?5, ?5, ?6, ?7, ?8,
                  'chatbot / conversational agent', 'type 2 diabetes',
                  'self-management education outcomes', 'HbA1c; adherence; HRQoL; safety escalation',
                  'patients; clinicians; trialists', ?9, ?10, ?11, ?12,
-                 4, 4, 5, 4, 3, -1, 83, 'Tier1', ?13, 'text', 0, 1, ?14)",
+                 ?13, 'text', datetime('now'), 0, 1, ?14)",
             params![
                 article.uid,
                 format!("demo://{SOURCE_PACKAGE}/{}", article.uid),

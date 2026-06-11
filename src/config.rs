@@ -26,6 +26,8 @@ pub struct StorageConfig {
     pub prompts_dir: PathBuf,
     pub settings_file: PathBuf,
     pub wiki_export_dir: PathBuf,
+    /// Where fetched article PDFs are persisted for re-extraction.
+    pub pdf_dir: PathBuf,
 }
 
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
@@ -120,6 +122,7 @@ impl AppConfig {
                 prompts_dir: root.join("prompts"),
                 settings_file: root.join("settings.json"),
                 wiki_export_dir: root.join("wiki"),
+                pdf_dir: root.join("pdfs"),
             },
             llm: LlmConfig::default(),
             embedding: EmbeddingConfig::default(),
@@ -142,6 +145,7 @@ impl AppConfig {
             prompts_dir: env_path("PROMPTS_DIR").unwrap_or(base.storage.prompts_dir),
             settings_file: env_path("SETTINGS_FILE").unwrap_or(base.storage.settings_file),
             wiki_export_dir: env_path("WIKI_EXPORT_DIR").unwrap_or(base.storage.wiki_export_dir),
+            pdf_dir: env_path("PDF_DIR").unwrap_or(base.storage.pdf_dir),
         };
 
         let llm = LlmConfig {

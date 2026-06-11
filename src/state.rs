@@ -90,6 +90,7 @@ impl AppState {
             workspace_service.clone(),
             config.contact_email_opt(),
             config.semantic_scholar_api_key_opt(),
+            config.storage.pdf_dir.clone(),
         ));
         let newsletter_service = std::sync::Arc::new(NewsletterService::new(
             article_service.clone(),

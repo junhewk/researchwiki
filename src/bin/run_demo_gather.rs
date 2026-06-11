@@ -348,6 +348,7 @@ fn demo_config_from_env() -> Result<AppConfig> {
             prompts_dir: env_path("PROMPTS_DIR", root.join("prompts")),
             settings_file: env_path("SETTINGS_FILE", root.join("settings.json")),
             wiki_export_dir: env_path("WIKI_EXPORT_DIR", root.join("wiki")),
+            pdf_dir: env_path("PDF_DIR", root.join("pdfs")),
         },
         llm: LlmConfig {
             base_url: std::env::var("LLM_BASE_URL").unwrap_or_default(),

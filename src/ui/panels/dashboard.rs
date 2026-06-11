@@ -110,11 +110,11 @@ impl Panel {
                     &stats.total_articles.to_string(),
                 );
                 style::metric_tile(ui, ctx.t("This week"), &stats.this_week.to_string());
-                style::metric_tile(ui, ctx.t("Tier 1"), &stats.tier1_count.to_string());
+                style::metric_tile(ui, ctx.t("Evaluated"), &stats.evaluated_count.to_string());
                 style::metric_tile(
                     ui,
-                    ctx.t("Pending review"),
-                    &stats.pending_review.to_string(),
+                    ctx.t("Pending evaluation"),
+                    &stats.pending_evaluation.to_string(),
                 );
             });
         }
@@ -139,18 +139,15 @@ impl Panel {
         }
 
         ui.add_space(10.0);
-        style::section_heading(ui, ctx.t("Top articles"));
+        style::section_heading(ui, ctx.t("Recent articles"));
         egui::ScrollArea::vertical().show(ui, |ui| {
             if self.top.is_empty() {
-                style::muted_label(ui, ctx.t("No scored articles yet for this workspace."));
+                style::muted_label(ui, ctx.t("No articles yet for this workspace."));
             }
             for article in &self.top {
                 ui.horizontal(|ui| {
-                    let score = article
-                        .total_score
-                        .map(|s| s.to_string())
-                        .unwrap_or_else(|| "—".to_string());
-                    ui.label(egui::RichText::new(format!("[{score}]")).monospace());
+                    let date = article.reg_date.as_deref().unwrap_or("—");
+                    ui.label(egui::RichText::new(date).monospace());
                     ui.label(article.title.as_deref().unwrap_or("(untitled)"));
                 });
             }
@@ -169,7 +166,7 @@ impl Panel {
         ctx.handle.spawn(async move {
             let stats = svc.get_stats(ws).await;
             let daily = svc.get_daily_stats(CHART_DAYS, ws).await;
-            let top = svc.get_top_articles(CHART_DAYS, TOP_LIMIT, ws).await;
+            let top = svc.get_latest_articles(CHART_DAYS, TOP_LIMIT, ws).await;
             let _ = match (stats, daily, top) {
                 (Ok(stats), Ok(daily), Ok(top)) => tx.send(Msg::Loaded { stats, daily, top }),
                 (Err(e), _, _) | (_, Err(e), _) | (_, _, Err(e)) => {

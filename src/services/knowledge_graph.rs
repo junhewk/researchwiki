@@ -184,14 +184,28 @@ struct ArticleInput {
     uid: String,
     title: Option<String>,
     full_text: Option<String>,
+    content_type: Option<String>,
     byline_summary: Option<String>,
 }
 
 impl ArticleInput {
     fn kg_text(&self) -> String {
+        // full_text may hold raw PMC XML or scraped HTML; extract plain text
+        // before chunking so the LLM never sees markup.
+        let extracted = self
+            .full_text
+            .as_deref()
+            .map(|text| {
+                crate::services::text_extractor::extract_from_content(
+                    text,
+                    self.content_type.as_deref().unwrap_or("text"),
+                )
+                .full_text
+            })
+            .filter(|text| !text.trim().is_empty());
         prepare_kg_text(
             self.title.as_deref(),
-            self.full_text.as_deref().or(self.byline_summary.as_deref()),
+            extracted.as_deref().or(self.byline_summary.as_deref()),
         )
     }
 }
@@ -232,6 +246,9 @@ struct InsertOutcome {
     entities: i64,
     relationships: i64,
     chunks: i64,
+    /// Chunks whose extraction failed even after a retry. The article is left
+    /// unmarked so the next backfill resumes the missing chunks.
+    failed_chunks: i64,
 }
 
 impl EntityEngram {
@@ -804,15 +821,25 @@ impl KnowledgeGraphService {
                 .await
             {
                 Ok(outcome) => {
+                    let complete = outcome.failed_chunks == 0;
                     results.push(KGInsertResult {
                         uid: article.uid,
-                        success: true,
+                        success: complete,
                         entities: outcome.entities,
                         relationships: outcome.relationships,
                         chunks: outcome.chunks,
-                        error: None,
+                        error: (!complete).then(|| {
+                            format!(
+                                "{} of {} chunks failed extraction; the article will be retried by the next backfill",
+                                outcome.failed_chunks, outcome.chunks
+                            )
+                        }),
                     });
-                    inserted += 1;
+                    if complete {
+                        inserted += 1;
+                    } else {
+                        failed += 1;
+                    }
                 }
                 Err(error) => {
                     results.push(KGInsertResult {
@@ -1281,60 +1308,94 @@ impl KnowledgeGraphService {
         context: &WorkspaceResearchContext,
     ) -> Result<InsertOutcome, AppError> {
         let chunks = chunk_text_for_kg(text);
+        let chunks_total = chunks.len() as i64;
+        // Chunk writes commit individually (mention counts, relationship
+        // weights), so a retried article must not re-run chunks that already
+        // landed — that would double-increment the counters. The progress row
+        // records exactly which chunks committed.
+        let mut completed = self.load_extraction_progress(uid, chunks_total).await?;
         let mut total_entities = 0i64;
         let mut total_relationships = 0i64;
+        let mut failed_chunks = 0i64;
         let mut session_cache = HashMap::new();
 
         for (chunk_index, chunk_text) in chunks.iter().enumerate() {
-            let extraction = self.extract_chunk(uid, chunk_text, context).await?;
-            if extraction.entities.is_empty() {
+            let chunk_index = chunk_index as i64;
+            if completed.contains(&chunk_index) {
                 continue;
             }
 
-            let entity_ids = self
-                .resolve_entities(uid, &extraction.entities, engram, &mut session_cache)
-                .await?;
-            if entity_ids.is_empty() {
-                continue;
-            }
+            // One retry guards against transient LLM/parse failures; after
+            // that the chunk is skipped so one bad chunk can't sink the
+            // article's remaining chunks.
+            let extraction = match self.extract_chunk(uid, chunk_text, context).await {
+                Ok(extraction) => extraction,
+                Err(first_error) => {
+                    warn!("chunk {chunk_index} extraction failed for {uid}: {first_error}; retrying once");
+                    match self.extract_chunk(uid, chunk_text, context).await {
+                        Ok(extraction) => extraction,
+                        Err(error) => {
+                            warn!("chunk {chunk_index} extraction failed again for {uid}: {error}; skipping chunk");
+                            failed_chunks += 1;
+                            continue;
+                        }
+                    }
+                }
+            };
 
-            for entity in &extraction.entities {
-                if let Some(entity_id) = entity_ids.get(&entity.name) {
-                    self.add_article_entity(
+            if !extraction.entities.is_empty() {
+                let entity_ids = self
+                    .resolve_entities(uid, &extraction.entities, engram, &mut session_cache)
+                    .await?;
+
+                for entity in &extraction.entities {
+                    if let Some(entity_id) = entity_ids.get(&entity.name) {
+                        self.add_article_entity(
+                            uid,
+                            *entity_id,
+                            Some(entity.name.as_str()),
+                            Some(entity.description.as_str()),
+                            chunk_index,
+                        )
+                        .await?;
+                        total_entities += 1;
+                    }
+                }
+
+                for relationship in &extraction.relationships {
+                    let Some(source_id) = entity_ids.get(&relationship.source).copied() else {
+                        continue;
+                    };
+                    let Some(target_id) = entity_ids.get(&relationship.target).copied() else {
+                        continue;
+                    };
+                    if source_id == target_id {
+                        continue;
+                    }
+                    self.upsert_relationship(
+                        source_id,
+                        target_id,
+                        &relationship.relationship,
                         uid,
-                        *entity_id,
-                        Some(entity.name.as_str()),
-                        Some(entity.description.as_str()),
-                        chunk_index as i64,
+                        Some(&relationship.description),
                     )
                     .await?;
-                    total_entities += 1;
+                    total_relationships += 1;
                 }
             }
 
-            for relationship in &extraction.relationships {
-                let Some(source_id) = entity_ids.get(&relationship.source).copied() else {
-                    continue;
-                };
-                let Some(target_id) = entity_ids.get(&relationship.target).copied() else {
-                    continue;
-                };
-                if source_id == target_id {
-                    continue;
-                }
-                self.upsert_relationship(
-                    source_id,
-                    target_id,
-                    &relationship.relationship,
-                    uid,
-                    Some(&relationship.description),
-                )
+            completed.insert(chunk_index);
+            self.save_extraction_progress(uid, chunks_total, &completed)
                 .await?;
-                total_relationships += 1;
-            }
         }
 
-        self.mark_article_has_kg_entities(uid).await?;
+        // Only a fully extracted article counts as done; partial articles stay
+        // unmarked (and keep their progress row) so backfill retries the
+        // missing chunks without redoing the committed ones.
+        if failed_chunks == 0 {
+            self.mark_article_has_kg_entities(uid).await?;
+            self.clear_extraction_progress(uid).await?;
+        }
 
         // Mark syntheses stale for all entities touched by this article.
         let touched_ids: Vec<i64> = session_cache.values().copied().collect();
@@ -1343,8 +1404,90 @@ impl KnowledgeGraphService {
         Ok(InsertOutcome {
             entities: total_entities,
             relationships: total_relationships,
-            chunks: chunks.len() as i64,
+            chunks: chunks_total,
+            failed_chunks,
         })
+    }
+
+    /// Loads the set of chunk indexes already committed for this article. A
+    /// missing row or a chunk-count mismatch (the source text changed) starts
+    /// fresh.
+    async fn load_extraction_progress(
+        &self,
+        uid: &str,
+        chunks_total: i64,
+    ) -> Result<BTreeSet<i64>, AppError> {
+        let database_path = self.database_path.clone();
+        let uid = uid.to_string();
+        run_blocking(move || {
+            let conn = crate::db::open_connection(&*database_path)?;
+            let row: Option<(i64, String)> = conn
+                .query_row(
+                    "SELECT chunks_total, completed_chunks_json
+                     FROM kg_extraction_progress WHERE article_uid = ?1",
+                    [uid.as_str()],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .optional()?;
+
+            match row {
+                Some((stored_total, completed_json)) if stored_total == chunks_total => {
+                    Ok(serde_json::from_str::<Vec<i64>>(&completed_json)
+                        .unwrap_or_default()
+                        .into_iter()
+                        .collect())
+                }
+                Some(_) => {
+                    conn.execute(
+                        "DELETE FROM kg_extraction_progress WHERE article_uid = ?1",
+                        [uid.as_str()],
+                    )?;
+                    Ok(BTreeSet::new())
+                }
+                None => Ok(BTreeSet::new()),
+            }
+        })
+        .await
+    }
+
+    async fn save_extraction_progress(
+        &self,
+        uid: &str,
+        chunks_total: i64,
+        completed: &BTreeSet<i64>,
+    ) -> Result<(), AppError> {
+        let database_path = self.database_path.clone();
+        let uid = uid.to_string();
+        let completed_json = serde_json::to_string(&completed.iter().collect::<Vec<_>>())
+            .unwrap_or_else(|_| "[]".to_string());
+        run_blocking(move || {
+            let conn = crate::db::open_connection(&*database_path)?;
+            conn.execute(
+                "INSERT INTO kg_extraction_progress (article_uid, chunks_total, completed_chunks_json, updated_at)
+                 VALUES (?1, ?2, ?3, datetime('now'))
+                 ON CONFLICT(article_uid) DO UPDATE SET
+                   chunks_total = excluded.chunks_total,
+                   completed_chunks_json = excluded.completed_chunks_json,
+                   updated_at = excluded.updated_at",
+                params![uid, chunks_total, completed_json],
+            )?;
+            Ok(())
+        })
+        .await
+    }
+
+    async fn clear_extraction_progress(&self, uid: &str) -> Result<(), AppError> {
+        let database_path = self.database_path.clone();
+        let uid = uid.to_string();
+        run_blocking(move || {
+            let conn = crate::db::open_connection(&*database_path)?;
+            conn.execute(
+                "DELETE FROM kg_extraction_progress WHERE article_uid = ?1",
+                [uid.as_str()],
+            )?;
+            Ok(())
+        })
+        .await
     }
 
     async fn extract_chunk(
@@ -1542,9 +1685,23 @@ impl KnowledgeGraphService {
                 continue;
             }
 
-            let verification = self
+            // A failed verification call must not abort the whole article.
+            // Skip the candidate without caching: no merge on uncertainty (a
+            // duplicate entity is recoverable, a wrong merge is not), and the
+            // next encounter retries the verification.
+            let verification = match self
                 .verify_entity_candidate(uid, entity, &candidate.entity)
-                .await?;
+                .await
+            {
+                Ok(verification) => verification,
+                Err(error) => {
+                    warn!(
+                        "entity verification failed for '{}' vs '{}': {error}; treating as no match",
+                        entity.name, candidate.entity.canonical_name
+                    );
+                    continue;
+                }
+            };
             let matched = verification.same_entity
                 && verification.confidence >= ENTITY_VERIFICATION_CONFIDENCE_THRESHOLD;
             if !verification.reasoning.trim().is_empty() {
@@ -1689,7 +1846,7 @@ impl KnowledgeGraphService {
             }
             let placeholders = vec!["?"; uids.len()].join(", ");
             let sql = format!(
-                "SELECT uid, title, full_text, byline_summary FROM haie_rev WHERE uid IN ({placeholders})"
+                "SELECT uid, title, full_text, content_type, byline_summary FROM haie_rev WHERE uid IN ({placeholders})"
             );
             let params: Vec<Value> = uids.into_iter().map(Value::Text).collect();
             let mut stmt = conn.prepare(&sql)?;
@@ -1698,7 +1855,8 @@ impl KnowledgeGraphService {
                     uid: row.get(0)?,
                     title: row.get(1)?,
                     full_text: row.get(2)?,
-                    byline_summary: row.get(3)?,
+                    content_type: row.get(3)?,
+                    byline_summary: row.get(4)?,
                 })
             })?;
             rows.collect::<Result<Vec<_>, _>>().map_err(anyhow::Error::from)
@@ -1735,7 +1893,7 @@ impl KnowledgeGraphService {
             let conn = crate::db::open_connection(&*database_path)?;
             let mut stmt = conn.prepare(
                 "
-                SELECT uid, title, full_text, byline_summary
+                SELECT uid, title, full_text, content_type, byline_summary
                 FROM haie_rev
                 WHERE full_text IS NOT NULL
                   AND COALESCE(has_kg_entities, 0) = 0
@@ -1753,7 +1911,8 @@ impl KnowledgeGraphService {
                         uid: row.get(0)?,
                         title: row.get(1)?,
                         full_text: row.get(2)?,
-                        byline_summary: row.get(3)?,
+                        content_type: row.get(3)?,
+                        byline_summary: row.get(4)?,
                     })
                 },
             )?;
@@ -1891,7 +2050,8 @@ impl KnowledgeGraphService {
         description: Option<&str>,
     ) -> Result<(), AppError> {
         let database_path = self.database_path.clone();
-        let relationship_type = relationship_type.trim().to_string();
+        let (relationship_type, source_id, target_id) =
+            canonicalize_relationship(relationship_type, source_id, target_id);
         let article_uid = article_uid.to_string();
         let description = description.map(|value| value.trim().to_string());
 
@@ -3078,6 +3238,9 @@ impl KnowledgeGraphService {
             serde_json::from_value(json_output).map_err(|error| {
                 AppError::Internal(format!("invalid entity_synthesis output: {error}"))
             })?;
+        // An empty/truncated synthesis must not overwrite a previous good one;
+        // failing here keeps the old row and counts as a failed compile.
+        validate_synthesis_output(&output)?;
 
         // Count source articles
         let database_path = self.database_path.clone();
@@ -3126,6 +3289,20 @@ impl KnowledgeGraphService {
 
         if let Err(error) = self.export_wiki_pages(entity_id).await {
             warn!("wiki Markdown export failed for entity {entity_id}: {error}");
+            // The synthesis itself is good, but the on-disk wiki page is now
+            // out of date — flip the row back to stale so the next compile
+            // pass re-exports it.
+            let database_path = self.database_path.clone();
+            run_blocking(move || {
+                let conn = crate::db::open_connection(&*database_path)?;
+                conn.execute(
+                    "UPDATE kg_entity_syntheses SET stale = 1, updated_at = datetime('now')
+                     WHERE entity_id = ?1",
+                    [entity_id],
+                )?;
+                Ok(())
+            })
+            .await?;
         }
 
         Ok(())
@@ -3613,7 +3790,6 @@ struct WikiSourceArticle {
     why_it_matters: Option<String>,
     key_argument: Option<String>,
     main_findings: Option<String>,
-    total_score: Option<i64>,
     reg_date: Option<String>,
 }
 
@@ -3687,7 +3863,7 @@ fn load_wiki_sources_for_entity(
         "
         SELECT DISTINCT h.uid, h.title, h.url, h.first_author, h.pub_date, h.journal,
                h.byline_summary, h.why_it_matters, h.key_argument, h.main_findings,
-               h.total_score, h.reg_date
+               h.reg_date
         FROM kg_article_entities kae
         JOIN haie_rev h ON h.uid = kae.article_uid
         WHERE kae.entity_id = ?1
@@ -3704,7 +3880,7 @@ fn load_all_wiki_sources(conn: &Connection) -> Result<Vec<WikiSourceArticle>, an
     let mut stmt = conn.prepare(
         "
         SELECT uid, title, url, first_author, pub_date, journal, byline_summary,
-               why_it_matters, key_argument, main_findings, total_score, reg_date
+               why_it_matters, key_argument, main_findings, reg_date
         FROM haie_rev
         WHERE COALESCE(uid, '') != ''
         ORDER BY pub_date DESC, reg_date DESC, title ASC
@@ -3722,10 +3898,10 @@ fn load_wiki_daily_sources(
     let mut stmt = conn.prepare(
         "
         SELECT uid, title, url, first_author, pub_date, journal, byline_summary,
-               why_it_matters, key_argument, main_findings, total_score, reg_date
+               why_it_matters, key_argument, main_findings, reg_date
         FROM haie_rev
         WHERE reg_date = ?1
-        ORDER BY total_score DESC, title ASC
+        ORDER BY title ASC
         LIMIT 200
         ",
     )?;
@@ -3778,8 +3954,7 @@ fn map_wiki_source_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<WikiSourceAr
         why_it_matters: row.get(7)?,
         key_argument: row.get(8)?,
         main_findings: row.get(9)?,
-        total_score: row.get(10)?,
-        reg_date: row.get(11)?,
+        reg_date: row.get(10)?,
     })
 }
 
@@ -3890,9 +4065,6 @@ fn render_source_markdown(source: &WikiSourceArticle) -> String {
     append_optional_line(&mut out, "Author", source.first_author.as_deref());
     append_optional_line(&mut out, "Published", source.pub_date.as_deref());
     append_optional_line(&mut out, "Journal", source.journal.as_deref());
-    if let Some(score) = source.total_score {
-        out.push_str(&format!("- Score: {score}\n"));
-    }
     if let Some(url) = source.url.as_deref().filter(|value| !value.is_empty()) {
         out.push_str(&format!("- URL: <{url}>\n"));
     }
@@ -3953,9 +4125,6 @@ fn render_daily_markdown(date: &str, sources: &[WikiSourceArticle]) -> String {
             escape_markdown_link_label(title),
             source_markdown_filename(&source.uid)
         ));
-        if let Some(score) = source.total_score {
-            out.push_str(&format!(" - score {score}"));
-        }
         if let Some(journal) = source.journal.as_deref().filter(|value| !value.is_empty()) {
             out.push_str(&format!(" - {}", clean_markdown_text(journal)));
         }
@@ -4139,11 +4308,83 @@ fn query_graph_edges(
     Ok(edges)
 }
 
+/// Passive relationship phrasings and their active counterparts. A passive
+/// match flips the edge direction so "B developed by A" and "A develops B"
+/// land on the same row.
+const PASSIVE_RELATIONSHIP_FORMS: [(&str, &str); 14] = [
+    ("developed by", "develops"),
+    ("used by", "uses"),
+    ("caused by", "causes"),
+    ("influenced by", "influences"),
+    ("regulated by", "regulates"),
+    ("proposed by", "proposes"),
+    ("applied by", "applies"),
+    ("created by", "creates"),
+    ("introduced by", "introduces"),
+    ("evaluated by", "evaluates"),
+    ("supported by", "supports"),
+    ("funded by", "funds"),
+    ("studied by", "studies"),
+    ("addressed by", "addresses"),
+];
+
+/// Canonical form of a relationship edge: trimmed, lowercased,
+/// whitespace-collapsed, with passive voice rewritten as active (which swaps
+/// source and target). LLM extraction is not consistent about voice, and
+/// without this the same fact accumulates as two separate edges.
+pub(crate) fn canonicalize_relationship(
+    relationship_type: &str,
+    source_id: i64,
+    target_id: i64,
+) -> (String, i64, i64) {
+    let normalized = relationship_type
+        .trim()
+        .to_lowercase()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+
+    if let Some((_, active)) = PASSIVE_RELATIONSHIP_FORMS
+        .iter()
+        .find(|(passive, _)| *passive == normalized)
+    {
+        return ((*active).to_string(), target_id, source_id);
+    }
+
+    (normalized, source_id, target_id)
+}
+
+/// Minimum trimmed length for a usable entity description; shorter ones are
+/// noise that pollutes synthesis context.
+const MIN_ENTITY_DESCRIPTION_CHARS: usize = 15;
+
+fn is_reasonable_entity_name(name: &str) -> bool {
+    let trimmed = name.trim();
+    let char_count = trimmed.chars().count();
+    (2..=120).contains(&char_count) && trimmed.chars().any(char::is_alphabetic)
+}
+
+/// Rejects an LLM synthesis that came back structurally valid but empty or
+/// truncated — overwriting a previous good synthesis with it would lose data.
+fn validate_synthesis_output(output: &SynthesisGenerationOutput) -> Result<(), AppError> {
+    if output.summary.trim().is_empty() {
+        return Err(AppError::Internal(
+            "entity_synthesis returned an empty summary".to_string(),
+        ));
+    }
+    if output.synthesis.trim().chars().count() < 80 {
+        return Err(AppError::Internal(
+            "entity_synthesis returned a missing or truncated synthesis".to_string(),
+        ));
+    }
+    Ok(())
+}
+
 fn validate_extraction(extraction: &mut ChunkExtraction) {
     extraction.entities.retain(|entity| {
-        !entity.name.trim().is_empty()
+        is_reasonable_entity_name(&entity.name)
             && !normalize_entity_type(&entity.entity_type).is_empty()
-            && !entity.description.trim().is_empty()
+            && entity.description.trim().chars().count() >= MIN_ENTITY_DESCRIPTION_CHARS
             && !is_metadata_entity_name(&entity.name)
     });
 
@@ -4395,7 +4636,91 @@ fn json_object<const N: usize>(pairs: [(&str, JsonValue); N]) -> Map<String, Jso
 
 #[cfg(test)]
 mod tests {
-    use super::is_metadata_entity_name;
+    use super::{
+        canonicalize_relationship, is_metadata_entity_name, validate_extraction,
+        validate_synthesis_output,
+    };
+    use crate::models::knowledge_graph::{
+        ChunkExtraction, ExtractedEntity, ExtractedRelationship, SynthesisGenerationOutput,
+    };
+
+    #[test]
+    fn relationship_canonicalization_normalizes_and_flips_passive_voice() {
+        assert_eq!(
+            canonicalize_relationship("  Develops  ", 1, 2),
+            ("develops".to_string(), 1, 2)
+        );
+        assert_eq!(
+            canonicalize_relationship("Developed   By", 1, 2),
+            ("develops".to_string(), 2, 1)
+        );
+        assert_eq!(
+            canonicalize_relationship("used by", 7, 9),
+            ("uses".to_string(), 9, 7)
+        );
+        // Canonicalizing twice is a no-op.
+        let (rel, src, tgt) = canonicalize_relationship("developed by", 1, 2);
+        assert_eq!(canonicalize_relationship(&rel, src, tgt), (rel.clone(), src, tgt));
+    }
+
+    #[test]
+    fn synthesis_validation_rejects_empty_or_truncated_output() {
+        let valid = SynthesisGenerationOutput {
+            summary: "A summary.".to_string(),
+            synthesis: "S".repeat(120),
+            key_aspects: Vec::new(),
+            related_entities: Vec::new(),
+        };
+        assert!(validate_synthesis_output(&valid).is_ok());
+
+        let empty_summary = SynthesisGenerationOutput {
+            summary: "  ".to_string(),
+            synthesis: "S".repeat(120),
+            key_aspects: Vec::new(),
+            related_entities: Vec::new(),
+        };
+        assert!(validate_synthesis_output(&empty_summary).is_err());
+
+        let short_synthesis = SynthesisGenerationOutput {
+            summary: "A summary.".to_string(),
+            synthesis: "too short".to_string(),
+            key_aspects: Vec::new(),
+            related_entities: Vec::new(),
+        };
+        assert!(validate_synthesis_output(&short_synthesis).is_err());
+    }
+
+    #[test]
+    fn extraction_validation_drops_junk_entities_and_orphan_relationships() {
+        let entity = |name: &str, description: &str| ExtractedEntity {
+            name: name.to_string(),
+            entity_type: "CONCEPT".to_string(),
+            description: description.to_string(),
+        };
+        let mut extraction = ChunkExtraction {
+            entities: vec![
+                entity("Machine Learning", "A field of AI focused on learning from data."),
+                entity("X", "A single-character name is too short to keep."),
+                entity("Federated Learning", "short"),
+                entity("12345", "All-digit names carry no entity meaning here."),
+            ],
+            relationships: vec![
+                ExtractedRelationship {
+                    source: "Machine Learning".to_string(),
+                    target: "Federated Learning".to_string(),
+                    relationship: "includes".to_string(),
+                    description: String::new(),
+                },
+            ],
+        };
+
+        validate_extraction(&mut extraction);
+
+        assert_eq!(extraction.entities.len(), 1);
+        assert_eq!(extraction.entities[0].name, "Machine Learning");
+        // The relationship's target was dropped, so the edge goes too.
+        assert!(extraction.relationships.is_empty());
+    }
 
     #[test]
     fn metadata_filter_removes_publication_artifacts() {

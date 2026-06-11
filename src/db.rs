@@ -4,7 +4,7 @@ use std::{
 };
 
 use anyhow::{Context, Result};
-use rusqlite::Connection;
+use rusqlite::{Connection, OptionalExtension};
 use tokio::task;
 
 use crate::config::AppConfig;
@@ -180,16 +180,10 @@ fn initialize_sync(database_path: &std::path::Path, embedding_dimensions: u32) -
             theoretical_weaknesses TEXT,
             empirical_strengths TEXT,
             empirical_weaknesses TEXT,
-            scholarly_rigor INTEGER,
-            novelty INTEGER,
-            relevance_score INTEGER,
-            practical_impact INTEGER,
-            interdisciplinary INTEGER,
-            critical_concerns INTEGER,
-            total_score INTEGER,
-            priority TEXT,
             full_text TEXT,
             content_type TEXT,
+            evaluated_at TEXT,
+            pdf_path TEXT,
             has_embeddings INTEGER DEFAULT 0,
             has_kg_entities INTEGER DEFAULT 0,
             created_at TEXT DEFAULT (datetime('now')),
@@ -198,7 +192,6 @@ fn initialize_sync(database_path: &std::path::Path, embedding_dimensions: u32) -
 
         CREATE INDEX IF NOT EXISTS idx_haie_rev_reg_date ON haie_rev(reg_date);
         CREATE INDEX IF NOT EXISTS idx_haie_rev_category ON haie_rev(category);
-        CREATE INDEX IF NOT EXISTS idx_haie_rev_priority ON haie_rev(priority);
 
         CREATE TABLE IF NOT EXISTS prompt_versions (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -332,6 +325,13 @@ fn initialize_sync(database_path: &std::path::Path, embedding_dimensions: u32) -
         CREATE INDEX IF NOT EXISTS idx_kg_resolution_cache_candidate
             ON kg_resolution_cache(candidate_id);
 
+        CREATE TABLE IF NOT EXISTS kg_extraction_progress (
+            article_uid TEXT PRIMARY KEY,
+            chunks_total INTEGER NOT NULL,
+            completed_chunks_json TEXT NOT NULL DEFAULT '[]',
+            updated_at TEXT DEFAULT (datetime('now'))
+        );
+
         CREATE TABLE IF NOT EXISTS article_chunks (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             article_uid TEXT NOT NULL REFERENCES haie_rev(uid) ON DELETE CASCADE,
@@ -404,6 +404,8 @@ fn initialize_sync(database_path: &std::path::Path, embedding_dimensions: u32) -
     ensure_column(&conn, "haie_rev", "doi", "TEXT")?;
     ensure_column(&conn, "haie_rev", "full_text", "TEXT")?;
     ensure_column(&conn, "haie_rev", "content_type", "TEXT")?;
+    ensure_column(&conn, "haie_rev", "evaluated_at", "TEXT")?;
+    ensure_column(&conn, "haie_rev", "pdf_path", "TEXT")?;
     ensure_column(&conn, "haie_rev", "has_embeddings", "INTEGER DEFAULT 0")?;
     ensure_column(&conn, "haie_rev", "has_kg_entities", "INTEGER DEFAULT 0")?;
 
@@ -435,7 +437,20 @@ fn initialize_sync(database_path: &std::path::Path, embedding_dimensions: u32) -
 /// from a pre-versioning build — up to v1. Future *structural* changes that
 /// can't be expressed idempotently get their own ordered arm below and bump
 /// this constant.
-const CURRENT_SCHEMA_VERSION: i64 = 1;
+const CURRENT_SCHEMA_VERSION: i64 = 3;
+
+/// The article score columns removed in schema v2. Their values were only ever
+/// displayed and filtered on, never consumed by the pipeline.
+const LEGACY_SCORE_COLUMNS: [&str; 8] = [
+    "scholarly_rigor",
+    "novelty",
+    "relevance_score",
+    "practical_impact",
+    "interdisciplinary",
+    "critical_concerns",
+    "total_score",
+    "priority",
+];
 
 /// Advances `PRAGMA user_version` to [`CURRENT_SCHEMA_VERSION`], running any
 /// ordered migrations in between. v1 is the baseline established by the
@@ -447,6 +462,33 @@ fn apply_schema_migrations(conn: &Connection) -> Result<()> {
         match next {
             // Baseline: the schema is already in place from initialize_sync.
             1 => {}
+            // Scoring removal: back up the old per-article scores, mark rows
+            // that carried one as evaluated, then drop the score columns.
+            // No-op on databases created without them.
+            2 => {
+                if column_exists(conn, "haie_rev", "total_score")? {
+                    conn.execute_batch(
+                        "CREATE TABLE IF NOT EXISTS haie_rev_scores_backup AS
+                             SELECT uid, scholarly_rigor, novelty, relevance_score,
+                                    practical_impact, interdisciplinary, critical_concerns,
+                                    total_score, priority
+                             FROM haie_rev;",
+                    )?;
+                    conn.execute(
+                        "UPDATE haie_rev
+                         SET evaluated_at = COALESCE(updated_at, datetime('now'))
+                         WHERE evaluated_at IS NULL AND total_score IS NOT NULL",
+                        [],
+                    )?;
+                }
+                conn.execute_batch("DROP INDEX IF EXISTS idx_haie_rev_priority;")?;
+                for column in LEGACY_SCORE_COLUMNS {
+                    drop_column_if_exists(conn, "haie_rev", column)?;
+                }
+            }
+            // Relationship-type canonicalization: lowercase/trim every edge and
+            // flip passive-voice types, merging rows that collide.
+            3 => migrate_canonicalize_relationships(conn)?,
             other => anyhow::bail!("no migration defined for schema version {other}"),
         }
         version = next;
@@ -455,6 +497,109 @@ fn apply_schema_migrations(conn: &Connection) -> Result<()> {
     // ours, not user input.
     conn.execute_batch(&format!("PRAGMA user_version = {CURRENT_SCHEMA_VERSION};"))?;
     Ok(())
+}
+
+/// Rewrites every `kg_relationships` row through
+/// [`canonicalize_relationship`], merging rows that land on the same
+/// (source, target, type) key: weights add up, source-article lists union, and
+/// the longer description wins.
+fn migrate_canonicalize_relationships(conn: &Connection) -> Result<()> {
+    use crate::services::knowledge_graph::canonicalize_relationship;
+
+    type RelationshipPayload = (i64, Option<f64>, Option<String>, Option<String>);
+
+    if !table_exists(conn, "kg_relationships")? {
+        return Ok(());
+    }
+
+    let rows: Vec<(i64, i64, i64, String)> = {
+        let mut stmt = conn.prepare(
+            "SELECT id, source_entity_id, target_entity_id, relationship_type
+             FROM kg_relationships ORDER BY id ASC",
+        )?;
+        stmt.query_map([], |row| {
+            Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
+        })?
+        .collect::<std::result::Result<Vec<_>, _>>()?
+    };
+
+    for (id, source_id, target_id, relationship_type) in rows {
+        let (canonical_type, canonical_source, canonical_target) =
+            canonicalize_relationship(&relationship_type, source_id, target_id);
+        if canonical_type == relationship_type
+            && canonical_source == source_id
+            && canonical_target == target_id
+        {
+            continue;
+        }
+
+        let existing: Option<RelationshipPayload> = conn
+            .query_row(
+                "SELECT id, weight, source_articles_json, description
+                 FROM kg_relationships
+                 WHERE source_entity_id = ?1 AND target_entity_id = ?2
+                   AND relationship_type = ?3 AND id != ?4",
+                rusqlite::params![canonical_source, canonical_target, canonical_type, id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .optional()?;
+
+        if let Some((survivor_id, survivor_weight, survivor_articles, survivor_description)) =
+            existing
+        {
+            let (loser_weight, loser_articles, loser_description): (
+                Option<f64>,
+                Option<String>,
+                Option<String>,
+            ) = conn.query_row(
+                "SELECT weight, source_articles_json, description
+                 FROM kg_relationships WHERE id = ?1",
+                [id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )?;
+
+            let merged_weight = survivor_weight.unwrap_or(1.0) + loser_weight.unwrap_or(1.0);
+            let mut articles = parse_json_string_list(survivor_articles.as_deref());
+            for article in parse_json_string_list(loser_articles.as_deref()) {
+                if !articles.contains(&article) {
+                    articles.push(article);
+                }
+            }
+            let description = match (survivor_description, loser_description) {
+                (Some(a), Some(b)) => Some(if b.trim().len() > a.trim().len() { b } else { a }),
+                (a, b) => a.or(b),
+            };
+
+            conn.execute(
+                "UPDATE kg_relationships
+                 SET weight = ?2, source_articles_json = ?3, description = ?4,
+                     updated_at = datetime('now')
+                 WHERE id = ?1",
+                rusqlite::params![
+                    survivor_id,
+                    merged_weight,
+                    serde_json::to_string(&articles)?,
+                    description,
+                ],
+            )?;
+            conn.execute("DELETE FROM kg_relationships WHERE id = ?1", [id])?;
+        } else {
+            conn.execute(
+                "UPDATE kg_relationships
+                 SET source_entity_id = ?2, target_entity_id = ?3, relationship_type = ?4,
+                     updated_at = datetime('now')
+                 WHERE id = ?1",
+                rusqlite::params![id, canonical_source, canonical_target, canonical_type],
+            )?;
+        }
+    }
+
+    Ok(())
+}
+
+fn parse_json_string_list(raw: Option<&str>) -> Vec<String> {
+    raw.and_then(|value| serde_json::from_str::<Vec<String>>(value).ok())
+        .unwrap_or_default()
 }
 
 /// Seeds the default "Healthcare AI Ethics" workspace on first run and assigns
@@ -494,19 +639,28 @@ fn seed_default_workspace_and_backfill(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
-fn ensure_column(conn: &Connection, table: &str, column: &str, column_type: &str) -> Result<()> {
+fn column_exists(conn: &Connection, table: &str, column: &str) -> Result<bool> {
     let mut stmt = conn.prepare(&format!("PRAGMA table_info({table})"))?;
     let columns = stmt
         .query_map([], |row| row.get::<_, String>(1))?
         .collect::<std::result::Result<Vec<_>, _>>()?;
+    Ok(columns.iter().any(|existing| existing == column))
+}
 
-    if !columns.iter().any(|existing| existing == column) {
+fn ensure_column(conn: &Connection, table: &str, column: &str, column_type: &str) -> Result<()> {
+    if !column_exists(conn, table, column)? {
         conn.execute(
             &format!("ALTER TABLE {table} ADD COLUMN {column} {column_type}"),
             [],
         )?;
     }
+    Ok(())
+}
 
+fn drop_column_if_exists(conn: &Connection, table: &str, column: &str) -> Result<()> {
+    if column_exists(conn, table, column)? {
+        conn.execute(&format!("ALTER TABLE {table} DROP COLUMN {column}"), [])?;
+    }
     Ok(())
 }
 
@@ -621,4 +775,153 @@ fn create_synthesis_fts_table(conn: &Connection) -> Result<()> {
     )?;
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Simulates a v1 database that still carries score columns, then runs the
+    /// ordered migrations and checks the v2 scoring-removal arm end to end.
+    #[test]
+    fn migration_v2_backs_up_and_drops_score_columns() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "
+            CREATE TABLE haie_rev (
+                uid TEXT PRIMARY KEY,
+                title TEXT,
+                scholarly_rigor INTEGER,
+                novelty INTEGER,
+                relevance_score INTEGER,
+                practical_impact INTEGER,
+                interdisciplinary INTEGER,
+                critical_concerns INTEGER,
+                total_score INTEGER,
+                priority TEXT,
+                evaluated_at TEXT,
+                updated_at TEXT
+            );
+            CREATE INDEX idx_haie_rev_priority ON haie_rev(priority);
+            INSERT INTO haie_rev (uid, title, total_score, priority, updated_at)
+                VALUES ('scored', 'Scored article', 83, 'Tier1', '2026-01-01 00:00:00');
+            INSERT INTO haie_rev (uid, title) VALUES ('unscored', 'Unscored article');
+            PRAGMA user_version = 1;
+            ",
+        )
+        .unwrap();
+
+        apply_schema_migrations(&conn).unwrap();
+
+        let version: i64 = conn
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, CURRENT_SCHEMA_VERSION);
+
+        for column in LEGACY_SCORE_COLUMNS {
+            assert!(
+                !column_exists(&conn, "haie_rev", column).unwrap(),
+                "column {column} should be dropped"
+            );
+        }
+
+        let backup_score: Option<i64> = conn
+            .query_row(
+                "SELECT total_score FROM haie_rev_scores_backup WHERE uid = 'scored'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(backup_score, Some(83));
+
+        let evaluated_at: Option<String> = conn
+            .query_row(
+                "SELECT evaluated_at FROM haie_rev WHERE uid = 'scored'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(evaluated_at.as_deref(), Some("2026-01-01 00:00:00"));
+
+        let unscored_evaluated_at: Option<String> = conn
+            .query_row(
+                "SELECT evaluated_at FROM haie_rev WHERE uid = 'unscored'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(unscored_evaluated_at, None);
+    }
+
+    /// Two edges that express the same fact in active and passive voice must
+    /// merge into one canonical row with summed weight and unioned articles.
+    #[test]
+    fn migration_v3_merges_passive_voice_relationships() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "
+            CREATE TABLE kg_relationships (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                source_entity_id INTEGER NOT NULL,
+                target_entity_id INTEGER NOT NULL,
+                relationship_type TEXT NOT NULL,
+                description TEXT,
+                weight REAL,
+                source_articles_json TEXT,
+                evidence_summary TEXT,
+                updated_at TEXT,
+                UNIQUE(source_entity_id, target_entity_id, relationship_type)
+            );
+            INSERT INTO kg_relationships
+                (source_entity_id, target_entity_id, relationship_type, description, weight, source_articles_json)
+            VALUES
+                (1, 2, 'develops', 'short', 2.0, '[\"a:1\"]'),
+                (2, 1, 'Developed By', 'a longer description wins', 3.0, '[\"a:1\",\"b:2\"]'),
+                (3, 4, 'uses', NULL, 1.0, '[\"c:3\"]');
+            ",
+        )
+        .unwrap();
+
+        migrate_canonicalize_relationships(&conn).unwrap();
+
+        let count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM kg_relationships", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(count, 2);
+
+        let (weight, articles, description): (f64, String, String) = conn
+            .query_row(
+                "SELECT weight, source_articles_json, description FROM kg_relationships
+                 WHERE source_entity_id = 1 AND target_entity_id = 2
+                   AND relationship_type = 'develops'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(weight, 5.0);
+        assert_eq!(articles, "[\"a:1\",\"b:2\"]");
+        assert_eq!(description, "a longer description wins");
+    }
+
+    /// Fresh databases are created without score columns; the v2 arm must be a
+    /// no-op rather than failing on missing columns.
+    #[test]
+    fn migration_v2_is_noop_on_fresh_schema() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "
+            CREATE TABLE haie_rev (uid TEXT PRIMARY KEY, evaluated_at TEXT);
+            PRAGMA user_version = 1;
+            ",
+        )
+        .unwrap();
+
+        apply_schema_migrations(&conn).unwrap();
+
+        assert!(!table_exists(&conn, "haie_rev_scores_backup").unwrap());
+        let version: i64 = conn
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, CURRENT_SCHEMA_VERSION);
+    }
 }

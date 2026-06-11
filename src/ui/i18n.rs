@@ -263,17 +263,14 @@ pub fn t(language: UiLanguage, text: &'static str) -> &'static str {
         }
         "Drop embeddings and save" => "임베딩 삭제 후 저장",
 
-        "Top articles" => "상위 논문",
-        "No scored articles yet for this workspace." => {
-            "이 워크스페이스에는 아직 점수가 매겨진 논문이 없습니다."
+        "Recent articles" => "최근 논문",
+        "No articles yet for this workspace." => {
+            "이 워크스페이스에는 아직 논문이 없습니다."
         }
         "Filters" => "필터",
         "Category" => "분야",
         "Date from" => "시작일",
         "Date to" => "종료일",
-        "Min score" => "최소 점수",
-        "Max score" => "최대 점수",
-        "Tier" => "티어",
         "Reset" => "초기화",
         "Page size" => "페이지 크기",
 
@@ -304,8 +301,8 @@ pub fn t(language: UiLanguage, text: &'static str) -> &'static str {
         // Dashboard
         "Total articles" => "전체 논문",
         "This week" => "이번 주",
-        "Tier 1" => "1등급",
-        "Pending review" => "검토 대기",
+        "Evaluated" => "평가 완료",
+        "Pending evaluation" => "평가 대기",
         "Articles per day (last 30 days)" => "일별 논문 수(최근 30일)",
         "No articles yet. Open Input Set to describe your research, then run a gather to start building your wiki." => {
             "아직 논문이 없습니다. 입력 세트에서 연구를 설명한 뒤 수집을 실행하면 위키 구축이 시작됩니다."
@@ -341,7 +338,7 @@ pub fn t(language: UiLanguage, text: &'static str) -> &'static str {
         "Retry" => "다시 시도",
         "Saving…" => "저장 중…",
         "No articles yet" => "아직 논문이 없습니다",
-        "Run a gather to fetch and score articles for this research set." => {
+        "Run a gather to fetch and evaluate articles for this research set." => {
             "수집을 실행하면 이 연구 세트의 논문을 가져와 평가합니다."
         }
         "No matching articles" => "조건에 맞는 논문이 없습니다",
@@ -349,6 +346,11 @@ pub fn t(language: UiLanguage, text: &'static str) -> &'static str {
             "이 필터에 해당하는 논문이 없습니다. 조건을 넓히거나 초기화해 보세요."
         }
         "Open Gather" => "수집 탭 열기",
+        "Re-extract PDF" => "PDF 다시 추출",
+        "Extracting…" => "추출 중…",
+        "Runs text extraction again over the stored PDF and refreshes embeddings and the knowledge graph." => {
+            "저장된 PDF에서 텍스트 추출을 다시 실행하고 임베딩과 지식 그래프를 갱신합니다."
+        }
         "Open Input Set" => "입력 세트 열기",
         "No wiki articles yet" => "아직 위키 문서가 없습니다",
         "Populate the knowledge graph from the Gather tab, then compile \

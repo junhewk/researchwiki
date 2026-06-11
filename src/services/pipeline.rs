@@ -29,6 +29,7 @@ const RXIV_MAX_PAGES_PER_WINDOW: usize = 8;
 const MAX_WORKSPACE_SOURCE_QUERIES: usize = 8;
 const OPENALEX_SEARCH_URL: &str = "https://api.openalex.org/works";
 const CROSSREF_SEARCH_URL: &str = "https://api.crossref.org/works";
+const DOAJ_SEARCH_URL: &str = "https://doaj.org/api/search/articles";
 const UNPAYWALL_SEARCH_URL: &str = "https://api.unpaywall.org/v2/search";
 const SEMANTIC_SCHOLAR_SEARCH_URL: &str = "https://api.semanticscholar.org/graph/v1/paper/search";
 const CLINICAL_TRIALS_SEARCH_URL: &str = "https://clinicaltrials.gov/api/v2/studies";
@@ -96,6 +97,7 @@ pub const GATHER_SOURCE_IDS: &[&str] = &[
     "biorxiv",
     "openalex",
     "crossref",
+    "doaj",
     "semantic_scholar",
     "clinical_trials",
 ];
@@ -156,6 +158,15 @@ pub struct SaveCounters {
     pub errors: i32,
 }
 
+/// The fetched article payload to persist alongside metadata/evaluation:
+/// extracted full text, its content type, and the stored PDF location.
+#[derive(Debug, Default, Clone)]
+pub struct FetchedArticleContent {
+    pub full_text: Option<String>,
+    pub content_type: Option<String>,
+    pub pdf_path: Option<String>,
+}
+
 impl PipelineService {
     pub fn new(
         database_path: std::path::PathBuf,
@@ -198,6 +209,7 @@ impl PipelineService {
             "biorxiv" => self.list_rxiv("biorxiv", days_back, profile).await,
             "openalex" => self.list_openalex(days_back, profile).await,
             "crossref" => self.list_crossref(days_back, profile).await,
+            "doaj" => self.list_doaj(days_back, profile).await,
             "unpaywall" => self.list_unpaywall(days_back, profile).await,
             "semantic_scholar" => self.list_semantic_scholar(days_back, profile).await,
             "clinical_trials" => self.list_clinical_trials(days_back, profile).await,
@@ -222,14 +234,7 @@ impl PipelineService {
             let sql = format!(
                 "SELECT uid FROM haie_rev
                  WHERE uid IN ({placeholders})
-                   AND scholarly_rigor IS NOT NULL
-                   AND novelty IS NOT NULL
-                   AND relevance_score IS NOT NULL
-                   AND practical_impact IS NOT NULL
-                   AND interdisciplinary IS NOT NULL
-                   AND critical_concerns IS NOT NULL
-                   AND total_score IS NOT NULL
-                   AND priority IS NOT NULL"
+                   AND evaluated_at IS NOT NULL"
             );
             let params: Vec<rusqlite::types::Value> =
                 uids.into_iter().map(rusqlite::types::Value::Text).collect();
@@ -244,6 +249,75 @@ impl PipelineService {
         .context("duplicate check task failed")?
     }
 
+    /// Returns the uids of candidates whose DOI or normalized title already
+    /// matches an evaluated article in the workspace. Runs before fetch +
+    /// evaluation so cross-source duplicates don't cost a download and an LLM
+    /// call only to be skipped at save time.
+    pub async fn check_known_duplicates(
+        &self,
+        candidates: &[ArticleCandidate],
+        workspace_id: i64,
+    ) -> Result<std::collections::HashSet<String>> {
+        if candidates.is_empty() {
+            return Ok(std::collections::HashSet::new());
+        }
+        let database_path = self.database_path.clone();
+        let keys: Vec<(String, Option<String>, String)> = candidates
+            .iter()
+            .map(|candidate| {
+                (
+                    candidate.uid(),
+                    candidate
+                        .doi
+                        .as_deref()
+                        .map(normalized_duplicate_doi)
+                        .filter(|value| !value.is_empty()),
+                    normalized_duplicate_title(&candidate.title),
+                )
+            })
+            .collect();
+
+        task::spawn_blocking(move || {
+            let conn = crate::db::open_connection(&*database_path)?;
+            let mut stmt = conn.prepare(
+                "SELECT doi, title FROM haie_rev
+                 WHERE workspace_id = ?1 AND evaluated_at IS NOT NULL",
+            )?;
+            let mut known_dois = std::collections::HashSet::new();
+            let mut known_titles = std::collections::HashSet::new();
+            let rows = stmt.query_map([workspace_id], |row| {
+                Ok((
+                    row.get::<_, Option<String>>(0)?,
+                    row.get::<_, Option<String>>(1)?,
+                ))
+            })?;
+            for row in rows {
+                let (doi, title) = row?;
+                if let Some(doi) = doi.as_deref().map(normalized_duplicate_doi)
+                    && !doi.is_empty()
+                {
+                    known_dois.insert(doi);
+                }
+                if let Some(title) = title.as_deref().map(normalized_duplicate_title)
+                    && !title.is_empty()
+                {
+                    known_titles.insert(title);
+                }
+            }
+
+            Ok(keys
+                .into_iter()
+                .filter(|(_, doi, title)| {
+                    doi.as_deref().is_some_and(|doi| known_dois.contains(doi))
+                        || (!title.is_empty() && known_titles.contains(title))
+                })
+                .map(|(uid, _, _)| uid)
+                .collect())
+        })
+        .await
+        .context("known-duplicate check task failed")?
+    }
+
     pub async fn save_candidates(
         &self,
         candidates: Vec<ArticleCandidate>,
@@ -256,24 +330,33 @@ impl PipelineService {
             .context("candidate save task failed")?
     }
 
-    pub async fn save_evaluated_candidate(
+    /// Saves a candidate together with whatever the fetch produced — full text,
+    /// content type, stored-PDF path — and the evaluation when one succeeded.
+    pub async fn save_processed_candidate(
         &self,
         candidate: &ArticleCandidate,
-        evaluation: &serde_json::Map<String, serde_json::Value>,
+        evaluation: Option<&serde_json::Map<String, serde_json::Value>>,
+        fetched: Option<FetchedArticleContent>,
         workspace_id: i64,
     ) -> Result<SaveCounters> {
         let database_path = self.database_path.clone();
         let candidate = candidate.clone();
-        let evaluation = evaluation.clone();
+        let evaluation = evaluation.cloned();
 
         task::spawn_blocking(move || {
             let conn = crate::db::open_connection(&*database_path).with_context(|| {
                 format!("failed to open database at {}", database_path.display())
             })?;
-            save_article_sync(&conn, &candidate, Some(&evaluation), workspace_id)
+            save_article_sync(
+                &conn,
+                &candidate,
+                evaluation.as_ref(),
+                fetched.as_ref(),
+                workspace_id,
+            )
         })
         .await
-        .context("evaluated candidate save task failed")?
+        .context("processed candidate save task failed")?
     }
 
     async fn list_arxiv(
@@ -990,6 +1073,51 @@ impl PipelineService {
         }
 
         finish_merged_source("Crossref", merged, errors)
+    }
+
+    async fn list_doaj(
+        &self,
+        days_back: i32,
+        profile: &WorkspaceResearchContext,
+    ) -> Result<Vec<ArticleCandidate>> {
+        let (start, today) = date_window(days_back);
+
+        let mut merged = BTreeMap::<String, ArticleCandidate>::new();
+        let mut errors = Vec::new();
+        let queries = free_text_queries(profile, SCHOLARLY_FREE_TEXT_QUERIES);
+        for (index, query) in queries.iter().enumerate() {
+            pause_between_source_queries(index).await;
+            match self.fetch_doaj_query(query).await {
+                Ok(candidates) => merge_candidates(&mut merged, candidates),
+                Err(error) => {
+                    tracing::warn!("DOAJ query '{query}' failed: {error}");
+                    errors.push(error);
+                }
+            }
+        }
+
+        let candidates = finish_merged_source("DOAJ", merged, errors)?;
+        // DOAJ has no publication-date filter parameter, so the window is
+        // applied client-side.
+        Ok(filter_candidates_by_known_date(candidates, start, today))
+    }
+
+    async fn fetch_doaj_query(&self, query: &str) -> Result<Vec<ArticleCandidate>> {
+        let url = format!("{DOAJ_SEARCH_URL}/{}", urlencoding::encode(query));
+        let params = vec![
+            ("pageSize", DEFAULT_SOURCE_QUERY_LIMIT.clamp(1, 100).to_string()),
+            ("sort", "created_date:desc".to_string()),
+        ];
+        let body = self
+            .get_json_with_retries(&url, &params, "DOAJ", Some(self.polite_ua.as_str()))
+            .await?;
+        let results = body
+            .get("results")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+
+        Ok(results.iter().filter_map(doaj_candidate).collect())
     }
 
     async fn fetch_crossref_query(
@@ -1744,12 +1872,59 @@ async fn pause_between_source_queries(index: usize) {
     }
 }
 
+/// Roughly how complete a candidate's metadata is; abstracts weigh double
+/// because they feed screening and evaluation directly.
+fn candidate_richness(candidate: &ArticleCandidate) -> u32 {
+    let has = |value: &Option<String>| value.as_deref().is_some_and(|v| !v.trim().is_empty());
+    let mut score = 0;
+    if has(&candidate.doi) {
+        score += 1;
+    }
+    if has(&candidate.summary) {
+        score += 2;
+    }
+    if has(&candidate.pub_date) {
+        score += 1;
+    }
+    if has(&candidate.authors) {
+        score += 1;
+    }
+    score
+}
+
+fn fill_missing_candidate_fields(target: &mut ArticleCandidate, other: ArticleCandidate) {
+    fn fill(slot: &mut Option<String>, value: Option<String>) {
+        if slot.as_deref().is_none_or(|v| v.trim().is_empty())
+            && let Some(value) = value.filter(|v| !v.trim().is_empty())
+        {
+            *slot = Some(value);
+        }
+    }
+    fill(&mut target.doi, other.doi);
+    fill(&mut target.summary, other.summary);
+    fill(&mut target.pub_date, other.pub_date);
+    fill(&mut target.journal, other.journal);
+    fill(&mut target.authors, other.authors);
+}
+
 fn merge_candidates(
     merged: &mut BTreeMap<String, ArticleCandidate>,
     candidates: Vec<ArticleCandidate>,
 ) {
     for candidate in candidates {
-        merged.entry(candidate.uid()).or_insert(candidate);
+        match merged.entry(candidate.uid()) {
+            std::collections::btree_map::Entry::Vacant(entry) => {
+                entry.insert(candidate);
+            }
+            std::collections::btree_map::Entry::Occupied(mut entry) => {
+                if candidate_richness(&candidate) > candidate_richness(entry.get()) {
+                    let previous = std::mem::replace(entry.get_mut(), candidate);
+                    fill_missing_candidate_fields(entry.get_mut(), previous);
+                } else {
+                    fill_missing_candidate_fields(entry.get_mut(), candidate);
+                }
+            }
+        }
     }
 }
 
@@ -1797,6 +1972,7 @@ pub fn source_label(source: &str) -> Option<&'static str> {
         "biorxiv" => Some("bioRxiv"),
         "openalex" => Some("OpenAlex"),
         "crossref" => Some("Crossref"),
+        "doaj" => Some("DOAJ"),
         "unpaywall" => Some("Unpaywall"),
         "semantic_scholar" => Some("Semantic Scholar"),
         "clinical_trials" => Some("ClinicalTrials.gov"),
@@ -1985,7 +2161,7 @@ fn openalex_candidate(work: &Value) -> Result<ArticleCandidate> {
     let doi = work
         .get("doi")
         .and_then(Value::as_str)
-        .map(strip_doi_url)
+        .map(normalize_doi)
         .filter(|value| !value.is_empty());
     let url = work
         .get("primary_location")
@@ -2026,7 +2202,7 @@ fn crossref_candidate(work: &Value) -> Option<ArticleCandidate> {
     let doi = work
         .get("DOI")
         .and_then(Value::as_str)
-        .map(strip_doi_url)
+        .map(normalize_doi)
         .filter(|value| !value.is_empty())?;
     let title = first_string(work.get("title"))?;
     let authors = crossref_authors(work.get("author"));
@@ -2057,12 +2233,111 @@ fn crossref_candidate(work: &Value) -> Option<ArticleCandidate> {
     })
 }
 
+fn doaj_candidate(entry: &Value) -> Option<ArticleCandidate> {
+    let source_id = entry
+        .get("id")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())?
+        .to_string();
+    let bibjson = entry.get("bibjson")?;
+    let title = bibjson
+        .get("title")
+        .and_then(Value::as_str)
+        .map(clean_text)
+        .filter(|value| !value.is_empty())?;
+
+    let authors = bibjson
+        .get("author")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|author| author.get("name").and_then(Value::as_str))
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned)
+        .collect::<Vec<_>>();
+    let doi = bibjson
+        .get("identifier")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .find(|identifier| {
+            identifier
+                .get("type")
+                .and_then(Value::as_str)
+                .is_some_and(|kind| kind.eq_ignore_ascii_case("doi"))
+        })
+        .and_then(|identifier| identifier.get("id"))
+        .and_then(Value::as_str)
+        .map(normalize_doi)
+        .filter(|value| !value.is_empty());
+    let url = bibjson
+        .get("link")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .find(|link| {
+            link.get("type")
+                .and_then(Value::as_str)
+                .is_some_and(|kind| kind.eq_ignore_ascii_case("fulltext"))
+        })
+        .and_then(|link| link.get("url"))
+        .and_then(Value::as_str)
+        .map(ToOwned::to_owned)
+        .unwrap_or_else(|| format!("https://doaj.org/article/{source_id}"));
+    let pub_date = bibjson
+        .get("year")
+        .and_then(json_value_as_i64)
+        .map(|year| {
+            let month = bibjson
+                .get("month")
+                .and_then(json_value_as_i64)
+                .filter(|month| (1..=12).contains(month))
+                .unwrap_or(1);
+            format!("{year:04}-{month:02}-01")
+        });
+
+    Some(ArticleCandidate {
+        source: "doaj".to_string(),
+        source_id,
+        title,
+        summary: bibjson
+            .get("abstract")
+            .and_then(Value::as_str)
+            .map(clean_text)
+            .filter(|value| !value.is_empty()),
+        first_author: authors
+            .first()
+            .cloned()
+            .unwrap_or_else(|| "Unknown".to_string()),
+        authors: (!authors.is_empty()).then(|| authors.join(", ")),
+        pub_date,
+        journal: bibjson
+            .get("journal")
+            .and_then(|journal| journal.get("title"))
+            .and_then(Value::as_str)
+            .map(clean_text)
+            .filter(|value| !value.is_empty()),
+        doi,
+        url,
+    })
+}
+
+/// DOAJ serializes year/month as strings ("2026") in some records and numbers
+/// in others.
+fn json_value_as_i64(value: &Value) -> Option<i64> {
+    value
+        .as_i64()
+        .or_else(|| value.as_str().and_then(|text| text.trim().parse().ok()))
+}
+
 fn unpaywall_candidate(result: &Value) -> Option<ArticleCandidate> {
     let item = result.get("response").unwrap_or(result);
     let doi = item
         .get("doi")
         .and_then(Value::as_str)
-        .map(strip_doi_url)
+        .map(normalize_doi)
         .filter(|value| !value.is_empty())?;
     let title = item
         .get("title")
@@ -2122,7 +2397,7 @@ fn semantic_scholar_candidate(paper: &Value) -> Option<ArticleCandidate> {
         .get("externalIds")
         .and_then(|value| value.get("DOI"))
         .and_then(Value::as_str)
-        .map(strip_doi_url)
+        .map(normalize_doi)
         .filter(|value| !value.is_empty());
 
     Some(ArticleCandidate {
@@ -2289,13 +2564,26 @@ fn strip_openalex_id(url: &str) -> &str {
     url.rsplit('/').next().unwrap_or(url).trim()
 }
 
-fn strip_doi_url(doi: &str) -> String {
-    doi.trim()
-        .trim_start_matches("https://doi.org/")
-        .trim_start_matches("http://doi.org/")
-        .trim_start_matches("doi:")
-        .trim()
-        .to_string()
+/// Canonicalizes a DOI for storage and duplicate matching: DOIs are
+/// case-insensitive and arrive wrapped in several URL/prefix forms.
+pub(crate) fn normalize_doi(raw: &str) -> String {
+    let mut doi = raw.trim().to_ascii_lowercase();
+    loop {
+        let stripped = doi
+            .trim_start_matches("https://")
+            .trim_start_matches("http://")
+            .trim_start_matches("dx.doi.org/")
+            .trim_start_matches("www.doi.org/")
+            .trim_start_matches("doi.org/")
+            .trim_start_matches("doi:")
+            .trim()
+            .to_string();
+        if stripped == doi {
+            break;
+        }
+        doi = stripped;
+    }
+    doi.trim_end_matches(['.', ',']).trim().to_string()
 }
 
 fn reconstruct_inverted_abstract(index: &serde_json::Map<String, Value>) -> String {
@@ -2374,7 +2662,7 @@ fn save_candidates_sync(
     let tx = conn.transaction()?;
 
     for candidate in &candidates {
-        let result = save_article_sync(&tx, candidate, None, workspace_id)?;
+        let result = save_article_sync(&tx, candidate, None, None, workspace_id)?;
         counters.saved += result.saved;
         counters.skipped += result.skipped;
         counters.errors += result.errors;
@@ -2389,11 +2677,27 @@ fn save_article_sync(
     conn: &Connection,
     candidate: &ArticleCandidate,
     evaluation: Option<&serde_json::Map<String, serde_json::Value>>,
+    fetched: Option<&FetchedArticleContent>,
     workspace_id: i64,
 ) -> Result<SaveCounters> {
     let mut counters = SaveCounters::default();
     let reg_date = Utc::now().date_naive().format("%Y-%m-%d").to_string();
     let category = category_for_source(&candidate.source);
+
+    let fetched_text = fetched
+        .and_then(|content| content.full_text.as_deref())
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    let full_text = fetched_text
+        .map(str::to_string)
+        .or_else(|| candidate.summary.clone());
+    // "pdf_stored" survives even with abstract-only text: it marks the row as
+    // having a stored PDF that still awaits extraction.
+    let content_type = fetched
+        .and_then(|content| content.content_type.clone())
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| "abstract_only".to_string());
+    let pdf_path = fetched.and_then(|content| content.pdf_path.clone());
 
     let get_str = |key: &str| -> Option<String> {
         evaluation
@@ -2402,21 +2706,55 @@ fn save_article_sync(
             .filter(|s| !s.is_empty())
             .map(str::to_string)
     };
-    let get_int = |key: &str| -> Option<i64> {
-        evaluation
-            .and_then(|eval| eval.get(key))
-            .and_then(|v| v.as_i64().or_else(|| v.as_f64().map(|f| f as i64)))
-    };
-
     let title = get_str("title").unwrap_or_else(|| candidate.title.clone());
     let first_author = get_str("first_author").unwrap_or_else(|| candidate.first_author.clone());
     let pub_date = candidate.pub_date.clone().or_else(|| get_str("pub_date"));
     let journal = candidate.journal.clone().or_else(|| get_str("journal"));
     let candidate_uid = candidate.uid();
 
-    if find_duplicate_article_uid(conn, candidate, &title, workspace_id, &candidate_uid)?.is_some()
+    if let Some(existing_uid) =
+        find_duplicate_article_uid(conn, candidate, &title, workspace_id, &candidate_uid)?
     {
-        counters.skipped += 1;
+        // A fresh evaluation for an article we already hold (under another
+        // source uid) is worth keeping: enrich the existing row instead of
+        // discarding the LLM output.
+        if evaluation.is_some() {
+            counters.saved += update_existing_article_sync(
+                conn,
+                &existing_uid,
+                candidate,
+                category,
+                &title,
+                &first_author,
+                candidate.authors.as_deref(),
+                pub_date.as_deref(),
+                journal.as_deref(),
+                candidate.doi.as_deref(),
+                get_str("ai_tech").as_deref(),
+                get_str("clinical_domain").as_deref(),
+                get_str("ethics_framework").as_deref(),
+                get_str("primary_issue").as_deref(),
+                get_str("key_stakeholders").as_deref(),
+                get_str("practical_impl").as_deref(),
+                get_str("secondary_issues").as_deref(),
+                get_str("key_argument").as_deref(),
+                get_str("main_findings").as_deref(),
+                get_str("normative_claims").as_deref(),
+                get_str("limitations").as_deref(),
+                get_str("theoretical_strengths").as_deref(),
+                get_str("theoretical_weaknesses").as_deref(),
+                get_str("empirical_strengths").as_deref(),
+                get_str("empirical_weaknesses").as_deref(),
+                get_str("byline_summary").as_deref(),
+                get_str("why_it_matters").as_deref(),
+                full_text.as_deref(),
+                Some(content_type.as_str()),
+                pdf_path.as_deref(),
+                true,
+            )? as i32;
+        } else {
+            counters.skipped += 1;
+        }
         return Ok(counters);
     }
 
@@ -2443,17 +2781,14 @@ fn save_article_sync(
             limitations, theoretical_strengths, theoretical_weaknesses,
             empirical_strengths, empirical_weaknesses,
             byline_summary, why_it_matters,
-            scholarly_rigor, novelty, relevance_score, practical_impact,
-            interdisciplinary, critical_concerns, total_score, priority,
-            full_text, content_type, workspace_id
+            full_text, content_type, pdf_path, evaluated_at, workspace_id
          ) VALUES (
             ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10,
             ?11, ?12, ?13, ?14, ?15,
             ?16, ?17, ?18, ?19, ?20,
             ?21, ?22, ?23, ?24, ?25,
             ?26, ?27,
-            ?28, ?29, ?30, ?31, ?32, ?33, ?34, ?35,
-            ?36, ?37, ?38
+            ?28, ?29, ?30, ?31, ?32
         )",
         params![
             candidate_uid,
@@ -2483,16 +2818,12 @@ fn save_article_sync(
             get_str("empirical_weaknesses"),
             byline_summary.clone(),
             why_it_matters.clone(),
-            get_int("scholarly_rigor"),
-            get_int("novelty"),
-            get_int("relevance_score"),
-            get_int("practical_impact"),
-            get_int("interdisciplinary"),
-            get_int("critical_concerns"),
-            get_int("total_score"),
-            get_str("priority"),
-            candidate.summary,
-            Some("abstract_only".to_string()),
+            full_text.clone(),
+            content_type.clone(),
+            pdf_path.clone(),
+            evaluation
+                .is_some()
+                .then(|| Utc::now().format("%Y-%m-%d %H:%M:%S").to_string()),
             workspace_id,
         ],
     );
@@ -2501,6 +2832,7 @@ fn save_article_sync(
         Ok(0) if evaluation.is_some() => {
             counters.saved += update_existing_article_sync(
                 conn,
+                &candidate_uid,
                 candidate,
                 category,
                 &title,
@@ -2526,15 +2858,10 @@ fn save_article_sync(
                 get_str("empirical_weaknesses").as_deref(),
                 byline_summary.as_deref(),
                 why_it_matters.as_deref(),
-                get_int("scholarly_rigor"),
-                get_int("novelty"),
-                get_int("relevance_score"),
-                get_int("practical_impact"),
-                get_int("interdisciplinary"),
-                get_int("critical_concerns"),
-                get_int("total_score"),
-                get_str("priority").as_deref(),
-                candidate.summary.as_deref(),
+                full_text.as_deref(),
+                Some(content_type.as_str()),
+                pdf_path.as_deref(),
+                true,
             )? as i32;
         }
         Ok(0) => counters.skipped += 1,
@@ -2602,10 +2929,10 @@ fn find_duplicate_article_uid(
 }
 
 fn normalized_duplicate_doi(doi: &str) -> String {
-    strip_doi_url(doi).to_ascii_lowercase()
+    normalize_doi(doi)
 }
 
-fn normalized_duplicate_title(title: &str) -> String {
+pub(crate) fn normalized_duplicate_title(title: &str) -> String {
     normalized_search_text(title)
         .split_whitespace()
         .filter(|token| *token != "preprint")
@@ -2616,6 +2943,7 @@ fn normalized_duplicate_title(title: &str) -> String {
 #[allow(clippy::too_many_arguments)]
 fn update_existing_article_sync(
     conn: &Connection,
+    target_uid: &str,
     candidate: &ArticleCandidate,
     category: &str,
     title: &str,
@@ -2641,15 +2969,10 @@ fn update_existing_article_sync(
     empirical_weaknesses: Option<&str>,
     byline_summary: Option<&str>,
     why_it_matters: Option<&str>,
-    scholarly_rigor: Option<i64>,
-    novelty: Option<i64>,
-    relevance_score: Option<i64>,
-    practical_impact: Option<i64>,
-    interdisciplinary: Option<i64>,
-    critical_concerns: Option<i64>,
-    total_score: Option<i64>,
-    priority: Option<&str>,
     full_text: Option<&str>,
+    content_type: Option<&str>,
+    pdf_path: Option<&str>,
+    mark_evaluated: bool,
 ) -> Result<usize> {
     conn.execute(
         "UPDATE haie_rev
@@ -2678,20 +3001,24 @@ fn update_existing_article_sync(
              empirical_weaknesses = COALESCE(?24, empirical_weaknesses),
              byline_summary = COALESCE(?25, byline_summary),
              why_it_matters = COALESCE(?26, why_it_matters),
-             scholarly_rigor = COALESCE(?27, scholarly_rigor),
-             novelty = COALESCE(?28, novelty),
-             relevance_score = COALESCE(?29, relevance_score),
-             practical_impact = COALESCE(?30, practical_impact),
-             interdisciplinary = COALESCE(?31, interdisciplinary),
-             critical_concerns = COALESCE(?32, critical_concerns),
-             total_score = COALESCE(?33, total_score),
-             priority = COALESCE(?34, priority),
-             full_text = COALESCE(?35, full_text),
-             content_type = CASE WHEN ?35 IS NULL THEN content_type ELSE 'abstract_only' END,
+             full_text = CASE
+                 WHEN ?27 IS NULL THEN full_text
+                 WHEN COALESCE(?28, 'abstract_only') != 'abstract_only' THEN ?27
+                 WHEN full_text IS NULL OR TRIM(full_text) = '' THEN ?27
+                 ELSE full_text
+             END,
+             content_type = CASE
+                 WHEN ?27 IS NULL THEN content_type
+                 WHEN COALESCE(?28, 'abstract_only') != 'abstract_only' THEN ?28
+                 WHEN full_text IS NULL OR TRIM(full_text) = '' THEN COALESCE(?28, 'abstract_only')
+                 ELSE content_type
+             END,
+             pdf_path = COALESCE(?29, pdf_path),
+             evaluated_at = CASE WHEN ?30 = 1 THEN datetime('now') ELSE evaluated_at END,
              updated_at = datetime('now')
          WHERE uid = ?1",
         params![
-            candidate.uid(),
+            target_uid,
             Some(candidate.url.as_str()),
             Some(category),
             Some(title),
@@ -2717,15 +3044,10 @@ fn update_existing_article_sync(
             empirical_weaknesses,
             byline_summary,
             why_it_matters,
-            scholarly_rigor,
-            novelty,
-            relevance_score,
-            practical_impact,
-            interdisciplinary,
-            critical_concerns,
-            total_score,
-            priority,
             full_text,
+            content_type,
+            pdf_path,
+            mark_evaluated,
         ],
     )
     .map_err(anyhow::Error::from)
@@ -3442,6 +3764,113 @@ mod tests {
     }
 
     #[test]
+    fn normalize_doi_strips_all_prefix_forms() {
+        for raw in [
+            "10.1000/Test.Case",
+            "https://doi.org/10.1000/test.case",
+            "http://dx.doi.org/10.1000/test.case",
+            "doi:10.1000/test.case",
+            "doi:https://doi.org/10.1000/test.case",
+            "doi.org/10.1000/test.case",
+            "  10.1000/test.case. ",
+        ] {
+            assert_eq!(normalize_doi(raw), "10.1000/test.case", "raw: {raw}");
+        }
+        assert_eq!(normalize_doi(""), "");
+    }
+
+    #[test]
+    fn merge_candidates_prefers_richer_duplicates_and_fills_gaps() {
+        let mut sparse = test_candidate("same-id");
+        sparse.journal = Some("Sparse Journal".to_string());
+
+        let mut rich = test_candidate("same-id");
+        rich.doi = Some("10.1000/rich".to_string());
+        rich.summary = Some("An abstract".to_string());
+        rich.pub_date = Some("2026-05-01".to_string());
+
+        let mut merged = BTreeMap::new();
+        merge_candidates(&mut merged, vec![sparse]);
+        merge_candidates(&mut merged, vec![rich]);
+
+        assert_eq!(merged.len(), 1);
+        let winner = merged.values().next().unwrap();
+        assert_eq!(winner.doi.as_deref(), Some("10.1000/rich"));
+        assert_eq!(winner.summary.as_deref(), Some("An abstract"));
+        // The loser's journal backfills the richer candidate's missing field.
+        assert_eq!(winner.journal.as_deref(), Some("Sparse Journal"));
+    }
+
+    #[test]
+    fn maps_doaj_article_metadata() {
+        let entry = json!({
+            "id": "abcdef123456",
+            "bibjson": {
+                "title": "Open access AI ethics in primary care",
+                "abstract": "A study of governance.",
+                "author": [{ "name": "Grace Hopper" }, { "name": "Alan Turing" }],
+                "journal": { "title": "Open Medicine" },
+                "identifier": [
+                    { "type": "eissn", "id": "1234-5678" },
+                    { "type": "DOI", "id": "https://doi.org/10.1000/DOAJ.Case" }
+                ],
+                "link": [{ "type": "fulltext", "url": "https://example.com/article" }],
+                "year": "2026",
+                "month": "5"
+            }
+        });
+
+        let candidate = doaj_candidate(&entry).expect("candidate");
+        assert_eq!(candidate.uid(), "doaj:abcdef123456");
+        assert_eq!(candidate.title, "Open access AI ethics in primary care");
+        assert_eq!(candidate.summary.as_deref(), Some("A study of governance"));
+        assert_eq!(candidate.first_author, "Grace Hopper");
+        assert_eq!(candidate.doi.as_deref(), Some("10.1000/doaj.case"));
+        assert_eq!(candidate.url, "https://example.com/article");
+        assert_eq!(candidate.pub_date.as_deref(), Some("2026-05-01"));
+        assert_eq!(candidate.journal.as_deref(), Some("Open Medicine"));
+    }
+
+    #[test]
+    fn evaluated_duplicate_enriches_existing_row_instead_of_skipping() {
+        let conn = Connection::open_in_memory().unwrap();
+        create_save_test_table(&conn);
+
+        let mut first = test_candidate("openalex");
+        first.source = "openalex".to_string();
+        first.doi = Some("10.1000/diabetes.chat".to_string());
+        first.title = "Blinded Multi-Rater Comparative Evaluation".to_string();
+        assert_eq!(save_article_sync(&conn, &first, None, None, 1).unwrap().saved, 1);
+
+        let mut same_doi = test_candidate("semantic");
+        same_doi.source = "semantic_scholar".to_string();
+        same_doi.doi = Some("https://doi.org/10.1000/diabetes.chat".to_string());
+        same_doi.title = "Different source title".to_string();
+        let evaluation = serde_json::Map::from_iter([
+            ("byline_summary".to_string(), json!("Summary")),
+            ("why_it_matters".to_string(), json!("Why it matters")),
+        ]);
+        let result = save_article_sync(&conn, &same_doi, Some(&evaluation), None, 1).unwrap();
+        assert_eq!(result.saved, 1);
+        assert_eq!(result.skipped, 0);
+
+        let count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM haie_rev", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(count, 1, "no second row is created");
+
+        let (byline, evaluated_at): (Option<String>, Option<String>) = conn
+            .query_row(
+                "SELECT byline_summary, evaluated_at FROM haie_rev WHERE uid = ?1",
+                [first.uid()],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(byline.as_deref(), Some("Summary"));
+        assert!(evaluated_at.is_some());
+    }
+
+    #[test]
     fn preprint_query_matching_is_token_based() {
         assert!(text_matches_query(
             "Bias concerns in a clinical machine learning model",
@@ -3719,35 +4148,28 @@ mod tests {
         let mut candidate = test_candidate("dup");
         candidate.summary = Some("Abstract text".to_string());
 
-        let metadata_save = save_article_sync(&conn, &candidate, None, 1).unwrap();
+        let metadata_save = save_article_sync(&conn, &candidate, None, None, 1).unwrap();
         assert_eq!(metadata_save.saved, 1);
 
         let evaluation = serde_json::Map::from_iter([
             ("byline_summary".to_string(), json!("Summary")),
             ("why_it_matters".to_string(), json!("Why it matters")),
-            ("scholarly_rigor".to_string(), json!(5)),
-            ("novelty".to_string(), json!(4)),
-            ("relevance_score".to_string(), json!(5)),
-            ("practical_impact".to_string(), json!(4)),
-            ("interdisciplinary".to_string(), json!(3)),
-            ("critical_concerns".to_string(), json!(-1)),
-            ("total_score".to_string(), json!(83)),
-            ("priority".to_string(), json!("Tier1")),
         ]);
 
-        let evaluated_save = save_article_sync(&conn, &candidate, Some(&evaluation), 1).unwrap();
+        let evaluated_save = save_article_sync(&conn, &candidate, Some(&evaluation), None, 1).unwrap();
         assert_eq!(evaluated_save.saved, 1);
         assert_eq!(evaluated_save.skipped, 0);
 
-        let scores: (Option<i64>, Option<i64>, Option<String>) = conn
+        let (byline, evaluated_at): (Option<String>, Option<String>) = conn
             .query_row(
-                "SELECT scholarly_rigor, total_score, priority FROM haie_rev WHERE uid = ?1",
+                "SELECT byline_summary, evaluated_at FROM haie_rev WHERE uid = ?1",
                 [candidate.uid()],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                |row| Ok((row.get(0)?, row.get(1)?)),
             )
             .unwrap();
 
-        assert_eq!(scores, (Some(5), Some(83), Some("Tier1".to_string())));
+        assert_eq!(byline.as_deref(), Some("Summary"));
+        assert!(evaluated_at.is_some(), "evaluated save sets evaluated_at");
     }
 
     #[test]
@@ -3759,20 +4181,20 @@ mod tests {
         first.source = "openalex".to_string();
         first.doi = Some("10.1000/diabetes.chat".to_string());
         first.title = "Blinded Multi-Rater Comparative Evaluation".to_string();
-        assert_eq!(save_article_sync(&conn, &first, None, 1).unwrap().saved, 1);
+        assert_eq!(save_article_sync(&conn, &first, None, None, 1).unwrap().saved, 1);
 
         let mut same_doi = test_candidate("semantic");
         same_doi.source = "semantic_scholar".to_string();
         same_doi.doi = Some("https://doi.org/10.1000/diabetes.chat".to_string());
         same_doi.title = "Different source title".to_string();
-        let doi_result = save_article_sync(&conn, &same_doi, None, 1).unwrap();
+        let doi_result = save_article_sync(&conn, &same_doi, None, None, 1).unwrap();
         assert_eq!(doi_result.saved, 0);
         assert_eq!(doi_result.skipped, 1);
 
         let mut same_title = test_candidate("preprint");
         same_title.source = "openalex".to_string();
         same_title.title = "Blinded Multi-Rater Comparative Evaluation (Preprint)".to_string();
-        let title_result = save_article_sync(&conn, &same_title, None, 1).unwrap();
+        let title_result = save_article_sync(&conn, &same_title, None, None, 1).unwrap();
         assert_eq!(title_result.saved, 0);
         assert_eq!(title_result.skipped, 1);
 
@@ -3813,16 +4235,10 @@ mod tests {
                 theoretical_weaknesses TEXT,
                 empirical_strengths TEXT,
                 empirical_weaknesses TEXT,
-                scholarly_rigor INTEGER,
-                novelty INTEGER,
-                relevance_score INTEGER,
-                practical_impact INTEGER,
-                interdisciplinary INTEGER,
-                critical_concerns INTEGER,
-                total_score INTEGER,
-                priority TEXT,
                 full_text TEXT,
                 content_type TEXT,
+                evaluated_at TEXT,
+                pdf_path TEXT,
                 workspace_id INTEGER,
                 updated_at TEXT
             );

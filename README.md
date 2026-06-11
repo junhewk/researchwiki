@@ -10,11 +10,15 @@ embedding endpoint — hosted (OpenAI, etc.) or local (Ollama, LM Studio, llama.
 
 ## What it does
 
-- **Gather** recent articles from 10 open sources for your topic — arXiv, PubMed, PMC,
-  Europe PMC, medRxiv, bioRxiv, OpenAlex, Crossref, Semantic Scholar, and
-  ClinicalTrials.gov. (Unpaywall is used to resolve open‑access PDFs.)
+- **Gather** recent articles from 11 open sources for your topic — arXiv, PubMed, PMC,
+  Europe PMC, medRxiv, bioRxiv, OpenAlex, Crossref, DOAJ, Semantic Scholar, and
+  ClinicalTrials.gov. (Unpaywall is used to resolve open‑access PDFs.) Duplicates of the
+  same paper across sources are detected by DOI/title and processed only once.
 - **Screen, fetch, and evaluate** each candidate with your LLM, then embed it for
-  semantic + keyword (hybrid) search.
+  semantic + keyword (hybrid) search. Open‑access PDFs are downloaded through a
+  fall‑through chain (arXiv, Unpaywall, publisher patterns, DOI content negotiation,
+  `citation_pdf_url`), kept on disk, and their extracted full text — not just the
+  abstract — feeds evaluation, embeddings, and the knowledge graph.
 - **Build a knowledge graph** of entities and relationships across the saved articles,
   and compile a **wiki** of synthesized entity articles.
 - **Gap Bridge** turns your broad question + the graph's under‑connected areas into a
@@ -44,7 +48,7 @@ key in the setup wizard.
 
 Pre-built desktop artifacts are attached to tagged releases:
 
-Latest release: **v0.1.2**.
+Latest release: **v0.1.3**.
 
 | Platform | File |
 |---|---|
@@ -54,12 +58,28 @@ Latest release: **v0.1.2**.
 On macOS, open the DMG and copy `ResearchWiki.app` to `/Applications`.
 On Windows, unzip `ResearchWiki-windows.zip` and run `ResearchWiki.exe` from the extracted folder.
 
-### What's new in v0.1.2
+### What's new in v0.1.3
 
-- Maintenance release with clippy cleanups in first-run endpoint scheme validation and
-  arXiv/RSS source parsing.
-- No user-facing workflow changes are expected; the setup wizard, gather pipeline, and
-  existing v0.1.1 source reliability improvements remain in place.
+- **Full text finally reaches the pipeline.** Fetched full text is now saved with each
+  article, so evaluation, embeddings, and the knowledge graph work from the whole paper
+  instead of only the abstract. Downloaded PDFs are kept on disk and a **Re‑extract PDF**
+  button in the article detail retries text extraction (and refreshes embeddings/KG).
+- **Stronger PDF fetching.** Acquisition now falls through arXiv → Unpaywall → publisher
+  URL patterns (incl. Frontiers, PLOS, eLife) → DOI content negotiation → the landing
+  page's `citation_pdf_url` meta tag.
+- **New DOAJ source** (free API, no key) and **cross‑source deduplication**: the same
+  paper arriving from several sources is detected by normalized DOI/title before any LLM
+  call, and a duplicate's evaluation enriches the existing record instead of being
+  discarded.
+- **Article scoring removed.** The per‑article 0–100 scores and tiers were a personal
+  study aid with no role in the pipeline; evaluation keeps the classification, summaries,
+  and strengths/weaknesses. Existing scores are preserved in a `haie_rev_scores_backup`
+  table during the automatic database migration.
+- **Knowledge‑graph robustness.** Interrupted article extractions resume at the failed
+  chunk without inflating mention counts or edge weights; relationship types are
+  canonicalized ("developed by" merges into "develops" with the edge direction flipped,
+  existing duplicates are merged on upgrade); empty LLM syntheses no longer overwrite
+  good wiki pages; and failed wiki exports are retried on the next compile pass.
 
 ## Build from source
 
@@ -130,7 +150,7 @@ local/dev setups:
 | `EMBEDDING_DIMENSIONS` | Embedding vector size (default 1536) |
 | `RESEARCHWIKI_CONTACT_EMAIL` | Sent to polite‑pool APIs (OpenAlex, Crossref, Unpaywall). Without it, Unpaywall PDF resolution is skipped and no address is sent. |
 | `SEMANTIC_SCHOLAR_API_KEY` | Enables the Semantic Scholar source (its keyless tier is too rate‑limited to use). Skipped when unset. |
-| `DATABASE_PATH`, `PROMPTS_DIR`, `SETTINGS_FILE`, `WIKI_EXPORT_DIR` | Override storage locations |
+| `DATABASE_PATH`, `PROMPTS_DIR`, `SETTINGS_FILE`, `WIKI_EXPORT_DIR`, `PDF_DIR` | Override storage locations |
 
 LLM behavior can be tuned with `LLM_DISABLE_THINKING`, `LLM_REQUEST_TIMEOUT_SECONDS`,
 `LLM_MAX_ATTEMPTS`, and `LLM_MAX_CONCURRENT_REQUESTS`. PDF→text extraction can use
@@ -162,7 +182,8 @@ QUERY="diabetes" DAYS_BACK=365 cargo run --bin check_sources
   - **Windows:** `%APPDATA%\ResearchWiki\ResearchWiki\data\`
   - **Linux:** `~/.local/share/ResearchWiki/`
 - It holds `settings.json`, the workspace registry (`meta.db`), each research set's SQLite
-  database, the prompt templates, and exported wiki files.
+  database, the prompt templates, exported wiki files, and downloaded article PDFs
+  (`pdfs/`).
 - Articles, prompts, and your research context are sent to the LLM/embedding endpoints you
   configure, and queries go to the public scholarly APIs above.
 

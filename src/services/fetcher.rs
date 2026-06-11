@@ -4,15 +4,18 @@ use tracing::{debug, info, warn};
 
 use crate::{error::AppError, services::pipeline::ArticleCandidate};
 
-use std::{env, sync::Arc, time::Duration};
+use std::{
+    env,
+    path::{Path, PathBuf},
+    sync::Arc,
+    time::Duration,
+};
 
 const NCBI_EFETCH_URL: &str = "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/efetch.fcgi";
 const MARKITDOWN_COMMAND_ENV: &str = "MARKITDOWN_COMMAND";
 const MARKITDOWN_TIMEOUT: Duration = Duration::from_secs(120);
-const SCORING_ABSTRACT_CHARS: usize = 4_000;
-const SCORING_SECTION_CHARS: usize = 2_500;
-const SCORING_SECTION_LIMIT: usize = 4;
-const SCORING_TEXT_MAX_CHARS: usize = 14_000;
+/// Anything smaller cannot be a real article PDF.
+const MIN_PDF_BYTES: usize = 10;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ContentType {
@@ -20,6 +23,9 @@ pub enum ContentType {
     Html,
     Xml,
     AbstractOnly,
+    /// A PDF was downloaded and stored on disk, but text extraction failed.
+    /// The file is kept so extraction can be retried later.
+    PdfStored,
 }
 
 impl ContentType {
@@ -29,6 +35,7 @@ impl ContentType {
             Self::Html => "html",
             Self::Xml => "xml",
             Self::AbstractOnly => "abstract_only",
+            Self::PdfStored => "pdf_stored",
         }
     }
 }
@@ -53,6 +60,9 @@ pub struct FetchedContent {
     pub content_type: ContentType,
     pub content: ContentData,
     pub fetch_method: String,
+    /// Where the downloaded PDF was persisted, when one was acquired. Kept
+    /// even if extraction failed so the article can be re-extracted later.
+    pub pdf_path: Option<PathBuf>,
 }
 
 #[derive(Clone)]
@@ -61,43 +71,85 @@ pub struct ContentFetcher {
     /// Contact email for Unpaywall OA lookups. `None` disables that strategy so
     /// we never send a placeholder address.
     contact_email: Option<String>,
+    /// Directory where acquired PDFs are persisted, keyed by article uid.
+    pdf_dir: PathBuf,
 }
 
-type FetchStrategy = (&'static str, fn(&ArticleCandidate) -> bool);
-
 impl ContentFetcher {
-    pub fn new(client: Client, contact_email: Option<String>) -> Self {
+    pub fn new(client: Client, contact_email: Option<String>, pdf_dir: PathBuf) -> Self {
         Self {
             client,
             contact_email: contact_email
                 .map(|email| email.trim().to_string())
                 .filter(|email| !email.is_empty()),
+            pdf_dir,
         }
     }
 
+    /// Two-phase fetch. Phase A walks every PDF acquisition strategy until one
+    /// yields a valid PDF, persists it, then extracts text. Phase B falls back
+    /// to text-only strategies (PMC XML, PubMed abstract, candidate summary).
+    /// A stored-but-unextractable PDF is still reported so the path lands in
+    /// the database for later re-extraction.
     pub async fn fetch(&self, candidate: &ArticleCandidate) -> Option<FetchedContent> {
-        let strategies: &[FetchStrategy] = &[
-            ("arxiv_pdf", |c| c.source == "arxiv"),
-            ("arxiv_abstract", |c| {
-                c.source == "arxiv" && has_candidate_summary(c)
-            }),
-            ("pmc_xml", |c| c.source == "pmc"),
-            ("unpaywall_oa", |c| c.doi.is_some()),
-            ("publisher_transform", |c| can_publisher_transform(c)),
-            ("pubmed_abstract", |c| {
-                c.source == "pubmed" || c.source == "pmc"
-            }),
-            ("candidate_summary", has_candidate_summary),
-        ];
+        let mut stored_pdf: Option<PathBuf> = None;
 
-        for &(name, can_fetch) in strategies {
-            if !can_fetch(candidate) {
+        if let Some((bytes, method)) = self.acquire_pdf(candidate).await {
+            match self.store_pdf(candidate, &bytes).await {
+                Ok(path) => match markdown_from_pdf_file(&path).await {
+                    Ok(Some(markdown)) => {
+                        info!("fetched {} using {method}", candidate.uid());
+                        return Some(FetchedContent {
+                            content_type: ContentType::Pdf,
+                            content: ContentData::Text(markdown),
+                            fetch_method: method,
+                            pdf_path: Some(path),
+                        });
+                    }
+                    Ok(None) => {
+                        warn!(
+                            "MarkItDown returned no Markdown for {}; keeping stored PDF at {}",
+                            candidate.uid(),
+                            path.display()
+                        );
+                        stored_pdf = Some(path);
+                    }
+                    Err(error) => {
+                        warn!(
+                            "PDF extraction failed for {}: {error}; keeping stored PDF at {}",
+                            candidate.uid(),
+                            path.display()
+                        );
+                        stored_pdf = Some(path);
+                    }
+                },
+                Err(error) => {
+                    warn!("failed to persist PDF for {}: {error}", candidate.uid());
+                }
+            }
+        }
+
+        for (name, applicable) in [
+            ("pmc_xml", candidate.source == "pmc"),
+            (
+                "pubmed_abstract",
+                candidate.source == "pubmed" || candidate.source == "pmc",
+            ),
+            ("candidate_summary", has_candidate_summary(candidate)),
+        ] {
+            if !applicable {
                 continue;
             }
-            debug!("trying strategy {name} for {}", candidate.uid());
-            match self.try_strategy(name, candidate).await {
-                Ok(Some(content)) => {
+            debug!("trying text strategy {name} for {}", candidate.uid());
+            let result = match name {
+                "pmc_xml" => self.fetch_pmc_xml(candidate).await,
+                "pubmed_abstract" => self.fetch_pubmed_abstract(candidate).await,
+                _ => self.fetch_candidate_summary(candidate).await,
+            };
+            match result {
+                Ok(Some(mut content)) => {
                     info!("fetched {} using {}", candidate.uid(), content.fetch_method);
+                    content.pdf_path = stored_pdf;
                     return Some(content);
                 }
                 Ok(None) => continue,
@@ -106,6 +158,15 @@ impl ContentFetcher {
                     continue;
                 }
             }
+        }
+
+        if let Some(path) = stored_pdf {
+            return Some(FetchedContent {
+                content_type: ContentType::PdfStored,
+                content: ContentData::Text(String::new()),
+                fetch_method: "pdf_stored_unextracted".to_string(),
+                pdf_path: Some(path),
+            });
         }
 
         warn!("all fetch strategies failed for {}", candidate.uid());
@@ -135,131 +196,112 @@ impl ContentFetcher {
         futures::future::join_all(futures).await
     }
 
-    async fn try_strategy(
-        &self,
-        name: &str,
-        candidate: &ArticleCandidate,
-    ) -> Result<Option<FetchedContent>, AppError> {
-        match name {
-            "arxiv_abstract" => self.fetch_arxiv_abstract(candidate).await,
-            "arxiv_pdf" => self.fetch_arxiv_pdf(candidate).await,
-            "pmc_xml" => self.fetch_pmc_xml(candidate).await,
-            "unpaywall_oa" => self.fetch_unpaywall_oa(candidate).await,
-            "publisher_transform" => self.fetch_publisher_transform(candidate).await,
-            "pubmed_abstract" => self.fetch_pubmed_abstract(candidate).await,
-            "candidate_summary" => self.fetch_candidate_summary(candidate).await,
-            _ => Ok(None),
+    /// Re-runs MarkItDown over a previously stored PDF.
+    pub async fn re_extract_stored_pdf(&self, path: &Path) -> Result<Option<String>, AppError> {
+        markdown_from_pdf_file(path).await
+    }
+
+    /// Walks the PDF acquisition strategies in order of reliability and cost;
+    /// the first valid PDF (magic-byte checked) wins.
+    async fn acquire_pdf(&self, candidate: &ArticleCandidate) -> Option<(Vec<u8>, String)> {
+        let unpaywall_ready = candidate.doi.is_some() && self.contact_email.is_some();
+        let strategies: [(&str, bool); 5] = [
+            ("arxiv_pdf", candidate.source == "arxiv"),
+            ("unpaywall_oa", unpaywall_ready),
+            ("publisher_pdf", candidate.doi.is_some()),
+            ("doi_negotiation", candidate.doi.is_some()),
+            (
+                "landing_page_pdf",
+                candidate.doi.is_some() || !candidate.url.trim().is_empty(),
+            ),
+        ];
+
+        for (name, applicable) in strategies {
+            if !applicable {
+                continue;
+            }
+            debug!("trying PDF strategy {name} for {}", candidate.uid());
+            let result = match name {
+                "arxiv_pdf" => self.fetch_arxiv_pdf_bytes(candidate).await,
+                "unpaywall_oa" => self.fetch_unpaywall_pdf_bytes(candidate).await,
+                "publisher_pdf" => self.fetch_publisher_pdf_bytes(candidate).await,
+                "doi_negotiation" => self.fetch_doi_negotiation_bytes(candidate).await,
+                _ => self.fetch_landing_page_pdf_bytes(candidate).await,
+            };
+            match result {
+                Ok(Some(bytes)) => return Some((bytes, name.to_string())),
+                Ok(None) => continue,
+                Err(error) => {
+                    warn!("{name} error for {}: {error}", candidate.uid());
+                    continue;
+                }
+            }
         }
+
+        None
     }
 
-    async fn fetch_arxiv_abstract(
+    async fn store_pdf(
         &self,
         candidate: &ArticleCandidate,
-    ) -> Result<Option<FetchedContent>, AppError> {
-        self.fetch_candidate_summary_with_method(candidate, "arxiv_abstract")
+        bytes: &[u8],
+    ) -> Result<PathBuf, AppError> {
+        tokio::fs::create_dir_all(&self.pdf_dir)
             .await
+            .map_err(|error| {
+                AppError::Internal(format!(
+                    "failed to create PDF directory {}: {error}",
+                    self.pdf_dir.display()
+                ))
+            })?;
+        let path = self.pdf_dir.join(pdf_filename(&candidate.uid()));
+        tokio::fs::write(&path, bytes).await.map_err(|error| {
+            AppError::Internal(format!("failed to write PDF {}: {error}", path.display()))
+        })?;
+        Ok(path)
     }
 
-    async fn fetch_arxiv_pdf(
+    /// Downloads `url` and returns the body only when it is a real PDF.
+    async fn download_pdf_bytes(
+        &self,
+        url: &str,
+        accept_pdf: bool,
+    ) -> Result<Option<Vec<u8>>, AppError> {
+        let mut request = self.client.get(url);
+        if accept_pdf {
+            request = request.header("Accept", "application/pdf");
+        }
+        let response = request
+            .send()
+            .await
+            .map_err(|error| AppError::Internal(format!("PDF fetch failed for {url}: {error}")))?;
+        if !response.status().is_success() {
+            return Ok(None);
+        }
+        let bytes = response.bytes().await.map_err(|error| {
+            AppError::Internal(format!("failed to read PDF response from {url}: {error}"))
+        })?;
+        if !is_pdf_bytes(&bytes) {
+            return Ok(None);
+        }
+        Ok(Some(bytes.to_vec()))
+    }
+
+    async fn fetch_arxiv_pdf_bytes(
         &self,
         candidate: &ArticleCandidate,
-    ) -> Result<Option<FetchedContent>, AppError> {
+    ) -> Result<Option<Vec<u8>>, AppError> {
         let arxiv_id = candidate.source_id.replace("v", "");
         let pdf_url = format!("https://arxiv.org/pdf/{arxiv_id}.pdf");
-
-        let response = self
-            .client
-            .get(&pdf_url)
-            .send()
-            .await
-            .map_err(|error| AppError::Internal(format!("arXiv PDF fetch failed: {error}")))?;
-
-        if !response.status().is_success() {
-            return Ok(None);
-        }
-
-        let bytes = response.bytes().await.map_err(|error| {
-            AppError::Internal(format!("failed to read arXiv PDF response: {error}"))
-        })?;
-
-        if bytes.len() < 10 || !bytes[..4].starts_with(b"%PDF") {
-            warn!("arXiv response not a PDF for {}", candidate.uid());
-            return Ok(None);
-        }
-
-        let markdown = match pdf_to_markdown_with_markitdown(&bytes).await {
-            Ok(Some(markdown)) => markdown,
-            Ok(None) => {
-                warn!(
-                    "MarkItDown returned no Markdown for {}; falling back to abstract",
-                    candidate.uid()
-                );
-                return Ok(None);
-            }
-            Err(error) => {
-                warn!(
-                    "MarkItDown PDF conversion failed for {}: {error}; falling back to abstract",
-                    candidate.uid()
-                );
-                return Ok(None);
-            }
-        };
-
-        let Some(scoring_text) = build_arxiv_scoring_text(candidate, &markdown) else {
-            warn!(
-                "MarkItDown produced no scoring sections for {}; falling back to abstract",
-                candidate.uid()
-            );
-            return Ok(None);
-        };
-
-        Ok(Some(FetchedContent {
-            content_type: ContentType::Pdf,
-            content: ContentData::Text(scoring_text),
-            fetch_method: "arxiv_pdf_markitdown_scoring".to_string(),
-        }))
-    }
-
-    async fn fetch_pmc_xml(
-        &self,
-        candidate: &ArticleCandidate,
-    ) -> Result<Option<FetchedContent>, AppError> {
-        let pmc_id = candidate.source_id.trim_start_matches("PMC");
-
-        let response = self
-            .client
-            .get(NCBI_EFETCH_URL)
-            .query(&[("db", "pmc"), ("id", pmc_id), ("rettype", "xml")])
-            .send()
-            .await
-            .map_err(|error| AppError::Internal(format!("PMC XML fetch failed: {error}")))?;
-
-        if !response.status().is_success() {
-            return Ok(None);
-        }
-
-        let content = response.text().await.map_err(|error| {
-            AppError::Internal(format!("failed to read PMC XML response: {error}"))
-        })?;
-
-        if !content.contains("<article") && !content.contains("<body") {
-            warn!("PMC XML fetch returned no article content for PMC{pmc_id}");
-            return Ok(None);
-        }
-
-        Ok(Some(FetchedContent {
-            content_type: ContentType::Xml,
-            content: ContentData::Text(content),
-            fetch_method: "pmc_xml".to_string(),
-        }))
+        self.download_pdf_bytes(&pdf_url, false).await
     }
 
     /// Unpaywall's real purpose: given a DOI, resolve the best open-access PDF
     /// location and download it. Works for any DOI-bearing candidate.
-    async fn fetch_unpaywall_oa(
+    async fn fetch_unpaywall_pdf_bytes(
         &self,
         candidate: &ArticleCandidate,
-    ) -> Result<Option<FetchedContent>, AppError> {
+    ) -> Result<Option<Vec<u8>>, AppError> {
         let Some(doi) = candidate.doi.as_deref() else {
             return Ok(None);
         };
@@ -294,89 +336,121 @@ impl ContentFetcher {
             return Ok(None);
         };
 
-        let pdf_response =
-            self.client.get(&pdf_url).send().await.map_err(|error| {
-                AppError::Internal(format!("unpaywall PDF fetch failed: {error}"))
-            })?;
-        if !pdf_response.status().is_success() {
-            return Ok(None);
-        }
-        let bytes = pdf_response.bytes().await.map_err(|error| {
-            AppError::Internal(format!("failed to read unpaywall PDF response: {error}"))
-        })?;
-        if bytes.len() < 10 || !bytes[..4].starts_with(b"%PDF") {
-            return Ok(None);
-        }
-
-        Ok(Some(FetchedContent {
-            content_type: ContentType::Pdf,
-            content: ContentData::Binary(bytes.to_vec()),
-            fetch_method: "unpaywall_oa".to_string(),
-        }))
+        self.download_pdf_bytes(&pdf_url, false).await
     }
 
-    async fn fetch_publisher_transform(
+    async fn fetch_publisher_pdf_bytes(
         &self,
         candidate: &ArticleCandidate,
-    ) -> Result<Option<FetchedContent>, AppError> {
+    ) -> Result<Option<Vec<u8>>, AppError> {
         let Some(doi) = candidate.doi.as_deref() else {
             return Ok(None);
         };
-        let doi_lower = doi.to_lowercase();
 
-        let (pdf_url, publisher) = if doi_lower.contains("springer") || doi_lower.contains("s41") {
-            (
-                format!("https://link.springer.com/content/pdf/{doi}.pdf"),
-                "springer",
-            )
-        } else if doi_lower.contains("nature") {
-            let suffix = doi.split('/').next_back().unwrap_or(doi);
-            (
-                format!("https://www.nature.com/articles/{suffix}.pdf"),
-                "nature",
-            )
-        } else if doi_lower.contains("biomedcentral") || doi_lower.contains("bmc") {
-            (
-                format!("https://bmcmedethics.biomedcentral.com/track/pdf/{doi}.pdf"),
-                "bmc",
-            )
-        } else if doi_lower.contains("jmir") {
-            (
-                format!("https://www.jmir.org/article/download/{doi}/"),
-                "jmir",
-            )
-        } else if doi_lower.contains("cambridge") {
-            (
-                format!(
-                    "https://www.cambridge.org/core/services/aop-cambridge-core/content/view/{doi}"
-                ),
-                "cambridge",
-            )
-        } else {
+        for (pdf_url, publisher) in publisher_pdf_urls(doi) {
+            match self.download_pdf_bytes(&pdf_url, false).await {
+                Ok(Some(bytes)) => {
+                    debug!("publisher heuristic {publisher} hit for {}", candidate.uid());
+                    return Ok(Some(bytes));
+                }
+                Ok(None) => continue,
+                Err(error) => {
+                    debug!("publisher heuristic {publisher} failed: {error}");
+                    continue;
+                }
+            }
+        }
+
+        Ok(None)
+    }
+
+    /// DOI content negotiation: some registrars serve the PDF directly when
+    /// asked for `application/pdf`. Cheap to try before scraping.
+    async fn fetch_doi_negotiation_bytes(
+        &self,
+        candidate: &ArticleCandidate,
+    ) -> Result<Option<Vec<u8>>, AppError> {
+        let Some(doi) = candidate.doi.as_deref() else {
             return Ok(None);
         };
+        self.download_pdf_bytes(&format!("https://doi.org/{doi}"), true)
+            .await
+    }
 
-        let response =
-            self.client.get(&pdf_url).send().await.map_err(|error| {
-                AppError::Internal(format!("publisher PDF fetch failed: {error}"))
-            })?;
+    /// Generalist fallback: load the article landing page (DOI redirect or the
+    /// candidate's own URL) and follow its `citation_pdf_url` meta tag, which
+    /// most publishers emit for Google Scholar.
+    async fn fetch_landing_page_pdf_bytes(
+        &self,
+        candidate: &ArticleCandidate,
+    ) -> Result<Option<Vec<u8>>, AppError> {
+        let landing_url = candidate
+            .doi
+            .as_deref()
+            .map(|doi| format!("https://doi.org/{doi}"))
+            .unwrap_or_else(|| candidate.url.trim().to_string());
+        if landing_url.is_empty() {
+            return Ok(None);
+        }
+
+        let response = self.client.get(&landing_url).send().await.map_err(|error| {
+            AppError::Internal(format!("landing page fetch failed for {landing_url}: {error}"))
+        })?;
+        if !response.status().is_success() {
+            return Ok(None);
+        }
+        let final_url = response.url().clone();
+        let bytes = response.bytes().await.map_err(|error| {
+            AppError::Internal(format!("failed to read landing page response: {error}"))
+        })?;
+        // Some landing URLs serve the PDF directly.
+        if is_pdf_bytes(&bytes) {
+            return Ok(Some(bytes.to_vec()));
+        }
+
+        let html = String::from_utf8_lossy(&bytes);
+        let Some(pdf_url) = extract_citation_pdf_url(&html) else {
+            return Ok(None);
+        };
+        let pdf_url = match final_url.join(&pdf_url) {
+            Ok(resolved) => resolved.to_string(),
+            Err(_) => pdf_url,
+        };
+        self.download_pdf_bytes(&pdf_url, false).await
+    }
+
+    async fn fetch_pmc_xml(
+        &self,
+        candidate: &ArticleCandidate,
+    ) -> Result<Option<FetchedContent>, AppError> {
+        let pmc_id = candidate.source_id.trim_start_matches("PMC");
+
+        let response = self
+            .client
+            .get(NCBI_EFETCH_URL)
+            .query(&[("db", "pmc"), ("id", pmc_id), ("rettype", "xml")])
+            .send()
+            .await
+            .map_err(|error| AppError::Internal(format!("PMC XML fetch failed: {error}")))?;
 
         if !response.status().is_success() {
             return Ok(None);
         }
 
-        let bytes = response.bytes().await.map_err(|error| {
-            AppError::Internal(format!("failed to read publisher PDF response: {error}"))
+        let content = response.text().await.map_err(|error| {
+            AppError::Internal(format!("failed to read PMC XML response: {error}"))
         })?;
 
-        if bytes.len() < 10 || !bytes[..4].starts_with(b"%PDF") {
+        if !content.contains("<article") && !content.contains("<body") {
+            warn!("PMC XML fetch returned no article content for PMC{pmc_id}");
             return Ok(None);
         }
 
         Ok(Some(FetchedContent {
-            content_type: ContentType::Pdf,
-            content: ContentData::Binary(bytes.to_vec()),
-            fetch_method: format!("{publisher}_transform"),
+            content_type: ContentType::Xml,
+            content: ContentData::Text(content),
+            fetch_method: "pmc_xml".to_string(),
+            pdf_path: None,
         }))
     }
 
@@ -422,21 +496,13 @@ impl ContentFetcher {
             content_type: ContentType::AbstractOnly,
             content: ContentData::Text(content),
             fetch_method: "pubmed_efetch".to_string(),
+            pdf_path: None,
         }))
     }
 
     async fn fetch_candidate_summary(
         &self,
         candidate: &ArticleCandidate,
-    ) -> Result<Option<FetchedContent>, AppError> {
-        self.fetch_candidate_summary_with_method(candidate, "candidate_summary")
-            .await
-    }
-
-    async fn fetch_candidate_summary_with_method(
-        &self,
-        candidate: &ArticleCandidate,
-        fetch_method: &str,
     ) -> Result<Option<FetchedContent>, AppError> {
         let Some(summary) = candidate
             .summary
@@ -450,7 +516,8 @@ impl ContentFetcher {
         Ok(Some(FetchedContent {
             content_type: ContentType::AbstractOnly,
             content: ContentData::Text(summary.to_string()),
-            fetch_method: fetch_method.to_string(),
+            fetch_method: "candidate_summary".to_string(),
+            pdf_path: None,
         }))
     }
 }
@@ -463,224 +530,121 @@ fn has_candidate_summary(candidate: &ArticleCandidate) -> bool {
         .is_some_and(|value| !value.is_empty())
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct MarkdownSection {
-    heading: String,
-    body: String,
+fn is_pdf_bytes(bytes: &[u8]) -> bool {
+    bytes.len() >= MIN_PDF_BYTES && bytes.starts_with(b"%PDF")
 }
 
-fn build_arxiv_scoring_text(candidate: &ArticleCandidate, markdown: &str) -> Option<String> {
-    let sections = selected_scoring_sections(markdown);
-    if sections.is_empty() {
-        return None;
+/// Deterministic filename for a stored PDF: sanitized uid plus an FNV-1a hash
+/// suffix so distinct uids that sanitize identically cannot collide.
+fn pdf_filename(uid: &str) -> String {
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for byte in uid.as_bytes() {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
     }
-
-    let mut text = String::new();
-    text.push_str("# Title\n");
-    text.push_str(candidate.title.trim());
-    text.push_str("\n\n");
-
-    if let Some(summary) = candidate
-        .summary
-        .as_deref()
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-    {
-        text.push_str("## Abstract (selection basis)\n");
-        text.push_str(&truncate_chars(summary, SCORING_ABSTRACT_CHARS));
-        text.push_str("\n\n");
-    }
-
-    text.push_str("## Selected PDF evidence for scoring\n");
-    for section in sections.into_iter().take(SCORING_SECTION_LIMIT) {
-        text.push_str("### ");
-        text.push_str(section.heading.trim());
-        text.push('\n');
-        text.push_str(&truncate_chars(section.body.trim(), SCORING_SECTION_CHARS));
-        text.push_str("\n\n");
-
-        if text.chars().count() >= SCORING_TEXT_MAX_CHARS {
-            break;
-        }
-    }
-
-    Some(truncate_chars(&text, SCORING_TEXT_MAX_CHARS))
-}
-
-fn selected_scoring_sections(markdown: &str) -> Vec<MarkdownSection> {
-    let mut sections = Vec::new();
-    let mut current_heading = None::<String>;
-    let mut current_body = String::new();
-
-    for line in markdown.lines() {
-        if let Some(heading) = parse_section_heading(line) {
-            push_markdown_section(&mut sections, current_heading.take(), &mut current_body);
-            current_heading = Some(heading);
-            continue;
-        }
-
-        if current_heading.is_some() {
-            current_body.push_str(line);
-            current_body.push('\n');
-        }
-    }
-
-    push_markdown_section(&mut sections, current_heading, &mut current_body);
-
-    sections
-        .into_iter()
-        .filter(|section| is_scoring_heading(&section.heading) && !section.body.trim().is_empty())
-        .collect()
-}
-
-fn push_markdown_section(
-    sections: &mut Vec<MarkdownSection>,
-    heading: Option<String>,
-    body: &mut String,
-) {
-    if let Some(heading) = heading {
-        let trimmed_body = body.trim();
-        if !trimmed_body.is_empty() {
-            sections.push(MarkdownSection {
-                heading,
-                body: trimmed_body.to_string(),
-            });
-        }
-    }
-    body.clear();
-}
-
-fn parse_section_heading(line: &str) -> Option<String> {
-    let trimmed = line.trim();
-    if trimmed.is_empty() {
-        return None;
-    }
-
-    if trimmed.starts_with('#') {
-        let heading = trimmed.trim_start_matches('#').trim();
-        return (!heading.is_empty()).then(|| clean_heading(heading));
-    }
-
-    if !looks_like_plain_heading(trimmed) {
-        return None;
-    }
-
-    let heading = clean_heading(trimmed);
-    (is_common_paper_heading(&heading) || is_scoring_heading(&heading)).then_some(heading)
-}
-
-fn looks_like_plain_heading(line: &str) -> bool {
-    let char_count = line.chars().count();
-    if !(3..=80).contains(&char_count) {
-        return false;
-    }
-    if line.ends_with('.') || line.ends_with(',') || line.contains("  ") {
-        return false;
-    }
-    line.split_whitespace().count() <= 8
-}
-
-fn clean_heading(heading: &str) -> String {
-    let without_number = heading
-        .trim()
-        .trim_start_matches(|character: char| {
-            character.is_ascii_digit() || matches!(character, '.' | ')' | '(' | '-' | ':' | ' ')
+    let safe: String = uid
+        .chars()
+        .map(|character| {
+            if character.is_ascii_alphanumeric() || matches!(character, '-' | '.' | '_') {
+                character
+            } else {
+                '_'
+            }
         })
-        .trim();
-    let cleaned = without_number
-        .trim_matches(|character: char| matches!(character, ':' | '.' | '-' | ' '))
-        .trim();
+        .collect();
+    format!("{safe}-{hash:016x}.pdf")
+}
 
-    if cleaned.is_empty() {
-        heading.trim().to_string()
-    } else {
-        cleaned.to_string()
+/// Heuristic per-publisher PDF URLs derived from the DOI. DOI prefixes are
+/// stable publisher identifiers; the legacy substring checks stay for DOIs
+/// that embed the publisher name.
+fn publisher_pdf_urls(doi: &str) -> Vec<(String, &'static str)> {
+    let doi = doi.trim();
+    let doi_lower = doi.to_lowercase();
+    let mut urls = Vec::new();
+
+    if doi_lower.contains("springer") || doi_lower.contains("s41") {
+        urls.push((
+            format!("https://link.springer.com/content/pdf/{doi}.pdf"),
+            "springer",
+        ));
     }
-}
-
-fn is_scoring_heading(heading: &str) -> bool {
-    let heading = heading.to_lowercase();
-    [
-        "result",
-        "finding",
-        "discussion",
-        "conclusion",
-        "evaluation",
-        "experiment",
-        "analysis",
-        "limitation",
-        "implication",
-    ]
-    .iter()
-    .any(|keyword| heading.contains(keyword))
-}
-
-fn is_common_paper_heading(heading: &str) -> bool {
-    let heading = heading.to_lowercase();
-    [
-        "abstract",
-        "introduction",
-        "background",
-        "related work",
-        "methods",
-        "method",
-        "materials and methods",
-        "study design",
-        "results",
-        "findings",
-        "discussion",
-        "conclusion",
-        "references",
-        "bibliography",
-        "acknowledgments",
-        "acknowledgements",
-        "appendix",
-        "supplement",
-    ]
-    .iter()
-    .any(|keyword| heading == *keyword || heading.contains(keyword))
-}
-
-fn truncate_chars(text: &str, limit: usize) -> String {
-    let mut chars = text.chars();
-    let truncated = chars.by_ref().take(limit).collect::<String>();
-    if chars.next().is_some() {
-        format!("{truncated}\n[truncated]")
-    } else {
-        truncated
+    if doi_lower.contains("nature") {
+        let suffix = doi.split('/').next_back().unwrap_or(doi);
+        urls.push((
+            format!("https://www.nature.com/articles/{suffix}.pdf"),
+            "nature",
+        ));
     }
-}
-
-async fn pdf_to_markdown_with_markitdown(bytes: &[u8]) -> Result<Option<String>, AppError> {
-    let path = env::temp_dir().join(format!(
-        "researchwiki-markitdown-{}.pdf",
-        uuid::Uuid::new_v4()
-    ));
-
-    let result = async {
-        tokio::fs::write(&path, bytes).await.map_err(|error| {
-            AppError::Internal(format!(
-                "failed to write temporary PDF for MarkItDown at {}: {error}",
-                path.display()
-            ))
-        })?;
-
-        let markdown = run_markitdown_commands(&path).await?;
-        Ok((!markdown.is_empty()).then_some(markdown))
+    if doi_lower.contains("biomedcentral") || doi_lower.contains("bmc") {
+        urls.push((
+            format!("https://bmcmedethics.biomedcentral.com/track/pdf/{doi}.pdf"),
+            "bmc",
+        ));
     }
-    .await;
-
-    if let Err(error) = tokio::fs::remove_file(&path).await {
-        debug!(
-            "failed to remove temporary MarkItDown PDF {}: {error}",
-            path.display()
-        );
+    if doi_lower.contains("jmir") {
+        urls.push((
+            format!("https://www.jmir.org/article/download/{doi}/"),
+            "jmir",
+        ));
+    }
+    if doi_lower.contains("cambridge") {
+        urls.push((
+            format!(
+                "https://www.cambridge.org/core/services/aop-cambridge-core/content/view/{doi}"
+            ),
+            "cambridge",
+        ));
+    }
+    if doi_lower.starts_with("10.3389/") {
+        urls.push((
+            format!("https://www.frontiersin.org/articles/{doi}/pdf"),
+            "frontiers",
+        ));
+    }
+    if doi_lower.starts_with("10.1371/") {
+        urls.push((
+            format!("https://journals.plos.org/plosone/article/file?id={doi}&type=printable"),
+            "plos",
+        ));
+    }
+    if doi_lower.starts_with("10.7554/") {
+        if let Some(article) = doi_lower
+            .strip_prefix("10.7554/elife.")
+            .map(|suffix| suffix.split('.').next().unwrap_or(suffix))
+            .filter(|value| !value.is_empty())
+        {
+            urls.push((
+                format!("https://elifesciences.org/articles/{article}/pdf"),
+                "elife",
+            ));
+        }
     }
 
-    result
+    urls
 }
 
-async fn run_markitdown_commands(path: &std::path::Path) -> Result<String, AppError> {
+/// Pulls the `citation_pdf_url` (Highwire/Google Scholar) meta tag out of a
+/// landing page.
+fn extract_citation_pdf_url(html: &str) -> Option<String> {
+    use scraper::{Html, Selector};
+
+    let document = Html::parse_document(html);
+    let selector = Selector::parse(r#"meta[name="citation_pdf_url"]"#).ok()?;
+    document
+        .select(&selector)
+        .filter_map(|element| element.value().attr("content"))
+        .map(str::trim)
+        .find(|value| !value.is_empty())
+        .map(ToOwned::to_owned)
+}
+
+async fn markdown_from_pdf_file(path: &Path) -> Result<Option<String>, AppError> {
+    let markdown = run_markitdown_commands(path).await?;
+    Ok((!markdown.is_empty()).then_some(markdown))
+}
+
+async fn run_markitdown_commands(path: &Path) -> Result<String, AppError> {
     let mut commands = Vec::<(String, Vec<String>)>::new();
     if let Ok(command) = env::var(MARKITDOWN_COMMAND_ENV) {
         let command = command.trim();
@@ -715,7 +679,7 @@ async fn run_markitdown_commands(path: &std::path::Path) -> Result<String, AppEr
 async fn run_markitdown_command(
     program: &str,
     args: &[String],
-    path: &std::path::Path,
+    path: &Path,
 ) -> Result<String, AppError> {
     let mut command = Command::new(program);
     command.args(args).arg(path);
@@ -757,18 +721,6 @@ fn format_command_args(args: &[String]) -> String {
     }
 }
 
-fn can_publisher_transform(candidate: &ArticleCandidate) -> bool {
-    candidate
-        .doi
-        .as_deref()
-        .map(str::to_lowercase)
-        .is_some_and(|doi| {
-            ["springer", "nature", "biomedcentral", "jmir", "cambridge"]
-                .iter()
-                .any(|publisher| doi.contains(publisher))
-        })
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -797,54 +749,53 @@ mod tests {
     }
 
     #[test]
-    fn arxiv_scoring_text_keeps_abstract_and_selected_sections() {
-        let mut candidate = test_candidate();
-        candidate.summary = Some("This is the abstract used for selection.".to_string());
-        let markdown = r#"
-# Paper title
-
-## Methods
-This method text should not be included.
-
-## Results
-The intervention improved the primary outcome.
-
-## Discussion
-The finding changes the interpretation of prior work.
-
-## References
-Reference text should not be included.
-"#;
-
-        let text = build_arxiv_scoring_text(&candidate, markdown).unwrap();
-
-        assert!(text.contains("This is the abstract used for selection."));
-        assert!(text.contains("## Selected PDF evidence for scoring"));
-        assert!(text.contains("### Results"));
-        assert!(text.contains("The intervention improved the primary outcome."));
-        assert!(text.contains("### Discussion"));
-        assert!(!text.contains("This method text should not be included."));
-        assert!(!text.contains("Reference text should not be included."));
+    fn pdf_magic_byte_check() {
+        assert!(is_pdf_bytes(b"%PDF-1.7 rest of file"));
+        assert!(!is_pdf_bytes(b"%PDF"));
+        assert!(!is_pdf_bytes(b"<html><body>Not a PDF</body></html>"));
     }
 
     #[test]
-    fn selected_scoring_sections_support_plain_headings() {
-        let markdown = r#"
-INTRODUCTION
-Background text.
+    fn pdf_filenames_are_sanitized_and_collision_resistant() {
+        let a = pdf_filename("arxiv:2605.00001");
+        let b = pdf_filename("arxiv_2605.00001");
+        assert!(a.starts_with("arxiv_2605.00001-"));
+        assert!(a.ends_with(".pdf"));
+        assert_ne!(a, b, "sanitization collisions are disambiguated by hash");
+        assert_eq!(a, pdf_filename("arxiv:2605.00001"), "deterministic");
+    }
 
-RESULTS
-Observed effect size was large.
+    #[test]
+    fn extracts_citation_pdf_url_from_landing_page() {
+        let html = r#"
+            <html><head>
+                <meta name="citation_title" content="A Paper">
+                <meta name="citation_pdf_url" content="https://example.com/article.pdf">
+            </head><body></body></html>
+        "#;
+        assert_eq!(
+            extract_citation_pdf_url(html).as_deref(),
+            Some("https://example.com/article.pdf")
+        );
+        assert_eq!(extract_citation_pdf_url("<html></html>"), None);
+    }
 
-REFERENCES
-Ignored reference.
-"#;
+    #[test]
+    fn publisher_urls_cover_doi_prefixes() {
+        let frontiers = publisher_pdf_urls("10.3389/fmed.2026.101126");
+        assert_eq!(frontiers.len(), 1);
+        assert_eq!(frontiers[0].1, "frontiers");
 
-        let sections = selected_scoring_sections(markdown);
+        let plos = publisher_pdf_urls("10.1371/journal.pone.0123456");
+        assert_eq!(plos[0].1, "plos");
 
-        assert_eq!(sections.len(), 1);
-        assert_eq!(sections[0].heading, "RESULTS");
-        assert_eq!(sections[0].body, "Observed effect size was large.");
+        let elife = publisher_pdf_urls("10.7554/eLife.12345");
+        assert_eq!(
+            elife[0].0,
+            "https://elifesciences.org/articles/12345/pdf"
+        );
+
+        assert!(publisher_pdf_urls("10.1000/unknown").is_empty());
     }
 
     fn test_candidate() -> ArticleCandidate {
