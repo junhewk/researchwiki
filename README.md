@@ -44,7 +44,7 @@ key in the setup wizard.
 
 Pre-built desktop artifacts are attached to tagged releases:
 
-Latest release: **v0.1.1**.
+Latest release: **v0.1.2**.
 
 | Platform | File |
 |---|---|
@@ -54,12 +54,12 @@ Latest release: **v0.1.1**.
 On macOS, open the DMG and copy `ResearchWiki.app` to `/Applications`.
 On Windows, unzip `ResearchWiki-windows.zip` and run `ResearchWiki.exe` from the extracted folder.
 
-### What's new in v0.1.1
+### What's new in v0.1.2
 
-- arXiv gather now uses OAI-PMH plus the official RSS feed instead of the throttled
-  export search endpoint, reducing 429 failures during normal source listing.
-- PMC gather treats NCBI ELink PubMed linkage as best-effort, so transient ELink 500s
-  no longer fail the whole PMC source.
+- Maintenance release with clippy cleanups in first-run endpoint scheme validation and
+  arXiv/RSS source parsing.
+- No user-facing workflow changes are expected; the setup wizard, gather pipeline, and
+  existing v0.1.1 source reliability improvements remain in place.
 
 ## Build from source
 

@@ -1,6 +1,6 @@
 [package]
 name = "researchwiki"
-version = "0.1.1"
+version = "0.1.2"
 edition = "2024"
 description = "Native desktop app for gathering academic articles and building a knowledge-graph wiki"
 license = "MIT"

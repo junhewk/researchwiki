@@ -3081,9 +3081,7 @@ fn arxiv_source_id_from_value(value: &str) -> Option<String> {
         id = &id[(index + "/pdf/".len())..];
     }
 
-    let end = id
-        .find(|character| character == '?' || character == '#')
-        .unwrap_or(id.len());
+    let end = id.find(['?', '#']).unwrap_or(id.len());
     let id = id[..end]
         .trim()
         .trim_end_matches(".pdf")
@@ -3094,10 +3092,10 @@ fn arxiv_source_id_from_value(value: &str) -> Option<String> {
 
 fn clean_arxiv_rss_title(value: &str) -> String {
     let title = clean_text(value);
-    if let Some(rest) = title.strip_prefix('[') {
-        if let Some(end) = rest.find(']') {
-            return rest[(end + 1)..].trim().to_string();
-        }
+    if let Some(rest) = title.strip_prefix('[')
+        && let Some(end) = rest.find(']')
+    {
+        return rest[(end + 1)..].trim().to_string();
     }
     title
 }
@@ -3161,7 +3159,7 @@ fn first_author_from_author_list(authors: Option<&str>) -> String {
     authors
         .and_then(|value| {
             value
-                .split(|character| character == ',' || character == ';')
+                .split([',', ';'])
                 .next()
                 .map(str::trim)
                 .filter(|value| !value.is_empty())
