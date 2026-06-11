@@ -148,7 +148,7 @@ impl Panel {
                         self.rewrite(ctx, &name);
                     }
                     if self.busy {
-                        ui.spinner();
+                        style::loading_indicator(ui, ctx.t("Loading…"));
                     }
                 });
 

@@ -2,7 +2,7 @@ use crate::{
     config::{EmbeddingConfig, LlmConfig, normalize_api_key},
     models::settings::{NewsletterSettings, UiLanguage},
     runtime::UiEvent,
-    ui::style,
+    ui::{style, toast::ToastKind},
 };
 
 use super::{MsgChannel, PanelCtx};
@@ -52,13 +52,11 @@ pub struct Panel {
     embedding_dim_input: String,
     embedding_confirm_open: bool,
 
-    notice: Option<(NoticeKind, String)>,
-}
-
-#[derive(Clone, Copy)]
-enum NoticeKind {
-    Success,
-    Error,
+    /// Which section's save is in flight (the `Msg::Saved` label); all save
+    /// buttons disable until it completes.
+    saving: Option<&'static str>,
+    /// Persistent error from the last failed load/save. Successes toast.
+    error: Option<String>,
 }
 
 impl Panel {
@@ -66,7 +64,7 @@ impl Panel {
         if self.channel.is_none() {
             self.channel = Some(MsgChannel::default());
         }
-        self.drain();
+        self.drain(ctx);
         if !self.initialized {
             self.initialized = true;
             self.loaded_workspace = Some(ctx.active_workspace_id);
@@ -113,8 +111,10 @@ impl Panel {
                 self.section_embedding(ui, ctx);
 
                 ui.add_space(12.0);
-                if let Some((kind, msg)) = &self.notice {
-                    style::status_notice(ui, matches!(kind, NoticeKind::Success), msg);
+                if let Some(err) = self.error.clone()
+                    && style::error_notice(ui, &err, None) == style::NoticeAction::Dismiss
+                {
+                    self.error = None;
                 }
             });
 
@@ -123,7 +123,7 @@ impl Panel {
         }
     }
 
-    fn drain(&mut self) {
+    fn drain(&mut self, ctx: &PanelCtx<'_>) {
         let Some(channel) = self.channel.as_mut() else {
             return;
         };
@@ -144,11 +144,14 @@ impl Panel {
                 }
                 Msg::LoadError(err) => {
                     self.loading = false;
-                    self.notice =
-                        Some((NoticeKind::Error, format!("Failed to load settings: {err}")));
+                    self.error = Some(format!("Failed to load settings: {err}"));
                 }
                 Msg::Saved(what) => {
-                    self.notice = Some((NoticeKind::Success, format!("{what} saved.")));
+                    self.saving = None;
+                    let _ = ctx.ui_tx.send(UiEvent::Toast {
+                        kind: ToastKind::Success,
+                        message: format!("{what} saved."),
+                    });
                     match what {
                         "LLM endpoint" => self.llm_dirty = false,
                         "Embedding endpoint" => self.embed_dirty = false,
@@ -158,7 +161,8 @@ impl Panel {
                     }
                 }
                 Msg::SaveError(err) => {
-                    self.notice = Some((NoticeKind::Error, format!("Save failed: {err}")));
+                    self.saving = None;
+                    self.error = Some(format!("Save failed: {err}"));
                 }
             }
         }
@@ -261,6 +265,7 @@ impl Panel {
 
         ui.horizontal(|ui| {
             let save_enabled = self.llm_dirty
+                && self.saving.is_none()
                 && !self.llm_base_url.trim().is_empty()
                 && !self.llm_model.trim().is_empty();
             if ui
@@ -269,7 +274,9 @@ impl Panel {
             {
                 self.save_llm(ctx);
             }
-            if self.llm_dirty {
+            if self.saving == Some("LLM endpoint") {
+                style::loading_indicator(ui, ctx.t("Saving…"));
+            } else if self.llm_dirty {
                 ui.label(egui::RichText::new(ctx.t("unsaved changes")).italics());
             }
         });
@@ -305,14 +312,16 @@ impl Panel {
         ui.horizontal(|ui| {
             if ui
                 .add_enabled(
-                    self.contact_email_dirty,
+                    self.contact_email_dirty && self.saving.is_none(),
                     egui::Button::new(ctx.t("Save contact email")),
                 )
                 .clicked()
             {
                 self.save_contact_email(ctx);
             }
-            if self.contact_email_dirty {
+            if self.saving == Some("Contact email") {
+                style::loading_indicator(ui, ctx.t("Saving…"));
+            } else if self.contact_email_dirty {
                 ui.label(egui::RichText::new(ctx.t("unsaved changes")).italics());
             }
         });
@@ -348,12 +357,17 @@ impl Panel {
 
         ui.horizontal(|ui| {
             if ui
-                .add_enabled(self.s2_dirty, egui::Button::new(ctx.t("Save key")))
+                .add_enabled(
+                    self.s2_dirty && self.saving.is_none(),
+                    egui::Button::new(ctx.t("Save key")),
+                )
                 .clicked()
             {
                 self.save_semantic_scholar(ctx);
             }
-            if self.s2_dirty {
+            if self.saving == Some("Semantic Scholar key") {
+                style::loading_indicator(ui, ctx.t("Saving…"));
+            } else if self.s2_dirty {
                 ui.label(egui::RichText::new(ctx.t("unsaved changes")).italics());
             }
         });
@@ -397,6 +411,7 @@ impl Panel {
 
         ui.horizontal(|ui| {
             let save_enabled = self.embed_dirty
+                && self.saving.is_none()
                 && !self.embed_base_url.trim().is_empty()
                 && !self.embed_model.trim().is_empty();
             if ui
@@ -408,7 +423,9 @@ impl Panel {
             {
                 self.save_embedding_endpoint(ctx);
             }
-            if self.embed_dirty {
+            if self.saving == Some("Embedding endpoint") {
+                style::loading_indicator(ui, ctx.t("Saving…"));
+            } else if self.embed_dirty {
                 ui.label(egui::RichText::new(ctx.t("unsaved changes")).italics());
             }
         });
@@ -518,6 +535,7 @@ impl Panel {
         let Some(channel) = self.channel.as_ref() else {
             return;
         };
+        self.saving = Some("LLM endpoint");
         let tx = channel.tx.clone();
         let mut new_llm: LlmConfig = ctx.state.config.llm.clone();
         new_llm.base_url = self.llm_base_url.trim().trim_end_matches('/').to_string();
@@ -537,6 +555,7 @@ impl Panel {
         let Some(channel) = self.channel.as_ref() else {
             return;
         };
+        self.saving = Some("Contact email");
         let tx = channel.tx.clone();
         let email = {
             let trimmed = self.contact_email.trim();
@@ -556,6 +575,7 @@ impl Panel {
         let Some(channel) = self.channel.as_ref() else {
             return;
         };
+        self.saving = Some("Semantic Scholar key");
         let tx = channel.tx.clone();
         let key = {
             let trimmed = self.semantic_scholar_api_key.trim();
@@ -594,6 +614,7 @@ impl Panel {
         let Some(channel) = self.channel.as_ref() else {
             return;
         };
+        self.saving = Some("Embedding endpoint");
         let tx = channel.tx.clone();
         let new_embed = EmbeddingConfig {
             base_url: self.embed_base_url.trim().trim_end_matches('/').to_string(),
@@ -614,6 +635,7 @@ impl Panel {
         let Some(channel) = self.channel.as_ref() else {
             return;
         };
+        self.saving = Some("Embedding dimension");
         let tx = channel.tx.clone();
         let svc = ctx.state.settings_service.clone();
         ctx.handle.spawn(async move {

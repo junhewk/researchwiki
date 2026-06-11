@@ -258,7 +258,7 @@ impl Panel {
                 changed = true;
             }
             if self.loading {
-                ui.spinner();
+                style::loading_indicator(ui, ctx.t("Loading…"));
             }
         });
 

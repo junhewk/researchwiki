@@ -82,8 +82,16 @@ impl Panel {
         self.show_controls(ui, ctx);
         ui.add_space(8.0);
 
-        if let Some(err) = &self.error {
-            ui.colored_label(egui::Color32::RED, err);
+        if let Some(err) = self.error.clone() {
+            match style::error_notice(ui, &err, Some(ctx.t("Retry"))) {
+                style::NoticeAction::Retry => {
+                    self.error = None;
+                    self.fetch_list(ctx);
+                }
+                style::NoticeAction::Dismiss => self.error = None,
+                style::NoticeAction::None => {}
+            }
+            ui.add_space(4.0);
         }
 
         egui::SidePanel::left("wiki-list")
@@ -188,7 +196,7 @@ impl Panel {
                 self.fetch_list(ctx);
             }
             if self.loading {
-                ui.spinner();
+                style::loading_indicator(ui, ctx.t("Loading…"));
             }
         });
 

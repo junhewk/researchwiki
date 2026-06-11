@@ -171,8 +171,11 @@ impl FirstRunForm {
                     });
 
                 ui.add_space(8.0);
-                if let Some(err) = &self.error {
-                    ui.colored_label(egui::Color32::RED, err);
+                if let Some(err) = self.error.clone() {
+                    if style::error_notice(ui, &err, None) == style::NoticeAction::Dismiss {
+                        self.error = None;
+                    }
+                    ui.add_space(4.0);
                 }
 
                 ui.horizontal(|ui| {
@@ -326,8 +329,11 @@ impl ResearchSetupForm {
                     });
 
                 ui.add_space(8.0);
-                if let Some(err) = &self.error {
-                    ui.colored_label(egui::Color32::RED, err);
+                if let Some(err) = self.error.clone() {
+                    if style::error_notice(ui, &err, None) == style::NoticeAction::Dismiss {
+                        self.error = None;
+                    }
+                    ui.add_space(4.0);
                 }
 
                 ui.horizontal(|ui| {

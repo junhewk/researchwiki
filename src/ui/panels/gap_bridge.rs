@@ -112,7 +112,7 @@ impl Panel {
                     self.run_gap_finder(ctx, active);
                 }
                 if self.busy {
-                    ui.spinner();
+                    style::loading_indicator(ui, ctx.t("Loading…"));
                 }
             });
 

@@ -15,8 +15,9 @@ use crate::{
         },
         settings::{SchedulerSettings, SchedulerStatusResponse, SettingsUpdate},
     },
+    runtime::UiEvent,
     services::pipeline::{GATHER_SOURCE_IDS, source_label},
-    ui::style,
+    ui::{style, toast::ToastKind},
 };
 
 use super::{MsgChannel, PanelCtx};
@@ -93,19 +94,9 @@ pub struct Panel {
     last_refresh: Option<Instant>,
     last_ops_refresh: Option<Instant>,
     last_scheduler_refresh: Option<Instant>,
-    notice: Option<(NoticeKind, String)>,
-}
-
-#[derive(Clone, Copy)]
-enum NoticeKind {
-    Success,
-    Error,
-}
-
-impl Default for NoticeKind {
-    fn default() -> Self {
-        Self::Success
-    }
+    /// Persistent error from the last failed operation. Successes go straight
+    /// to the app toast stack instead.
+    error: Option<String>,
 }
 
 impl Panel {
@@ -113,7 +104,7 @@ impl Panel {
         if self.channel.is_none() {
             self.channel = Some(MsgChannel::default());
         }
-        self.drain();
+        self.drain(ctx);
         if !self.initialized {
             self.initialized = true;
             self.test_source = "arxiv".to_string();
@@ -153,7 +144,7 @@ impl Panel {
             .show(ui, |ui| {
                 style::section_heading(ui, ctx.t("Run gather"));
                 self.show_controls(ui, ctx);
-                self.show_notice(ui);
+                self.show_error(ui, ctx);
                 style::section_break(ui);
                 self.show_active_runs(ui, ctx);
                 style::section_break(ui);
@@ -201,13 +192,17 @@ impl Panel {
         }
     }
 
-    fn drain(&mut self) {
+    fn drain(&mut self, ctx: &PanelCtx<'_>) {
         let mut drained = Vec::new();
         if let Some(channel) = self.channel.as_mut() {
             while let Ok(msg) = channel.rx.try_recv() {
                 drained.push(msg);
             }
         }
+
+        let toast = |kind: ToastKind, message: String| {
+            let _ = ctx.ui_tx.send(UiEvent::Toast { kind, message });
+        };
 
         for msg in drained {
             match msg {
@@ -217,7 +212,9 @@ impl Panel {
                     if had_active_jobs && !self.has_active_jobs() {
                         self.pending_ops_refresh = true;
                     }
-                    self.detect_scheduler_run();
+                    if let Some(message) = self.detect_scheduler_run() {
+                        toast(ToastKind::Success, message);
+                    }
                     self.loading = false;
                 }
                 Msg::JobDetail(detail) => {
@@ -227,17 +224,16 @@ impl Panel {
                 }
                 Msg::JobStarted(run) => {
                     self.action_in_flight = false;
-                    self.notice = Some((
-                        NoticeKind::Success,
+                    toast(
+                        ToastKind::Success,
                         format!("Started {} gather ({})", label_for(&run.source), run.run_id),
-                    ));
+                    );
                     upsert_job(&mut self.jobs, run);
                     self.last_refresh = None;
                 }
                 Msg::JobCancelled(run) => {
                     self.action_in_flight = false;
-                    self.notice =
-                        Some((NoticeKind::Success, format!("Cancelled run {}", run.run_id)));
+                    toast(ToastKind::Success, format!("Cancelled run {}", run.run_id));
                     upsert_job(&mut self.jobs, run);
                     self.last_refresh = None;
                 }
@@ -250,7 +246,7 @@ impl Panel {
                 }
                 Msg::OperationNotice(message) => {
                     self.action_in_flight = false;
-                    self.notice = Some((NoticeKind::Success, message));
+                    toast(ToastKind::Info, message);
                 }
                 Msg::SchedulerLoaded(settings, status) => {
                     self.scheduler_settings = Some(settings);
@@ -262,10 +258,10 @@ impl Panel {
                     self.scheduler_status = Some(status);
                     self.scheduler_test = Some(test);
                     self.action_in_flight = false;
-                    self.notice = Some((
-                        NoticeKind::Success,
+                    toast(
+                        ToastKind::Info,
                         "Scheduler test armed for the next minute (local time)".to_string(),
-                    ));
+                    );
                 }
                 Msg::SchedulerRestored(settings, status) => {
                     let message = self
@@ -284,14 +280,14 @@ impl Panel {
                     self.scheduler_status = Some(status);
                     self.scheduler_test = None;
                     self.action_in_flight = false;
-                    self.notice = Some((NoticeKind::Success, message));
+                    toast(ToastKind::Success, message);
                 }
                 Msg::Error(err) => {
                     self.loading = false;
                     self.ops_loading = false;
                     self.scheduler_loading = false;
                     self.action_in_flight = false;
-                    self.notice = Some((NoticeKind::Error, err));
+                    self.error = Some(err);
                 }
             }
         }
@@ -410,7 +406,7 @@ impl Panel {
             }
 
             if self.ops_loading {
-                ui.spinner();
+                style::loading_indicator(ui, ctx.t("Loading…"));
             }
         });
 
@@ -477,7 +473,7 @@ impl Panel {
             }
 
             if self.scheduler_loading {
-                ui.spinner();
+                style::loading_indicator(ui, ctx.t("Loading…"));
             }
         });
 
@@ -503,7 +499,7 @@ impl Panel {
             }
 
             if self.loading {
-                ui.spinner();
+                style::loading_indicator(ui, ctx.t("Loading…"));
             }
         });
 
@@ -534,11 +530,20 @@ impl Panel {
         });
     }
 
-    fn show_notice(&self, ui: &mut egui::Ui) {
-        let Some((kind, msg)) = &self.notice else {
+    fn show_error(&mut self, ui: &mut egui::Ui, ctx: &PanelCtx<'_>) {
+        let Some(err) = self.error.clone() else {
             return;
         };
-        style::status_notice(ui, matches!(kind, NoticeKind::Success), msg);
+        match style::error_notice(ui, &err, Some(ctx.t("Refresh"))) {
+            style::NoticeAction::Retry => {
+                self.error = None;
+                self.refresh(ctx);
+                self.refresh_operations(ctx);
+                self.refresh_scheduler(ctx);
+            }
+            style::NoticeAction::Dismiss => self.error = None,
+            style::NoticeAction::None => {}
+        }
     }
 
     fn show_kg_stats(&self, ui: &mut egui::Ui) {
@@ -1299,27 +1304,25 @@ impl Panel {
             || self.scheduler_test.is_some()
     }
 
-    fn detect_scheduler_run(&mut self) {
-        let Some(test) = self.scheduler_test.as_mut() else {
-            return;
-        };
+    /// Returns a user-facing message when the armed scheduler test's run shows
+    /// up in the job list.
+    fn detect_scheduler_run(&mut self) -> Option<String> {
+        let test = self.scheduler_test.as_mut()?;
         if test.detected_run_id.is_some() {
-            return;
+            return None;
         }
 
-        let detected = self
+        let run_id = self
             .jobs
             .iter()
             .find(|job| job.source == test.source && !test.known_run_ids.contains(&job.run_id))
-            .map(|job| job.run_id.clone());
+            .map(|job| job.run_id.clone())?;
 
-        if let Some(run_id) = detected {
-            test.detected_run_id = Some(run_id.clone());
-            self.notice = Some((
-                NoticeKind::Success,
-                format!("Scheduler fired {} ({run_id})", label_for(&test.source)),
-            ));
-        }
+        test.detected_run_id = Some(run_id.clone());
+        Some(format!(
+            "Scheduler fired {} ({run_id})",
+            label_for(&test.source)
+        ))
     }
 
     fn running_sources(&self) -> HashSet<String> {
