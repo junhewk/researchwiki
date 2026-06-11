@@ -30,15 +30,33 @@ pub enum Tab {
 }
 
 impl Tab {
-    // End-user flow: overview first, then set up → gather → read results →
-    // analyze, with Prompts/Traces/Settings (power-user + config) at the end.
-    pub const ALL: [Tab; 10] = [
+    /// Day-to-day reading flow: overview → gather → results.
+    pub const MAIN: [Tab; 5] = [
         Tab::Dashboard,
-        Tab::Workspace,
         Tab::Gather,
         Tab::Articles,
         Tab::KnowledgeGraph,
         Tab::Wiki,
+    ];
+
+    /// Configuration and power-user tools.
+    pub const CONFIG: [Tab; 5] = [
+        Tab::Workspace,
+        Tab::GapBridge,
+        Tab::Prompts,
+        Tab::Traces,
+        Tab::Settings,
+    ];
+
+    /// `MAIN` then `CONFIG`, in display order. Index n binds to Ctrl+(n+1),
+    /// with Ctrl+0 for the tenth tab.
+    pub const ALL: [Tab; 10] = [
+        Tab::Dashboard,
+        Tab::Gather,
+        Tab::Articles,
+        Tab::KnowledgeGraph,
+        Tab::Wiki,
+        Tab::Workspace,
         Tab::GapBridge,
         Tab::Prompts,
         Tab::Traces,

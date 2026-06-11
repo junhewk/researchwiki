@@ -505,7 +505,7 @@ impl DesktopApp {
         let mut quit = false;
         let mut cancel = false;
 
-        egui::Modal::new(egui::Id::new("close_confirm_modal")).show(ctx, |ui| {
+        let modal = egui::Modal::new(egui::Id::new("close_confirm_modal")).show(ctx, |ui| {
             ui.set_width(360.0);
             style::section_heading(ui, i18n::t(lang, "Close ResearchWiki?"));
             style::body_label(
@@ -530,6 +530,8 @@ impl DesktopApp {
                 }
             });
         });
+        // Esc / backdrop click = Cancel.
+        cancel |= modal.should_close();
 
         if minimize {
             if self.remember_close {
@@ -630,6 +632,34 @@ impl DesktopApp {
         self.status = Some(status);
     }
 
+    /// Ctrl+1..9 / Ctrl+0 jump to the tab at that position in [`Tab::ALL`].
+    /// Skipped while a text field has focus so typing digits stays typing.
+    fn handle_shortcuts(&mut self, ctx: &egui::Context) {
+        if ctx.wants_keyboard_input() {
+            return;
+        }
+        use egui::{Key, Modifiers};
+        const KEYS: [Key; 10] = [
+            Key::Num1,
+            Key::Num2,
+            Key::Num3,
+            Key::Num4,
+            Key::Num5,
+            Key::Num6,
+            Key::Num7,
+            Key::Num8,
+            Key::Num9,
+            Key::Num0,
+        ];
+        ctx.input_mut(|input| {
+            for (key, tab) in KEYS.iter().zip(Tab::ALL) {
+                if input.consume_key(Modifiers::COMMAND, *key) {
+                    self.persistent.active_tab = tab;
+                }
+            }
+        });
+    }
+
     fn show_cadence_modal(&mut self, ctx: &egui::Context) {
         let Some(due) = self.cadence_due.as_ref() else {
             return;
@@ -647,7 +677,7 @@ impl DesktopApp {
         let mut gather = false;
         let mut dismiss = false;
 
-        egui::Modal::new(egui::Id::new("cadence_due_modal")).show(ctx, |ui| {
+        let modal = egui::Modal::new(egui::Id::new("cadence_due_modal")).show(ctx, |ui| {
             ui.set_width(380.0);
             style::section_heading(ui, i18n::t(lang, "Gather due"));
             style::body_label(
@@ -665,6 +695,8 @@ impl DesktopApp {
                 }
             });
         });
+        // Esc / backdrop click = Not now.
+        dismiss |= modal.should_close();
 
         if gather {
             self.cadence_due = None;
@@ -736,6 +768,7 @@ impl eframe::App for DesktopApp {
             self.show_cadence_modal(ctx);
         }
 
+        self.handle_shortcuts(ctx);
         self.maybe_refresh_workspaces();
 
         let mut pending_switch: Option<i64> = None;
@@ -746,37 +779,62 @@ impl eframe::App for DesktopApp {
             .collect();
         let active_ws = self.persistent.active_workspace_id;
 
-        egui::TopBottomPanel::top("tabs").show(ctx, |ui| {
-            ui.horizontal(|ui| {
-                ui.label(i18n::t(self.language, "Workspace:"));
-                let mut selected = active_ws;
-                let current = workspace_items
-                    .iter()
-                    .find(|(id, _)| *id == selected)
-                    .map(|(_, name)| name.clone())
-                    .unwrap_or_else(|| "—".to_string());
-                egui::ComboBox::from_id_salt("workspace_switcher")
-                    .selected_text(current)
-                    .show_ui(ui, |ui| {
-                        for (id, name) in &workspace_items {
-                            ui.selectable_value(&mut selected, *id, name);
-                        }
-                    });
-                if selected != active_ws {
-                    pending_switch = Some(selected);
-                }
-            });
-            ui.separator();
-            ui.horizontal_wrapped(|ui| {
-                for tab in Tab::ALL {
-                    ui.selectable_value(
-                        &mut self.persistent.active_tab,
-                        tab,
-                        format!("{}  {}", tab.icon(), tab.label_for(self.language)),
+        egui::TopBottomPanel::top("tabs")
+            .frame(
+                egui::Frame::new()
+                    .fill(style::color::SURFACE)
+                    .inner_margin(egui::Margin::symmetric(12, 8)),
+            )
+            .show(ctx, |ui| {
+                ui.horizontal_wrapped(|ui| {
+                    ui.label(
+                        egui::RichText::new(style::icon::FOLDERS)
+                            .color(style::color::MUTED),
                     );
-                }
+                    let mut selected = active_ws;
+                    let current = workspace_items
+                        .iter()
+                        .find(|(id, _)| *id == selected)
+                        .map(|(_, name)| name.clone())
+                        .unwrap_or_else(|| "—".to_string());
+                    egui::ComboBox::from_id_salt("workspace_switcher")
+                        .selected_text(current)
+                        .show_ui(ui, |ui| {
+                            for (id, name) in &workspace_items {
+                                ui.selectable_value(&mut selected, *id, name);
+                            }
+                        });
+                    if selected != active_ws {
+                        pending_switch = Some(selected);
+                    }
+
+                    ui.separator();
+                    for (group_idx, group) in [Tab::MAIN, Tab::CONFIG].into_iter().enumerate() {
+                        if group_idx > 0 {
+                            ui.separator();
+                        }
+                        for tab in group {
+                            let selected_tab = self.persistent.active_tab == tab;
+                            let shortcut = Tab::ALL.iter().position(|t| *t == tab).map(|i| {
+                                if i == 9 { 0 } else { i + 1 }
+                            });
+                            let response = style::nav_tab(
+                                ui,
+                                selected_tab,
+                                tab.icon(),
+                                tab.label_for(self.language),
+                            );
+                            let response = match shortcut {
+                                Some(n) => response.on_hover_text(format!("Ctrl+{n}")),
+                                None => response,
+                            };
+                            if response.clicked() {
+                                self.persistent.active_tab = tab;
+                            }
+                        }
+                    }
+                });
             });
-        });
 
         if let Some(new_id) = pending_switch {
             self.build_state_for_workspace(new_id);
