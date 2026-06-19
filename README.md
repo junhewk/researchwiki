@@ -64,6 +64,9 @@ On Windows, unzip `ResearchWiki-windows.zip` and run `ResearchWiki.exe` from the
   article, so evaluation, embeddings, and the knowledge graph work from the whole paper
   instead of only the abstract. Downloaded PDFs are kept on disk and a **Re‑extract PDF**
   button in the article detail retries text extraction (and refreshes embeddings/KG).
+- **Abstracts are preserved separately.** Source abstracts now live in their own
+  `abstract_text` field while `full_text` remains reserved for extracted PDF/XML/body
+  content. Older abstract-only rows are migrated automatically.
 - **Stronger PDF fetching.** Acquisition now falls through arXiv → Unpaywall → publisher
   URL patterns (incl. Frontiers, PLOS, eLife) → DOI content negotiation → the landing
   page's `citation_pdf_url` meta tag.

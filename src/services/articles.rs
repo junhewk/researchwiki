@@ -18,7 +18,7 @@ const ARTICLE_COLUMNS: &str = r#"
     ai_tech, clinical_domain, ethics_framework, primary_issue, key_stakeholders,
     practical_impl, secondary_issues, key_argument, main_findings, normative_claims,
     limitations, theoretical_strengths, theoretical_weaknesses, empirical_strengths,
-    empirical_weaknesses, byline_summary, why_it_matters, evaluated_at,
+    empirical_weaknesses, byline_summary, why_it_matters, abstract_text, evaluated_at,
     content_type, pdf_path, pdf_sha256, pdf_bytes, pdf_source_url, pdf_fetch_method,
     text_extraction_status, text_extracted_at, text_extraction_error,
     reg_date, created_at, updated_at
@@ -34,6 +34,7 @@ pub struct ArticleProcessingContext {
     pub uid: String,
     pub category: Option<String>,
     pub title: Option<String>,
+    pub abstract_text: Option<String>,
     pub byline_summary: Option<String>,
     pub full_text: Option<String>,
 }
@@ -174,7 +175,7 @@ impl ArticleService {
         task::spawn_blocking(move || {
             let conn = crate::db::open_connection(&*database_path)?;
             let mut stmt = conn.prepare(
-                "SELECT uid, category, title, byline_summary, full_text
+                "SELECT uid, category, title, abstract_text, byline_summary, full_text
                  FROM haie_rev
                  WHERE uid = ?1",
             )?;
@@ -185,8 +186,9 @@ impl ArticleService {
                         uid: row.get(0)?,
                         category: row.get(1)?,
                         title: row.get(2)?,
-                        byline_summary: row.get(3)?,
-                        full_text: row.get(4)?,
+                        abstract_text: row.get(3)?,
+                        byline_summary: row.get(4)?,
+                        full_text: row.get(5)?,
                     })
                 })
                 .map_err(|error| match error {
@@ -444,6 +446,7 @@ fn build_article_update(
             | "theoretical_weaknesses"
             | "empirical_strengths"
             | "empirical_weaknesses"
+            | "abstract_text"
             | "byline_summary"
             | "why_it_matters" => key.as_str(),
             _ => continue,
@@ -503,10 +506,13 @@ fn article_where_clause(
     }
     if let Some(search) = query.search.as_ref().filter(|value| !value.is_empty()) {
         conditions.push(
-            "(LOWER(COALESCE(title, '')) LIKE ? OR LOWER(COALESCE(key_argument, '')) LIKE ?)"
+            "(LOWER(COALESCE(title, '')) LIKE ?
+              OR LOWER(COALESCE(abstract_text, '')) LIKE ?
+              OR LOWER(COALESCE(key_argument, '')) LIKE ?)"
                 .to_string(),
         );
         let pattern = format!("%{}%", search.to_lowercase());
+        params.push(Value::Text(pattern.clone()));
         params.push(Value::Text(pattern.clone()));
         params.push(Value::Text(pattern));
     }
@@ -545,18 +551,19 @@ fn map_article_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ArticleResponse>
         empirical_weaknesses: row.get(22)?,
         byline_summary: row.get(23)?,
         why_it_matters: row.get(24)?,
-        evaluated_at: row.get(25)?,
-        content_type: row.get(26)?,
-        pdf_path: row.get(27)?,
-        pdf_sha256: row.get(28)?,
-        pdf_bytes: row.get(29)?,
-        pdf_source_url: row.get(30)?,
-        pdf_fetch_method: row.get(31)?,
-        text_extraction_status: row.get(32)?,
-        text_extracted_at: row.get(33)?,
-        text_extraction_error: row.get(34)?,
-        reg_date: row.get(35)?,
-        created_at: row.get(36)?,
-        updated_at: row.get(37)?,
+        abstract_text: row.get(25)?,
+        evaluated_at: row.get(26)?,
+        content_type: row.get(27)?,
+        pdf_path: row.get(28)?,
+        pdf_sha256: row.get(29)?,
+        pdf_bytes: row.get(30)?,
+        pdf_source_url: row.get(31)?,
+        pdf_fetch_method: row.get(32)?,
+        text_extraction_status: row.get(33)?,
+        text_extracted_at: row.get(34)?,
+        text_extraction_error: row.get(35)?,
+        reg_date: row.get(36)?,
+        created_at: row.get(37)?,
+        updated_at: row.get(38)?,
     })
 }

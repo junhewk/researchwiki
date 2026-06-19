@@ -2694,10 +2694,16 @@ fn save_article_sync(
         .and_then(|content| content.full_text.as_deref())
         .map(str::trim)
         .filter(|value| !value.is_empty());
+    let abstract_text = candidate
+        .summary
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string);
     let has_extracted_text = fetched_text.is_some();
     let full_text = fetched_text
         .map(str::to_string)
-        .or_else(|| candidate.summary.clone());
+        .or_else(|| abstract_text.clone());
     // "pdf_stored" survives even with abstract-only text: it marks the row as
     // having a stored PDF that still awaits extraction.
     let content_type = fetched
@@ -2757,6 +2763,7 @@ fn save_article_sync(
                 pub_date.as_deref(),
                 journal.as_deref(),
                 candidate.doi.as_deref(),
+                abstract_text.as_deref(),
                 get_str("ai_tech").as_deref(),
                 get_str("clinical_domain").as_deref(),
                 get_str("ethics_framework").as_deref(),
@@ -2809,7 +2816,7 @@ fn save_article_sync(
     let changed = conn.execute(
         "INSERT OR IGNORE INTO haie_rev (
             uid, url, category, reg_date, title, first_author, authors, pub_date, journal, doi,
-            ai_tech, clinical_domain, ethics_framework, primary_issue, key_stakeholders,
+            abstract_text, ai_tech, clinical_domain, ethics_framework, primary_issue, key_stakeholders,
             practical_impl, secondary_issues, key_argument, main_findings, normative_claims,
             limitations, theoretical_strengths, theoretical_weaknesses,
             empirical_strengths, empirical_weaknesses,
@@ -2823,11 +2830,12 @@ fn save_article_sync(
             ?11, ?12, ?13, ?14, ?15,
             ?16, ?17, ?18, ?19, ?20,
             ?21, ?22, ?23, ?24, ?25,
-            ?26, ?27,
-            ?28, ?29, ?30,
-            ?31, ?32, ?33, ?34,
-            ?35, ?36, ?37,
-            ?38, ?39
+            ?26,
+            ?27, ?28,
+            ?29, ?30, ?31,
+            ?32, ?33, ?34, ?35,
+            ?36, ?37, ?38,
+            ?39, ?40
         )",
         params![
             candidate_uid,
@@ -2840,6 +2848,7 @@ fn save_article_sync(
             pub_date,
             journal,
             candidate.doi,
+            abstract_text.clone(),
             get_str("ai_tech"),
             get_str("clinical_domain"),
             get_str("ethics_framework"),
@@ -2887,6 +2896,7 @@ fn save_article_sync(
                 pub_date.as_deref(),
                 journal.as_deref(),
                 candidate.doi.as_deref(),
+                abstract_text.as_deref(),
                 get_str("ai_tech").as_deref(),
                 get_str("clinical_domain").as_deref(),
                 get_str("ethics_framework").as_deref(),
@@ -3004,6 +3014,7 @@ fn update_existing_article_sync(
     pub_date: Option<&str>,
     journal: Option<&str>,
     doi: Option<&str>,
+    abstract_text: Option<&str>,
     ai_tech: Option<&str>,
     clinical_domain: Option<&str>,
     ethics_framework: Option<&str>,
@@ -3042,51 +3053,52 @@ fn update_existing_article_sync(
              pub_date = COALESCE(?7, pub_date),
              journal = COALESCE(?8, journal),
              doi = COALESCE(?9, doi),
-             ai_tech = COALESCE(?10, ai_tech),
-             clinical_domain = COALESCE(?11, clinical_domain),
-             ethics_framework = COALESCE(?12, ethics_framework),
-             primary_issue = COALESCE(?13, primary_issue),
-             key_stakeholders = COALESCE(?14, key_stakeholders),
-             practical_impl = COALESCE(?15, practical_impl),
-             secondary_issues = COALESCE(?16, secondary_issues),
-             key_argument = COALESCE(?17, key_argument),
-             main_findings = COALESCE(?18, main_findings),
-             normative_claims = COALESCE(?19, normative_claims),
-             limitations = COALESCE(?20, limitations),
-             theoretical_strengths = COALESCE(?21, theoretical_strengths),
-             theoretical_weaknesses = COALESCE(?22, theoretical_weaknesses),
-             empirical_strengths = COALESCE(?23, empirical_strengths),
-             empirical_weaknesses = COALESCE(?24, empirical_weaknesses),
-             byline_summary = COALESCE(?25, byline_summary),
-             why_it_matters = COALESCE(?26, why_it_matters),
+             abstract_text = COALESCE(?10, abstract_text),
+             ai_tech = COALESCE(?11, ai_tech),
+             clinical_domain = COALESCE(?12, clinical_domain),
+             ethics_framework = COALESCE(?13, ethics_framework),
+             primary_issue = COALESCE(?14, primary_issue),
+             key_stakeholders = COALESCE(?15, key_stakeholders),
+             practical_impl = COALESCE(?16, practical_impl),
+             secondary_issues = COALESCE(?17, secondary_issues),
+             key_argument = COALESCE(?18, key_argument),
+             main_findings = COALESCE(?19, main_findings),
+             normative_claims = COALESCE(?20, normative_claims),
+             limitations = COALESCE(?21, limitations),
+             theoretical_strengths = COALESCE(?22, theoretical_strengths),
+             theoretical_weaknesses = COALESCE(?23, theoretical_weaknesses),
+             empirical_strengths = COALESCE(?24, empirical_strengths),
+             empirical_weaknesses = COALESCE(?25, empirical_weaknesses),
+             byline_summary = COALESCE(?26, byline_summary),
+             why_it_matters = COALESCE(?27, why_it_matters),
              full_text = CASE
-                 WHEN ?27 IS NULL THEN full_text
-                 WHEN COALESCE(?28, 'abstract_only') != 'abstract_only' THEN ?27
-                 WHEN full_text IS NULL OR TRIM(full_text) = '' THEN ?27
+                 WHEN ?28 IS NULL THEN full_text
+                 WHEN COALESCE(?29, 'abstract_only') != 'abstract_only' THEN ?28
+                 WHEN full_text IS NULL OR TRIM(full_text) = '' THEN ?28
                  ELSE full_text
              END,
              content_type = CASE
-                 WHEN ?27 IS NULL THEN content_type
-                 WHEN COALESCE(?28, 'abstract_only') != 'abstract_only' THEN ?28
-                 WHEN full_text IS NULL OR TRIM(full_text) = '' THEN COALESCE(?28, 'abstract_only')
+                 WHEN ?28 IS NULL THEN content_type
+                 WHEN COALESCE(?29, 'abstract_only') != 'abstract_only' THEN ?29
+                 WHEN full_text IS NULL OR TRIM(full_text) = '' THEN COALESCE(?29, 'abstract_only')
                  ELSE content_type
              END,
-             pdf_path = COALESCE(?29, pdf_path),
-             pdf_sha256 = COALESCE(?30, pdf_sha256),
-             pdf_bytes = COALESCE(?31, pdf_bytes),
-             pdf_source_url = COALESCE(?32, pdf_source_url),
-             pdf_fetch_method = COALESCE(?33, pdf_fetch_method),
-             text_extraction_status = COALESCE(?34, text_extraction_status),
+             pdf_path = COALESCE(?30, pdf_path),
+             pdf_sha256 = COALESCE(?31, pdf_sha256),
+             pdf_bytes = COALESCE(?32, pdf_bytes),
+             pdf_source_url = COALESCE(?33, pdf_source_url),
+             pdf_fetch_method = COALESCE(?34, pdf_fetch_method),
+             text_extraction_status = COALESCE(?35, text_extraction_status),
              text_extracted_at = CASE
-                 WHEN ?34 = 'extracted' THEN datetime('now')
+                 WHEN ?35 = 'extracted' THEN datetime('now')
                  ELSE text_extracted_at
              END,
              text_extraction_error = CASE
-                 WHEN ?34 = 'extracted' THEN NULL
-                 WHEN ?35 IS NULL THEN text_extraction_error
-                 ELSE ?35
+                 WHEN ?35 = 'extracted' THEN NULL
+                 WHEN ?36 IS NULL THEN text_extraction_error
+                 ELSE ?36
              END,
-             evaluated_at = CASE WHEN ?36 = 1 THEN datetime('now') ELSE evaluated_at END,
+             evaluated_at = CASE WHEN ?37 = 1 THEN datetime('now') ELSE evaluated_at END,
              updated_at = datetime('now')
          WHERE uid = ?1",
         params![
@@ -3099,6 +3111,7 @@ fn update_existing_article_sync(
             pub_date,
             journal,
             doi,
+            abstract_text,
             ai_tech,
             clinical_domain,
             ethics_framework,
@@ -4260,7 +4273,8 @@ mod tests {
     fn fetched_pdf_payload_saves_file_metadata_and_extracted_text_state() {
         let conn = Connection::open_in_memory().unwrap();
         create_save_test_table(&conn);
-        let candidate = test_candidate("pdf");
+        let mut candidate = test_candidate("pdf");
+        candidate.summary = Some("Source abstract text".to_string());
         let fetched = FetchedArticleContent {
             full_text: Some("Extracted PDF body text".to_string()),
             content_type: Some("pdf".to_string()),
@@ -4280,6 +4294,7 @@ mod tests {
             Option<String>,
             Option<String>,
             Option<String>,
+            Option<String>,
             Option<i64>,
             Option<String>,
             Option<String>,
@@ -4287,7 +4302,7 @@ mod tests {
             Option<String>,
         ) = conn
             .query_row(
-                "SELECT full_text, content_type, pdf_sha256, pdf_bytes, pdf_source_url,
+                "SELECT full_text, content_type, abstract_text, pdf_sha256, pdf_bytes, pdf_source_url,
                         pdf_fetch_method, text_extraction_status, text_extracted_at
                  FROM haie_rev WHERE uid = ?1",
                 [candidate.uid()],
@@ -4301,6 +4316,7 @@ mod tests {
                         row.get(5)?,
                         row.get(6)?,
                         row.get(7)?,
+                        row.get(8)?,
                     ))
                 },
             )
@@ -4308,12 +4324,13 @@ mod tests {
 
         assert_eq!(row.0.as_deref(), Some("Extracted PDF body text"));
         assert_eq!(row.1.as_deref(), Some("pdf"));
-        assert_eq!(row.2.as_deref(), Some("abcdef123456"));
-        assert_eq!(row.3, Some(12345));
-        assert_eq!(row.4.as_deref(), Some("https://example.com/test.pdf"));
-        assert_eq!(row.5.as_deref(), Some("publisher_pdf"));
-        assert_eq!(row.6.as_deref(), Some("extracted"));
-        assert!(row.7.is_some(), "extracted PDFs get a timestamp");
+        assert_eq!(row.2.as_deref(), Some("Source abstract text"));
+        assert_eq!(row.3.as_deref(), Some("abcdef123456"));
+        assert_eq!(row.4, Some(12345));
+        assert_eq!(row.5.as_deref(), Some("https://example.com/test.pdf"));
+        assert_eq!(row.6.as_deref(), Some("publisher_pdf"));
+        assert_eq!(row.7.as_deref(), Some("extracted"));
+        assert!(row.8.is_some(), "extracted PDFs get a timestamp");
     }
 
     #[test]
@@ -4367,6 +4384,7 @@ mod tests {
                 pub_date TEXT,
                 journal TEXT,
                 doi TEXT,
+                abstract_text TEXT,
                 ai_tech TEXT,
                 clinical_domain TEXT,
                 ethics_framework TEXT,

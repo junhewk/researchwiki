@@ -163,6 +163,7 @@ fn initialize_sync(database_path: &std::path::Path, embedding_dimensions: u32) -
             pub_date TEXT,
             journal TEXT,
             doi TEXT,
+            abstract_text TEXT,
             ai_tech TEXT,
             clinical_domain TEXT,
             ethics_framework TEXT,
@@ -409,6 +410,7 @@ fn initialize_sync(database_path: &std::path::Path, embedding_dimensions: u32) -
     ensure_column(&conn, "prompt_versions", "description", "TEXT")?;
     ensure_column(&conn, "prompt_versions", "changed_by", "TEXT")?;
     ensure_column(&conn, "haie_rev", "doi", "TEXT")?;
+    ensure_column(&conn, "haie_rev", "abstract_text", "TEXT")?;
     ensure_column(&conn, "haie_rev", "full_text", "TEXT")?;
     ensure_column(&conn, "haie_rev", "content_type", "TEXT")?;
     ensure_column(&conn, "haie_rev", "evaluated_at", "TEXT")?;
@@ -451,7 +453,7 @@ fn initialize_sync(database_path: &std::path::Path, embedding_dimensions: u32) -
 /// from a pre-versioning build — up to v1. Future *structural* changes that
 /// can't be expressed idempotently get their own ordered arm below and bump
 /// this constant.
-const CURRENT_SCHEMA_VERSION: i64 = 3;
+const CURRENT_SCHEMA_VERSION: i64 = 4;
 
 /// The article score columns removed in schema v2. Their values were only ever
 /// displayed and filtered on, never consumed by the pipeline.
@@ -503,6 +505,9 @@ fn apply_schema_migrations(conn: &Connection) -> Result<()> {
             // Relationship-type canonicalization: lowercase/trim every edge and
             // flip passive-voice types, merging rows that collide.
             3 => migrate_canonicalize_relationships(conn)?,
+            // Split source abstracts from extracted body text. Legacy rows used
+            // full_text for abstracts when no full article text was available.
+            4 => migrate_abstract_text(conn)?,
             other => anyhow::bail!("no migration defined for schema version {other}"),
         }
         version = next;
@@ -510,6 +515,28 @@ fn apply_schema_migrations(conn: &Connection) -> Result<()> {
     // user_version takes a literal integer (no bind parameters); the value is
     // ours, not user input.
     conn.execute_batch(&format!("PRAGMA user_version = {CURRENT_SCHEMA_VERSION};"))?;
+    Ok(())
+}
+
+fn migrate_abstract_text(conn: &Connection) -> Result<()> {
+    if !table_exists(conn, "haie_rev")?
+        || !column_exists(conn, "haie_rev", "abstract_text")?
+        || !column_exists(conn, "haie_rev", "full_text")?
+        || !column_exists(conn, "haie_rev", "content_type")?
+    {
+        return Ok(());
+    }
+
+    conn.execute(
+        "UPDATE haie_rev
+         SET abstract_text = full_text
+         WHERE abstract_text IS NULL
+           AND content_type = 'abstract_only'
+           AND full_text IS NOT NULL
+           AND TRIM(full_text) != ''",
+        [],
+    )?;
+
     Ok(())
 }
 
@@ -921,6 +948,47 @@ mod tests {
         assert_eq!(weight, 5.0);
         assert_eq!(articles, "[\"a:1\",\"b:2\"]");
         assert_eq!(description, "a longer description wins");
+    }
+
+    #[test]
+    fn migration_v4_backfills_legacy_abstract_text() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "
+            CREATE TABLE haie_rev (
+                uid TEXT PRIMARY KEY,
+                full_text TEXT,
+                content_type TEXT,
+                abstract_text TEXT
+            );
+            INSERT INTO haie_rev (uid, full_text, content_type)
+                VALUES ('abstract-row', 'Stored abstract', 'abstract_only');
+            INSERT INTO haie_rev (uid, full_text, content_type)
+                VALUES ('pdf-row', 'PDF body', 'pdf');
+            PRAGMA user_version = 3;
+            ",
+        )
+        .unwrap();
+
+        apply_schema_migrations(&conn).unwrap();
+
+        let abstract_text: Option<String> = conn
+            .query_row(
+                "SELECT abstract_text FROM haie_rev WHERE uid = 'abstract-row'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(abstract_text.as_deref(), Some("Stored abstract"));
+
+        let pdf_abstract: Option<String> = conn
+            .query_row(
+                "SELECT abstract_text FROM haie_rev WHERE uid = 'pdf-row'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(pdf_abstract, None);
     }
 
     /// Fresh databases are created without score columns; the v2 arm must be a

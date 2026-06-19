@@ -28,6 +28,7 @@ pub struct ArticleResponse {
     pub authors: Option<String>,
     pub pub_date: Option<String>,
     pub journal: Option<String>,
+    pub abstract_text: Option<String>,
     pub ai_tech: Option<String>,
     pub clinical_domain: Option<String>,
     pub ethics_framework: Option<String>,

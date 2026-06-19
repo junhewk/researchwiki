@@ -474,8 +474,9 @@ impl Panel {
                                 detail_kv(ui, "Category", article.category.as_deref());
                                 detail_kv(ui, "Evaluated", article.evaluated_at.as_deref());
                                 detail_kv(ui, "Content", article.content_type.as_deref());
-                            });
+                        });
                         ui.add_space(8.0);
+                        detail_block(ui, "Abstract", article.abstract_text.as_deref());
                         detail_block(ui, "Byline summary", article.byline_summary.as_deref());
                         detail_block(ui, "Why it matters", article.why_it_matters.as_deref());
                         detail_block(ui, "Key argument", article.key_argument.as_deref());

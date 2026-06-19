@@ -1299,6 +1299,7 @@ async fn article_detail_page(
             ),
         ]),
         field_list(&[
+            ("Abstract", article.abstract_text.as_deref()),
             ("Why it matters", article.why_it_matters.as_deref()),
             ("Key argument", article.key_argument.as_deref()),
             ("Main findings", article.main_findings.as_deref()),
