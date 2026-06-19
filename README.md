@@ -73,8 +73,7 @@ On Windows, unzip `ResearchWiki-windows.zip` and run `ResearchWiki.exe` from the
   discarded.
 - **Article scoring removed.** The per‑article 0–100 scores and tiers were a personal
   study aid with no role in the pipeline; evaluation keeps the classification, summaries,
-  and strengths/weaknesses. Existing scores are preserved in a `haie_rev_scores_backup`
-  table during the automatic database migration.
+  and strengths/weaknesses.
 - **Knowledge‑graph robustness.** Interrupted article extractions resume at the failed
   chunk without inflating mention counts or edge weights; relationship types are
   canonicalized ("developed by" merges into "develops" with the edge direction flipped,
