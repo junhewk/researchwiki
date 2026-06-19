@@ -184,6 +184,13 @@ fn initialize_sync(database_path: &std::path::Path, embedding_dimensions: u32) -
             content_type TEXT,
             evaluated_at TEXT,
             pdf_path TEXT,
+            pdf_sha256 TEXT,
+            pdf_bytes INTEGER,
+            pdf_source_url TEXT,
+            pdf_fetch_method TEXT,
+            text_extraction_status TEXT,
+            text_extracted_at TEXT,
+            text_extraction_error TEXT,
             has_embeddings INTEGER DEFAULT 0,
             has_kg_entities INTEGER DEFAULT 0,
             created_at TEXT DEFAULT (datetime('now')),
@@ -406,6 +413,13 @@ fn initialize_sync(database_path: &std::path::Path, embedding_dimensions: u32) -
     ensure_column(&conn, "haie_rev", "content_type", "TEXT")?;
     ensure_column(&conn, "haie_rev", "evaluated_at", "TEXT")?;
     ensure_column(&conn, "haie_rev", "pdf_path", "TEXT")?;
+    ensure_column(&conn, "haie_rev", "pdf_sha256", "TEXT")?;
+    ensure_column(&conn, "haie_rev", "pdf_bytes", "INTEGER")?;
+    ensure_column(&conn, "haie_rev", "pdf_source_url", "TEXT")?;
+    ensure_column(&conn, "haie_rev", "pdf_fetch_method", "TEXT")?;
+    ensure_column(&conn, "haie_rev", "text_extraction_status", "TEXT")?;
+    ensure_column(&conn, "haie_rev", "text_extracted_at", "TEXT")?;
+    ensure_column(&conn, "haie_rev", "text_extraction_error", "TEXT")?;
     ensure_column(&conn, "haie_rev", "has_embeddings", "INTEGER DEFAULT 0")?;
     ensure_column(&conn, "haie_rev", "has_kg_entities", "INTEGER DEFAULT 0")?;
 
@@ -566,7 +580,11 @@ fn migrate_canonicalize_relationships(conn: &Connection) -> Result<()> {
                 }
             }
             let description = match (survivor_description, loser_description) {
-                (Some(a), Some(b)) => Some(if b.trim().len() > a.trim().len() { b } else { a }),
+                (Some(a), Some(b)) => Some(if b.trim().len() > a.trim().len() {
+                    b
+                } else {
+                    a
+                }),
                 (a, b) => a.or(b),
             };
 
@@ -885,7 +903,9 @@ mod tests {
         migrate_canonicalize_relationships(&conn).unwrap();
 
         let count: i64 = conn
-            .query_row("SELECT COUNT(*) FROM kg_relationships", [], |row| row.get(0))
+            .query_row("SELECT COUNT(*) FROM kg_relationships", [], |row| {
+                row.get(0)
+            })
             .unwrap();
         assert_eq!(count, 2);
 

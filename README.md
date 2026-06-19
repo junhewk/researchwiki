@@ -48,7 +48,7 @@ key in the setup wizard.
 
 Pre-built desktop artifacts are attached to tagged releases:
 
-Latest release: **v0.1.3**.
+Latest release: **v0.1.4**.
 
 | Platform | File |
 |---|---|
@@ -58,7 +58,7 @@ Latest release: **v0.1.3**.
 On macOS, open the DMG and copy `ResearchWiki.app` to `/Applications`.
 On Windows, unzip `ResearchWiki-windows.zip` and run `ResearchWiki.exe` from the extracted folder.
 
-### What's new in v0.1.3
+### What's new in v0.1.4
 
 - **Full text finally reaches the pipeline.** Fetched full text is now saved with each
   article, so evaluation, embeddings, and the knowledge graph work from the whole paper
@@ -86,8 +86,17 @@ On Windows, unzip `ResearchWiki-windows.zip` and run `ResearchWiki.exe` from the
 ```sh
 git clone <repo-url>
 cd researchwiki
-cargo build --release
+cargo build --release --bin researchwiki
 # binary: target/release/researchwiki
+```
+
+The Axum web UI is built from the same codebase, but it is not attached to
+desktop releases:
+
+```sh
+cargo run --bin web
+# or expose it beyond localhost:
+RESEARCHWIKI_WEB_ADDR=0.0.0.0:8787 cargo run --bin web
 ```
 
 ### macOS app bundle (recommended for end users)

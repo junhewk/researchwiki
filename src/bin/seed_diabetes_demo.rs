@@ -122,10 +122,6 @@ fn ensure_demo_settings(config: &AppConfig) -> Result<()> {
             "pubmed_schedule_minute": 30,
             "enabled": true
         },
-        "newsletter": {
-            "default_article_count": 7,
-            "default_days": 7
-        },
         "library_enabled": false,
         "kg_enabled": true,
         "llm": {

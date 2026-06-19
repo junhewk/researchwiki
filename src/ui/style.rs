@@ -473,7 +473,11 @@ pub fn secret_edit(
 /// Top-navigation tab: icon + label, accent text and a 2px underline when
 /// selected, soft accent fill on hover.
 pub fn nav_tab(ui: &mut egui::Ui, selected: bool, glyph: &str, label: &str) -> egui::Response {
-    let fg = if selected { color::ACCENT } else { color::MUTED };
+    let fg = if selected {
+        color::ACCENT
+    } else {
+        color::MUTED
+    };
     let text = egui::RichText::new(format!("{glyph}  {label}"))
         .size(HELP_TEXT_SIZE)
         .color(fg);

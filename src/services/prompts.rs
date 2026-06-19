@@ -596,32 +596,6 @@ const MODEL_CONFIG_REGISTRY: &[CategoryRegistry] = &[
         ],
     },
     CategoryRegistry {
-        category: "newsletter",
-        label: "Newsletter Generation",
-        configs: &[
-            ConfigRegistry {
-                prompt_name: "newsletter_introduction",
-                label: "Introduction",
-            },
-            ConfigRegistry {
-                prompt_name: "newsletter_title",
-                label: "Title Generation",
-            },
-            ConfigRegistry {
-                prompt_name: "newsletter_title_rephrase",
-                label: "Title Rephrase (Korean)",
-            },
-            ConfigRegistry {
-                prompt_name: "newsletter_highlights",
-                label: "Highlights",
-            },
-            ConfigRegistry {
-                prompt_name: "newsletter_closing",
-                label: "Closing Remarks",
-            },
-        ],
-    },
-    CategoryRegistry {
         category: "library_search",
         label: "Library Search",
         configs: &[

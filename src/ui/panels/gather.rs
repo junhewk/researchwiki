@@ -1205,7 +1205,6 @@ impl Panel {
                 settings
                     .update_settings(SettingsUpdate {
                         scheduler: Some(next_settings.clone()),
-                        newsletter: None,
                         ui_language: None,
                     })
                     .await?;
@@ -1255,7 +1254,6 @@ impl Panel {
                 settings
                     .update_settings(SettingsUpdate {
                         scheduler: Some(scheduler.clone()),
-                        newsletter: None,
                         ui_language: None,
                     })
                     .await?;

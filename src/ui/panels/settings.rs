@@ -1,6 +1,6 @@
 use crate::{
     config::{EmbeddingConfig, LlmConfig, normalize_api_key},
-    models::settings::{NewsletterSettings, UiLanguage},
+    models::settings::UiLanguage,
     runtime::UiEvent,
     ui::{style, toast::ToastKind},
 };
@@ -9,7 +9,6 @@ use super::{MsgChannel, PanelCtx};
 
 enum Msg {
     Loaded {
-        newsletter: NewsletterSettings,
         embedding_dimensions: Option<u32>,
         ui_language: UiLanguage,
     },
@@ -28,9 +27,6 @@ pub struct Panel {
     loading: bool,
 
     ui_language: UiLanguage,
-    // Loaded so a future newsletter UI can edit it; also drives the initial
-    // "Loading settings…" guard.
-    newsletter: Option<NewsletterSettings>,
 
     llm_base_url: String,
     llm_model: String,
@@ -85,7 +81,7 @@ impl Panel {
 
         style::panel_header_icon(ui, style::icon::GEAR, ctx.t("Settings"), None);
 
-        if self.loading && self.newsletter.is_none() {
+        if self.loading && self.embedding_dim_persisted.is_none() {
             ui.label(ctx.t("Loading settings..."));
             return;
         }
@@ -133,12 +129,10 @@ impl Panel {
         while let Ok(msg) = channel.rx.try_recv() {
             match msg {
                 Msg::Loaded {
-                    newsletter,
                     embedding_dimensions,
                     ui_language,
                 } => {
                     self.ui_language = ui_language;
-                    self.newsletter = Some(newsletter);
                     self.embedding_dim_persisted = embedding_dimensions;
                     if let Some(dim) = embedding_dimensions {
                         self.embedding_dim_input = dim.to_string();
@@ -197,7 +191,6 @@ impl Panel {
                 Ok(resp) => {
                     let dim = svc.get_embedding_dimensions().await.ok().flatten();
                     let _ = tx.send(Msg::Loaded {
-                        newsletter: resp.newsletter,
                         embedding_dimensions: dim,
                         ui_language: resp.ui_language,
                     });

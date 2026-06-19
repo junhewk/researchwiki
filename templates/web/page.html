@@ -1,0 +1,39 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>{{ title }} - ResearchWiki</title>
+  <link rel="stylesheet" href="/static/web.css">
+  <script defer src="/static/web.js"></script>
+</head>
+<body data-workspace-id="{{ active_workspace_id }}">
+  <header class="topbar">
+    <div class="topbar-inner">
+      <a class="brand" href="/?workspace_id={{ active_workspace_id }}">ResearchWiki</a>
+      <form class="workspace-switcher" method="post" action="/workspaces/select">
+        <label for="workspace-select">Input Set</label>
+        <select id="workspace-select" name="workspace_id" onchange="this.form.submit()">
+          {% for workspace in workspaces %}
+            <option value="{{ workspace.id }}" {% if workspace.selected %}selected{% endif %}>{{ workspace.name }}</option>
+          {% endfor %}
+        </select>
+      </form>
+    </div>
+    <nav class="nav">
+      {% for item in nav %}
+        <a class="nav-link{% if item.active %} active{% endif %}" href="{{ item.href }}">{{ item.label }}</a>
+      {% endfor %}
+    </nav>
+  </header>
+  <main class="page">
+    {% if notice.len() > 0 %}
+      <div class="notice success">{{ notice }}</div>
+    {% endif %}
+    {% if error.len() > 0 %}
+      <div class="notice error">{{ error }}</div>
+    {% endif %}
+    {{ body|safe }}
+  </main>
+</body>
+</html>

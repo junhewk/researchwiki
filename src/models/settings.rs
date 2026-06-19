@@ -54,21 +54,6 @@ impl Default for SchedulerSettings {
     }
 }
 
-#[derive(Clone, Debug, Deserialize, Serialize)]
-pub struct NewsletterSettings {
-    pub default_article_count: u8,
-    pub default_days: u8,
-}
-
-impl Default for NewsletterSettings {
-    fn default() -> Self {
-        Self {
-            default_article_count: 7,
-            default_days: 7,
-        }
-    }
-}
-
 #[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, PartialEq, Eq, Hash)]
 #[serde(rename_all = "snake_case")]
 pub enum UiLanguage {
@@ -94,8 +79,6 @@ pub struct StoredSettings {
     pub api_keys: std::collections::BTreeMap<String, String>,
     #[serde(default)]
     pub scheduler: SchedulerSettings,
-    #[serde(default)]
-    pub newsletter: NewsletterSettings,
     #[serde(default = "default_true")]
     pub library_enabled: bool,
     #[serde(default = "default_true")]
@@ -130,7 +113,6 @@ fn default_true() -> bool {
 pub struct SettingsResponse {
     pub api_keys: Vec<ApiKeyStatus>,
     pub scheduler: SchedulerSettings,
-    pub newsletter: NewsletterSettings,
     pub ui_language: UiLanguage,
 }
 
@@ -138,8 +120,6 @@ pub struct SettingsResponse {
 pub struct SettingsUpdate {
     #[serde(default)]
     pub scheduler: Option<SchedulerSettings>,
-    #[serde(default)]
-    pub newsletter: Option<NewsletterSettings>,
     #[serde(default)]
     pub ui_language: Option<UiLanguage>,
 }

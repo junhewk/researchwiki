@@ -8,6 +8,7 @@ pub mod services;
 pub mod state;
 pub mod tray;
 pub mod ui;
+pub mod web;
 
 use std::sync::Once;
 

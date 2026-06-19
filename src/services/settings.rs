@@ -50,7 +50,6 @@ impl SettingsService {
         Ok(SettingsResponse {
             api_keys,
             scheduler: stored.scheduler,
-            newsletter: stored.newsletter,
             ui_language: stored.ui_language,
         })
     }
@@ -61,9 +60,6 @@ impl SettingsService {
 
         if let Some(scheduler) = update.scheduler {
             stored.scheduler = scheduler;
-        }
-        if let Some(newsletter) = update.newsletter {
-            stored.newsletter = newsletter;
         }
         if let Some(language) = update.ui_language {
             stored.ui_language = language;

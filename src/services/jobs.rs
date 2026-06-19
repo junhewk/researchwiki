@@ -550,7 +550,9 @@ impl JobService {
                         .map(crate::services::pipeline::normalize_doi)
                         .filter(|value| !value.is_empty());
                     let title_key = crate::services::pipeline::normalized_duplicate_title(&c.title);
-                    let doi_seen = doi_key.as_deref().is_some_and(|key| seen_dois.contains(key));
+                    let doi_seen = doi_key
+                        .as_deref()
+                        .is_some_and(|key| seen_dois.contains(key));
                     let title_seen = !title_key.is_empty() && seen_titles.contains(&title_key);
                     if doi_seen || title_seen {
                         cross_source_skipped += 1;
@@ -757,6 +759,12 @@ impl JobService {
                 .pdf_path
                 .as_ref()
                 .map(|path| path.to_string_lossy().into_owned()),
+            pdf_sha256: content.pdf_sha256.clone(),
+            pdf_bytes: content.pdf_bytes,
+            pdf_source_url: content.pdf_source_url.clone(),
+            pdf_fetch_method: content.pdf_fetch_method.clone(),
+            text_extraction_status: content.text_extraction_status.clone(),
+            text_extraction_error: content.text_extraction_error.clone(),
         };
         let save_result = self
             .pipeline_service
@@ -811,11 +819,7 @@ impl JobService {
     /// Re-runs MarkItDown over an article's stored PDF and, on success, swaps
     /// the extracted markdown into `full_text` and refreshes the embedding/KG
     /// stages. Returns `false` when extraction still produces nothing.
-    pub async fn re_extract_article(
-        &self,
-        uid: &str,
-        workspace_id: i64,
-    ) -> Result<bool, AppError> {
+    pub async fn re_extract_article(&self, uid: &str, workspace_id: i64) -> Result<bool, AppError> {
         let database_path = self.database_path.clone();
         let uid_owned = uid.to_string();
         let pdf_path: Option<String> = run_blocking_db(move || {
@@ -854,7 +858,11 @@ impl JobService {
                 "UPDATE haie_rev
                  SET full_text = ?1,
                      content_type = 'pdf',
+                     text_extraction_status = 'extracted',
+                     text_extracted_at = datetime('now'),
+                     text_extraction_error = NULL,
                      has_embeddings = 0,
+                     has_kg_entities = 0,
                      updated_at = datetime('now')
                  WHERE uid = ?2",
                 params![markdown, uid_owned],
@@ -873,9 +881,7 @@ impl JobService {
             .get_feature_flags()
             .await
             .unwrap_or((true, true));
-        if library_enabled
-            && let Err(error) = self.library_service.process_article(uid).await
-        {
+        if library_enabled && let Err(error) = self.library_service.process_article(uid).await {
             tracing::warn!("re-embedding after re-extraction failed for {uid}: {error}");
         }
         if kg_enabled

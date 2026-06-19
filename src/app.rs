@@ -330,10 +330,8 @@ impl DesktopApp {
                 UiEvent::SwitchTab(tab) => self.persistent.active_tab = tab,
                 UiEvent::LanguageChanged(language) => {
                     self.language = language;
-                    self.toasts.push(
-                        ToastKind::Success,
-                        i18n::t(language, "Language updated."),
-                    );
+                    self.toasts
+                        .push(ToastKind::Success, i18n::t(language, "Language updated."));
                 }
                 UiEvent::JobProgress {
                     run_id,
@@ -787,10 +785,7 @@ impl eframe::App for DesktopApp {
             )
             .show(ctx, |ui| {
                 ui.horizontal_wrapped(|ui| {
-                    ui.label(
-                        egui::RichText::new(style::icon::FOLDERS)
-                            .color(style::color::MUTED),
-                    );
+                    ui.label(egui::RichText::new(style::icon::FOLDERS).color(style::color::MUTED));
                     let mut selected = active_ws;
                     let current = workspace_items
                         .iter()
@@ -815,9 +810,10 @@ impl eframe::App for DesktopApp {
                         }
                         for tab in group {
                             let selected_tab = self.persistent.active_tab == tab;
-                            let shortcut = Tab::ALL.iter().position(|t| *t == tab).map(|i| {
-                                if i == 9 { 0 } else { i + 1 }
-                            });
+                            let shortcut = Tab::ALL
+                                .iter()
+                                .position(|t| *t == tab)
+                                .map(|i| if i == 9 { 0 } else { i + 1 });
                             let response = style::nav_tab(
                                 ui,
                                 selected_tab,
@@ -968,7 +964,10 @@ pub fn first_launch_seed(config: &AppConfig) -> Result<()> {
             BUNDLED_PROMPTS
                 .extract(&storage.prompts_dir)
                 .with_context(|| {
-                    format!("failed to seed embedded prompts to {:?}", storage.prompts_dir)
+                    format!(
+                        "failed to seed embedded prompts to {:?}",
+                        storage.prompts_dir
+                    )
                 })?;
             info!(
                 "seeded {} embedded prompt templates to {}",

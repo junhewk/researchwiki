@@ -1339,11 +1339,15 @@ impl KnowledgeGraphService {
             let extraction = match self.extract_chunk(uid, chunk_text, context).await {
                 Ok(extraction) => extraction,
                 Err(first_error) => {
-                    warn!("chunk {chunk_index} extraction failed for {uid}: {first_error}; retrying once");
+                    warn!(
+                        "chunk {chunk_index} extraction failed for {uid}: {first_error}; retrying once"
+                    );
                     match self.extract_chunk(uid, chunk_text, context).await {
                         Ok(extraction) => extraction,
                         Err(error) => {
-                            warn!("chunk {chunk_index} extraction failed again for {uid}: {error}; skipping chunk");
+                            warn!(
+                                "chunk {chunk_index} extraction failed again for {uid}: {error}; skipping chunk"
+                            );
                             failed_chunks += 1;
                             continue;
                         }
@@ -4520,10 +4524,7 @@ fn bound_kg_text(text: &str) -> String {
 
     let head_chars = KG_TEXT_MAX_CHARS - KG_TEXT_TAIL_CHARS;
     let head: String = text.chars().take(head_chars).collect();
-    let tail: String = text
-        .chars()
-        .skip(char_count - KG_TEXT_TAIL_CHARS)
-        .collect();
+    let tail: String = text.chars().skip(char_count - KG_TEXT_TAIL_CHARS).collect();
     format!("{head}\n\n[... middle of document omitted ...]\n\n{tail}")
 }
 
@@ -4705,7 +4706,10 @@ mod tests {
         );
         // Canonicalizing twice is a no-op.
         let (rel, src, tgt) = canonicalize_relationship("developed by", 1, 2);
-        assert_eq!(canonicalize_relationship(&rel, src, tgt), (rel.clone(), src, tgt));
+        assert_eq!(
+            canonicalize_relationship(&rel, src, tgt),
+            (rel.clone(), src, tgt)
+        );
     }
 
     #[test]
@@ -4744,19 +4748,20 @@ mod tests {
         };
         let mut extraction = ChunkExtraction {
             entities: vec![
-                entity("Machine Learning", "A field of AI focused on learning from data."),
+                entity(
+                    "Machine Learning",
+                    "A field of AI focused on learning from data.",
+                ),
                 entity("X", "A single-character name is too short to keep."),
                 entity("Federated Learning", "short"),
                 entity("12345", "All-digit names carry no entity meaning here."),
             ],
-            relationships: vec![
-                ExtractedRelationship {
-                    source: "Machine Learning".to_string(),
-                    target: "Federated Learning".to_string(),
-                    relationship: "includes".to_string(),
-                    description: String::new(),
-                },
-            ],
+            relationships: vec![ExtractedRelationship {
+                source: "Machine Learning".to_string(),
+                target: "Federated Learning".to_string(),
+                relationship: "includes".to_string(),
+                description: String::new(),
+            }],
         };
 
         validate_extraction(&mut extraction);

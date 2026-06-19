@@ -4,7 +4,7 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 use researchwiki::{
-    app::{bootstrap_db, first_launch_seed, DesktopApp},
+    app::{DesktopApp, bootstrap_db, first_launch_seed},
     config::AppConfig,
     init_tracing, register_sqlite_vec,
     runtime::DesktopRuntime,

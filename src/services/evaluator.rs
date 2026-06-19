@@ -166,10 +166,7 @@ fn compact_evaluation_text(text: &str) -> String {
     // tail. char_count > MAX guarantees at least MIDDLE chars of room between
     // them.
     let middle_start = ((char_count - EVAL_TEXT_MIDDLE_CHARS) / 2)
-        .clamp(
-            EVAL_TEXT_HEAD_CHARS,
-            tail_start - EVAL_TEXT_MIDDLE_CHARS,
-        );
+        .clamp(EVAL_TEXT_HEAD_CHARS, tail_start - EVAL_TEXT_MIDDLE_CHARS);
     let middle = text
         .chars()
         .skip(middle_start)

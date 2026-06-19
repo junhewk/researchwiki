@@ -264,9 +264,7 @@ pub fn t(language: UiLanguage, text: &'static str) -> &'static str {
         "Drop embeddings and save" => "임베딩 삭제 후 저장",
 
         "Recent articles" => "최근 논문",
-        "No articles yet for this workspace." => {
-            "이 워크스페이스에는 아직 논문이 없습니다."
-        }
+        "No articles yet for this workspace." => "이 워크스페이스에는 아직 논문이 없습니다.",
         "Filters" => "필터",
         "Category" => "분야",
         "Date from" => "시작일",

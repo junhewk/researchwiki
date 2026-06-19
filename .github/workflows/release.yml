@@ -61,7 +61,7 @@ jobs:
       # --- Windows: build the exe and zip a portable app folder ---
       - name: Build (Windows)
         if: runner.os == 'Windows'
-        run: cargo build --release
+        run: cargo build --release --bin researchwiki
       - name: Package (Windows)
         if: runner.os == 'Windows'
         run: |

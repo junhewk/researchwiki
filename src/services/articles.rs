@@ -19,7 +19,9 @@ const ARTICLE_COLUMNS: &str = r#"
     practical_impl, secondary_issues, key_argument, main_findings, normative_claims,
     limitations, theoretical_strengths, theoretical_weaknesses, empirical_strengths,
     empirical_weaknesses, byline_summary, why_it_matters, evaluated_at,
-    content_type, pdf_path, reg_date, created_at, updated_at
+    content_type, pdf_path, pdf_sha256, pdf_bytes, pdf_source_url, pdf_fetch_method,
+    text_extraction_status, text_extracted_at, text_extraction_error,
+    reg_date, created_at, updated_at
 "#;
 
 #[derive(Clone)]
@@ -398,7 +400,6 @@ impl ArticleService {
         })
         .await
     }
-
 }
 
 /// Appends a workspace scope to a query when an id is provided. `has_where`
@@ -547,8 +548,15 @@ fn map_article_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ArticleResponse>
         evaluated_at: row.get(25)?,
         content_type: row.get(26)?,
         pdf_path: row.get(27)?,
-        reg_date: row.get(28)?,
-        created_at: row.get(29)?,
-        updated_at: row.get(30)?,
+        pdf_sha256: row.get(28)?,
+        pdf_bytes: row.get(29)?,
+        pdf_source_url: row.get(30)?,
+        pdf_fetch_method: row.get(31)?,
+        text_extraction_status: row.get(32)?,
+        text_extracted_at: row.get(33)?,
+        text_extraction_error: row.get(34)?,
+        reg_date: row.get(35)?,
+        created_at: row.get(36)?,
+        updated_at: row.get(37)?,
     })
 }

@@ -12,7 +12,10 @@ use crate::ui::{panels::Tab, toast::ToastKind};
 pub enum UiEvent {
     Status(String),
     /// Transient notification rendered in the top-right toast stack.
-    Toast { kind: ToastKind, message: String },
+    Toast {
+        kind: ToastKind,
+        message: String,
+    },
     /// Navigate the main window to a tab (e.g. from an empty-state action).
     SwitchTab(Tab),
     LanguageChanged(UiLanguage),

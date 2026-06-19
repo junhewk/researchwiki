@@ -1,8 +1,12 @@
 use reqwest::Client;
+use sha2::{Digest, Sha256};
 use tokio::{process::Command, sync::Semaphore, time::timeout};
 use tracing::{debug, info, warn};
 
-use crate::{error::AppError, services::pipeline::ArticleCandidate};
+use crate::{
+    error::AppError,
+    services::{pdf_text, pipeline::ArticleCandidate},
+};
 
 use std::{
     env,
@@ -63,6 +67,24 @@ pub struct FetchedContent {
     /// Where the downloaded PDF was persisted, when one was acquired. Kept
     /// even if extraction failed so the article can be re-extracted later.
     pub pdf_path: Option<PathBuf>,
+    pub pdf_sha256: Option<String>,
+    pub pdf_bytes: Option<i64>,
+    pub pdf_source_url: Option<String>,
+    pub pdf_fetch_method: Option<String>,
+    pub text_extraction_status: Option<String>,
+    pub text_extraction_error: Option<String>,
+}
+
+struct PdfAcquisition {
+    bytes: Vec<u8>,
+    method: String,
+    source_url: String,
+}
+
+struct StoredPdf {
+    path: PathBuf,
+    sha256: String,
+    bytes: i64,
 }
 
 #[derive(Clone)]
@@ -93,34 +115,58 @@ impl ContentFetcher {
     /// the database for later re-extraction.
     pub async fn fetch(&self, candidate: &ArticleCandidate) -> Option<FetchedContent> {
         let mut stored_pdf: Option<PathBuf> = None;
+        let mut stored_pdf_sha256: Option<String> = None;
+        let mut stored_pdf_bytes: Option<i64> = None;
+        let mut stored_pdf_source_url: Option<String> = None;
+        let mut stored_pdf_fetch_method: Option<String> = None;
+        let mut stored_pdf_extraction_error: Option<String> = None;
 
-        if let Some((bytes, method)) = self.acquire_pdf(candidate).await {
-            match self.store_pdf(candidate, &bytes).await {
-                Ok(path) => match markdown_from_pdf_file(&path).await {
-                    Ok(Some(markdown)) => {
-                        info!("fetched {} using {method}", candidate.uid());
+        if let Some(pdf) = self.acquire_pdf(candidate).await {
+            match self.store_pdf(candidate, &pdf.bytes).await {
+                Ok(stored) => match extract_text_from_pdf_file(&stored.path).await {
+                    Ok(Some(text)) => {
+                        info!("fetched {} using {}", candidate.uid(), pdf.method);
                         return Some(FetchedContent {
                             content_type: ContentType::Pdf,
-                            content: ContentData::Text(markdown),
-                            fetch_method: method,
-                            pdf_path: Some(path),
+                            content: ContentData::Text(text),
+                            fetch_method: pdf.method.clone(),
+                            pdf_path: Some(stored.path),
+                            pdf_sha256: Some(stored.sha256),
+                            pdf_bytes: Some(stored.bytes),
+                            pdf_source_url: Some(pdf.source_url),
+                            pdf_fetch_method: Some(pdf.method),
+                            text_extraction_status: Some("extracted".to_string()),
+                            text_extraction_error: None,
                         });
                     }
                     Ok(None) => {
+                        let message = "PDF extraction returned no text".to_string();
                         warn!(
-                            "MarkItDown returned no Markdown for {}; keeping stored PDF at {}",
+                            "{} for {}; keeping stored PDF at {}",
+                            message,
                             candidate.uid(),
-                            path.display()
+                            stored.path.display()
                         );
-                        stored_pdf = Some(path);
+                        stored_pdf_extraction_error = Some(message);
+                        stored_pdf = Some(stored.path);
+                        stored_pdf_sha256 = Some(stored.sha256);
+                        stored_pdf_bytes = Some(stored.bytes);
+                        stored_pdf_source_url = Some(pdf.source_url);
+                        stored_pdf_fetch_method = Some(pdf.method);
                     }
                     Err(error) => {
+                        let message = error.to_string();
                         warn!(
-                            "PDF extraction failed for {}: {error}; keeping stored PDF at {}",
+                            "PDF extraction failed for {}: {message}; keeping stored PDF at {}",
                             candidate.uid(),
-                            path.display()
+                            stored.path.display()
                         );
-                        stored_pdf = Some(path);
+                        stored_pdf_extraction_error = Some(message);
+                        stored_pdf = Some(stored.path);
+                        stored_pdf_sha256 = Some(stored.sha256);
+                        stored_pdf_bytes = Some(stored.bytes);
+                        stored_pdf_source_url = Some(pdf.source_url);
+                        stored_pdf_fetch_method = Some(pdf.method);
                     }
                 },
                 Err(error) => {
@@ -150,6 +196,13 @@ impl ContentFetcher {
                 Ok(Some(mut content)) => {
                     info!("fetched {} using {}", candidate.uid(), content.fetch_method);
                     content.pdf_path = stored_pdf;
+                    content.pdf_sha256 = stored_pdf_sha256;
+                    content.pdf_bytes = stored_pdf_bytes;
+                    content.pdf_source_url = stored_pdf_source_url;
+                    content.pdf_fetch_method = stored_pdf_fetch_method;
+                    content.text_extraction_status =
+                        content.pdf_path.as_ref().map(|_| "failed".to_string());
+                    content.text_extraction_error = stored_pdf_extraction_error;
                     return Some(content);
                 }
                 Ok(None) => continue,
@@ -166,6 +219,12 @@ impl ContentFetcher {
                 content: ContentData::Text(String::new()),
                 fetch_method: "pdf_stored_unextracted".to_string(),
                 pdf_path: Some(path),
+                pdf_sha256: stored_pdf_sha256,
+                pdf_bytes: stored_pdf_bytes,
+                pdf_source_url: stored_pdf_source_url,
+                pdf_fetch_method: stored_pdf_fetch_method,
+                text_extraction_status: Some("needs_reextract".to_string()),
+                text_extraction_error: stored_pdf_extraction_error,
             });
         }
 
@@ -196,14 +255,15 @@ impl ContentFetcher {
         futures::future::join_all(futures).await
     }
 
-    /// Re-runs MarkItDown over a previously stored PDF.
+    /// Re-runs the local PDF extractor, falling back to MarkItDown, over a
+    /// previously stored PDF.
     pub async fn re_extract_stored_pdf(&self, path: &Path) -> Result<Option<String>, AppError> {
-        markdown_from_pdf_file(path).await
+        extract_text_from_pdf_file(path).await
     }
 
     /// Walks the PDF acquisition strategies in order of reliability and cost;
     /// the first valid PDF (magic-byte checked) wins.
-    async fn acquire_pdf(&self, candidate: &ArticleCandidate) -> Option<(Vec<u8>, String)> {
+    async fn acquire_pdf(&self, candidate: &ArticleCandidate) -> Option<PdfAcquisition> {
         let unpaywall_ready = candidate.doi.is_some() && self.contact_email.is_some();
         let strategies: [(&str, bool); 5] = [
             ("arxiv_pdf", candidate.source == "arxiv"),
@@ -229,7 +289,13 @@ impl ContentFetcher {
                 _ => self.fetch_landing_page_pdf_bytes(candidate).await,
             };
             match result {
-                Ok(Some(bytes)) => return Some((bytes, name.to_string())),
+                Ok(Some((bytes, source_url))) => {
+                    return Some(PdfAcquisition {
+                        bytes,
+                        method: name.to_string(),
+                        source_url,
+                    });
+                }
                 Ok(None) => continue,
                 Err(error) => {
                     warn!("{name} error for {}: {error}", candidate.uid());
@@ -245,7 +311,7 @@ impl ContentFetcher {
         &self,
         candidate: &ArticleCandidate,
         bytes: &[u8],
-    ) -> Result<PathBuf, AppError> {
+    ) -> Result<StoredPdf, AppError> {
         tokio::fs::create_dir_all(&self.pdf_dir)
             .await
             .map_err(|error| {
@@ -254,11 +320,16 @@ impl ContentFetcher {
                     self.pdf_dir.display()
                 ))
             })?;
-        let path = self.pdf_dir.join(pdf_filename(&candidate.uid()));
+        let sha256 = sha256_hex(bytes);
+        let path = self.pdf_dir.join(pdf_filename(&candidate.uid(), &sha256));
         tokio::fs::write(&path, bytes).await.map_err(|error| {
             AppError::Internal(format!("failed to write PDF {}: {error}", path.display()))
         })?;
-        Ok(path)
+        Ok(StoredPdf {
+            path,
+            sha256,
+            bytes: bytes.len() as i64,
+        })
     }
 
     /// Downloads `url` and returns the body only when it is a real PDF.
@@ -290,10 +361,13 @@ impl ContentFetcher {
     async fn fetch_arxiv_pdf_bytes(
         &self,
         candidate: &ArticleCandidate,
-    ) -> Result<Option<Vec<u8>>, AppError> {
+    ) -> Result<Option<(Vec<u8>, String)>, AppError> {
         let arxiv_id = candidate.source_id.replace("v", "");
         let pdf_url = format!("https://arxiv.org/pdf/{arxiv_id}.pdf");
-        self.download_pdf_bytes(&pdf_url, false).await
+        Ok(self
+            .download_pdf_bytes(&pdf_url, false)
+            .await?
+            .map(|bytes| (bytes, pdf_url)))
     }
 
     /// Unpaywall's real purpose: given a DOI, resolve the best open-access PDF
@@ -301,7 +375,7 @@ impl ContentFetcher {
     async fn fetch_unpaywall_pdf_bytes(
         &self,
         candidate: &ArticleCandidate,
-    ) -> Result<Option<Vec<u8>>, AppError> {
+    ) -> Result<Option<(Vec<u8>, String)>, AppError> {
         let Some(doi) = candidate.doi.as_deref() else {
             return Ok(None);
         };
@@ -336,13 +410,16 @@ impl ContentFetcher {
             return Ok(None);
         };
 
-        self.download_pdf_bytes(&pdf_url, false).await
+        Ok(self
+            .download_pdf_bytes(&pdf_url, false)
+            .await?
+            .map(|bytes| (bytes, pdf_url)))
     }
 
     async fn fetch_publisher_pdf_bytes(
         &self,
         candidate: &ArticleCandidate,
-    ) -> Result<Option<Vec<u8>>, AppError> {
+    ) -> Result<Option<(Vec<u8>, String)>, AppError> {
         let Some(doi) = candidate.doi.as_deref() else {
             return Ok(None);
         };
@@ -350,8 +427,11 @@ impl ContentFetcher {
         for (pdf_url, publisher) in publisher_pdf_urls(doi) {
             match self.download_pdf_bytes(&pdf_url, false).await {
                 Ok(Some(bytes)) => {
-                    debug!("publisher heuristic {publisher} hit for {}", candidate.uid());
-                    return Ok(Some(bytes));
+                    debug!(
+                        "publisher heuristic {publisher} hit for {}",
+                        candidate.uid()
+                    );
+                    return Ok(Some((bytes, pdf_url)));
                 }
                 Ok(None) => continue,
                 Err(error) => {
@@ -369,12 +449,15 @@ impl ContentFetcher {
     async fn fetch_doi_negotiation_bytes(
         &self,
         candidate: &ArticleCandidate,
-    ) -> Result<Option<Vec<u8>>, AppError> {
+    ) -> Result<Option<(Vec<u8>, String)>, AppError> {
         let Some(doi) = candidate.doi.as_deref() else {
             return Ok(None);
         };
-        self.download_pdf_bytes(&format!("https://doi.org/{doi}"), true)
-            .await
+        let url = format!("https://doi.org/{doi}");
+        Ok(self
+            .download_pdf_bytes(&url, true)
+            .await?
+            .map(|bytes| (bytes, url)))
     }
 
     /// Generalist fallback: load the article landing page (DOI redirect or the
@@ -383,7 +466,7 @@ impl ContentFetcher {
     async fn fetch_landing_page_pdf_bytes(
         &self,
         candidate: &ArticleCandidate,
-    ) -> Result<Option<Vec<u8>>, AppError> {
+    ) -> Result<Option<(Vec<u8>, String)>, AppError> {
         let landing_url = candidate
             .doi
             .as_deref()
@@ -393,9 +476,16 @@ impl ContentFetcher {
             return Ok(None);
         }
 
-        let response = self.client.get(&landing_url).send().await.map_err(|error| {
-            AppError::Internal(format!("landing page fetch failed for {landing_url}: {error}"))
-        })?;
+        let response = self
+            .client
+            .get(&landing_url)
+            .send()
+            .await
+            .map_err(|error| {
+                AppError::Internal(format!(
+                    "landing page fetch failed for {landing_url}: {error}"
+                ))
+            })?;
         if !response.status().is_success() {
             return Ok(None);
         }
@@ -405,7 +495,7 @@ impl ContentFetcher {
         })?;
         // Some landing URLs serve the PDF directly.
         if is_pdf_bytes(&bytes) {
-            return Ok(Some(bytes.to_vec()));
+            return Ok(Some((bytes.to_vec(), final_url.to_string())));
         }
 
         let html = String::from_utf8_lossy(&bytes);
@@ -416,7 +506,10 @@ impl ContentFetcher {
             Ok(resolved) => resolved.to_string(),
             Err(_) => pdf_url,
         };
-        self.download_pdf_bytes(&pdf_url, false).await
+        Ok(self
+            .download_pdf_bytes(&pdf_url, false)
+            .await?
+            .map(|bytes| (bytes, pdf_url)))
     }
 
     async fn fetch_pmc_xml(
@@ -451,6 +544,12 @@ impl ContentFetcher {
             content: ContentData::Text(content),
             fetch_method: "pmc_xml".to_string(),
             pdf_path: None,
+            pdf_sha256: None,
+            pdf_bytes: None,
+            pdf_source_url: None,
+            pdf_fetch_method: None,
+            text_extraction_status: None,
+            text_extraction_error: None,
         }))
     }
 
@@ -497,6 +596,12 @@ impl ContentFetcher {
             content: ContentData::Text(content),
             fetch_method: "pubmed_efetch".to_string(),
             pdf_path: None,
+            pdf_sha256: None,
+            pdf_bytes: None,
+            pdf_source_url: None,
+            pdf_fetch_method: None,
+            text_extraction_status: None,
+            text_extraction_error: None,
         }))
     }
 
@@ -518,6 +623,12 @@ impl ContentFetcher {
             content: ContentData::Text(summary.to_string()),
             fetch_method: "candidate_summary".to_string(),
             pdf_path: None,
+            pdf_sha256: None,
+            pdf_bytes: None,
+            pdf_source_url: None,
+            pdf_fetch_method: None,
+            text_extraction_status: None,
+            text_extraction_error: None,
         }))
     }
 }
@@ -536,12 +647,7 @@ fn is_pdf_bytes(bytes: &[u8]) -> bool {
 
 /// Deterministic filename for a stored PDF: sanitized uid plus an FNV-1a hash
 /// suffix so distinct uids that sanitize identically cannot collide.
-fn pdf_filename(uid: &str) -> String {
-    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
-    for byte in uid.as_bytes() {
-        hash ^= u64::from(*byte);
-        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
-    }
+fn pdf_filename(uid: &str, sha256: &str) -> String {
     let safe: String = uid
         .chars()
         .map(|character| {
@@ -552,7 +658,14 @@ fn pdf_filename(uid: &str) -> String {
             }
         })
         .collect();
-    format!("{safe}-{hash:016x}.pdf")
+    let short_hash = sha256.get(..16).unwrap_or(sha256);
+    format!("{safe}-{short_hash}.pdf")
+}
+
+fn sha256_hex(bytes: &[u8]) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(bytes);
+    format!("{:x}", hasher.finalize())
 }
 
 /// Heuristic per-publisher PDF URLs derived from the DOI. DOI prefixes are
@@ -639,7 +752,39 @@ fn extract_citation_pdf_url(html: &str) -> Option<String> {
         .map(ToOwned::to_owned)
 }
 
-async fn markdown_from_pdf_file(path: &Path) -> Result<Option<String>, AppError> {
+async fn extract_text_from_pdf_file(path: &Path) -> Result<Option<String>, AppError> {
+    let path_for_local = path.to_path_buf();
+    match tokio::task::spawn_blocking(move || {
+        let bytes = std::fs::read(&path_for_local).map_err(|error| {
+            AppError::Internal(format!(
+                "failed to read PDF {}: {error}",
+                path_for_local.display()
+            ))
+        })?;
+        pdf_text::extract_pdf_text(&bytes)
+            .map(|text| text.trim().to_string())
+            .map_err(|error| {
+                AppError::Internal(format!("local PDF text extraction failed: {error}"))
+            })
+    })
+    .await
+    {
+        Ok(Ok(text)) if !text.is_empty() => return Ok(Some(text)),
+        Ok(Ok(_)) => {}
+        Ok(Err(error)) => {
+            debug!(
+                "local PDF extraction failed for {}: {error}",
+                path.display()
+            );
+        }
+        Err(error) => {
+            debug!(
+                "local PDF extraction task failed for {}: {error}",
+                path.display()
+            );
+        }
+    }
+
     let markdown = run_markitdown_commands(path).await?;
     Ok((!markdown.is_empty()).then_some(markdown))
 }
@@ -757,12 +902,21 @@ mod tests {
 
     #[test]
     fn pdf_filenames_are_sanitized_and_collision_resistant() {
-        let a = pdf_filename("arxiv:2605.00001");
-        let b = pdf_filename("arxiv_2605.00001");
+        let hash_a = sha256_hex(b"first pdf");
+        let hash_b = sha256_hex(b"second pdf");
+        let a = pdf_filename("arxiv:2605.00001", &hash_a);
+        let b = pdf_filename("arxiv_2605.00001", &hash_b);
         assert!(a.starts_with("arxiv_2605.00001-"));
         assert!(a.ends_with(".pdf"));
-        assert_ne!(a, b, "sanitization collisions are disambiguated by hash");
-        assert_eq!(a, pdf_filename("arxiv:2605.00001"), "deterministic");
+        assert_ne!(
+            a, b,
+            "sanitization collisions are disambiguated by content hash"
+        );
+        assert_eq!(
+            a,
+            pdf_filename("arxiv:2605.00001", &hash_a),
+            "deterministic"
+        );
     }
 
     #[test]
@@ -790,10 +944,7 @@ mod tests {
         assert_eq!(plos[0].1, "plos");
 
         let elife = publisher_pdf_urls("10.7554/eLife.12345");
-        assert_eq!(
-            elife[0].0,
-            "https://elifesciences.org/articles/12345/pdf"
-        );
+        assert_eq!(elife[0].0, "https://elifesciences.org/articles/12345/pdf");
 
         assert!(publisher_pdf_urls("10.1000/unknown").is_empty());
     }

@@ -11,7 +11,7 @@ pub mod knowledge_graph;
 pub mod library;
 pub mod llm;
 pub mod multi_query;
-pub mod newsletter;
+pub mod pdf_text;
 pub mod pipeline;
 pub mod prompts;
 pub mod rrf;

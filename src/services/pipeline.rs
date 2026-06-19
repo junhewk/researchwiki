@@ -165,6 +165,12 @@ pub struct FetchedArticleContent {
     pub full_text: Option<String>,
     pub content_type: Option<String>,
     pub pdf_path: Option<String>,
+    pub pdf_sha256: Option<String>,
+    pub pdf_bytes: Option<i64>,
+    pub pdf_source_url: Option<String>,
+    pub pdf_fetch_method: Option<String>,
+    pub text_extraction_status: Option<String>,
+    pub text_extraction_error: Option<String>,
 }
 
 impl PipelineService {
@@ -1105,7 +1111,10 @@ impl PipelineService {
     async fn fetch_doaj_query(&self, query: &str) -> Result<Vec<ArticleCandidate>> {
         let url = format!("{DOAJ_SEARCH_URL}/{}", urlencoding::encode(query));
         let params = vec![
-            ("pageSize", DEFAULT_SOURCE_QUERY_LIMIT.clamp(1, 100).to_string()),
+            (
+                "pageSize",
+                DEFAULT_SOURCE_QUERY_LIMIT.clamp(1, 100).to_string(),
+            ),
             ("sort", "created_date:desc".to_string()),
         ];
         let body = self
@@ -2286,17 +2295,14 @@ fn doaj_candidate(entry: &Value) -> Option<ArticleCandidate> {
         .and_then(Value::as_str)
         .map(ToOwned::to_owned)
         .unwrap_or_else(|| format!("https://doaj.org/article/{source_id}"));
-    let pub_date = bibjson
-        .get("year")
-        .and_then(json_value_as_i64)
-        .map(|year| {
-            let month = bibjson
-                .get("month")
-                .and_then(json_value_as_i64)
-                .filter(|month| (1..=12).contains(month))
-                .unwrap_or(1);
-            format!("{year:04}-{month:02}-01")
-        });
+    let pub_date = bibjson.get("year").and_then(json_value_as_i64).map(|year| {
+        let month = bibjson
+            .get("month")
+            .and_then(json_value_as_i64)
+            .filter(|month| (1..=12).contains(month))
+            .unwrap_or(1);
+        format!("{year:04}-{month:02}-01")
+    });
 
     Some(ArticleCandidate {
         source: "doaj".to_string(),
@@ -2688,6 +2694,7 @@ fn save_article_sync(
         .and_then(|content| content.full_text.as_deref())
         .map(str::trim)
         .filter(|value| !value.is_empty());
+    let has_extracted_text = fetched_text.is_some();
     let full_text = fetched_text
         .map(str::to_string)
         .or_else(|| candidate.summary.clone());
@@ -2698,6 +2705,26 @@ fn save_article_sync(
         .filter(|value| !value.is_empty())
         .unwrap_or_else(|| "abstract_only".to_string());
     let pdf_path = fetched.and_then(|content| content.pdf_path.clone());
+    let pdf_sha256 = fetched.and_then(|content| content.pdf_sha256.clone());
+    let pdf_bytes = fetched.and_then(|content| content.pdf_bytes);
+    let pdf_source_url = fetched.and_then(|content| content.pdf_source_url.clone());
+    let pdf_fetch_method = fetched.and_then(|content| content.pdf_fetch_method.clone());
+    let text_extraction_status = fetched
+        .and_then(|content| content.text_extraction_status.clone())
+        .or_else(|| {
+            pdf_path.as_ref().map(|_| {
+                if has_extracted_text {
+                    "extracted".to_string()
+                } else {
+                    "needs_reextract".to_string()
+                }
+            })
+        });
+    let text_extraction_error = fetched.and_then(|content| content.text_extraction_error.clone());
+    let text_extracted_at = text_extraction_status
+        .as_deref()
+        .is_some_and(|status| status == "extracted")
+        .then(|| Utc::now().format("%Y-%m-%d %H:%M:%S").to_string());
 
     let get_str = |key: &str| -> Option<String> {
         evaluation
@@ -2718,7 +2745,7 @@ fn save_article_sync(
         // A fresh evaluation for an article we already hold (under another
         // source uid) is worth keeping: enrich the existing row instead of
         // discarding the LLM output.
-        if evaluation.is_some() {
+        if evaluation.is_some() || fetched.is_some() {
             counters.saved += update_existing_article_sync(
                 conn,
                 &existing_uid,
@@ -2750,7 +2777,13 @@ fn save_article_sync(
                 full_text.as_deref(),
                 Some(content_type.as_str()),
                 pdf_path.as_deref(),
-                true,
+                pdf_sha256.as_deref(),
+                pdf_bytes,
+                pdf_source_url.as_deref(),
+                pdf_fetch_method.as_deref(),
+                text_extraction_status.as_deref(),
+                text_extraction_error.as_deref(),
+                evaluation.is_some(),
             )? as i32;
         } else {
             counters.skipped += 1;
@@ -2781,14 +2814,20 @@ fn save_article_sync(
             limitations, theoretical_strengths, theoretical_weaknesses,
             empirical_strengths, empirical_weaknesses,
             byline_summary, why_it_matters,
-            full_text, content_type, pdf_path, evaluated_at, workspace_id
+            full_text, content_type, pdf_path,
+            pdf_sha256, pdf_bytes, pdf_source_url, pdf_fetch_method,
+            text_extraction_status, text_extracted_at, text_extraction_error,
+            evaluated_at, workspace_id
          ) VALUES (
             ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10,
             ?11, ?12, ?13, ?14, ?15,
             ?16, ?17, ?18, ?19, ?20,
             ?21, ?22, ?23, ?24, ?25,
             ?26, ?27,
-            ?28, ?29, ?30, ?31, ?32
+            ?28, ?29, ?30,
+            ?31, ?32, ?33, ?34,
+            ?35, ?36, ?37,
+            ?38, ?39
         )",
         params![
             candidate_uid,
@@ -2821,6 +2860,13 @@ fn save_article_sync(
             full_text.clone(),
             content_type.clone(),
             pdf_path.clone(),
+            pdf_sha256.clone(),
+            pdf_bytes,
+            pdf_source_url.clone(),
+            pdf_fetch_method.clone(),
+            text_extraction_status.clone(),
+            text_extracted_at.clone(),
+            text_extraction_error.clone(),
             evaluation
                 .is_some()
                 .then(|| Utc::now().format("%Y-%m-%d %H:%M:%S").to_string()),
@@ -2829,7 +2875,7 @@ fn save_article_sync(
     );
 
     match changed {
-        Ok(0) if evaluation.is_some() => {
+        Ok(0) if evaluation.is_some() || fetched.is_some() => {
             counters.saved += update_existing_article_sync(
                 conn,
                 &candidate_uid,
@@ -2861,7 +2907,13 @@ fn save_article_sync(
                 full_text.as_deref(),
                 Some(content_type.as_str()),
                 pdf_path.as_deref(),
-                true,
+                pdf_sha256.as_deref(),
+                pdf_bytes,
+                pdf_source_url.as_deref(),
+                pdf_fetch_method.as_deref(),
+                text_extraction_status.as_deref(),
+                text_extraction_error.as_deref(),
+                evaluation.is_some(),
             )? as i32;
         }
         Ok(0) => counters.skipped += 1,
@@ -2972,6 +3024,12 @@ fn update_existing_article_sync(
     full_text: Option<&str>,
     content_type: Option<&str>,
     pdf_path: Option<&str>,
+    pdf_sha256: Option<&str>,
+    pdf_bytes: Option<i64>,
+    pdf_source_url: Option<&str>,
+    pdf_fetch_method: Option<&str>,
+    text_extraction_status: Option<&str>,
+    text_extraction_error: Option<&str>,
     mark_evaluated: bool,
 ) -> Result<usize> {
     conn.execute(
@@ -3014,7 +3072,21 @@ fn update_existing_article_sync(
                  ELSE content_type
              END,
              pdf_path = COALESCE(?29, pdf_path),
-             evaluated_at = CASE WHEN ?30 = 1 THEN datetime('now') ELSE evaluated_at END,
+             pdf_sha256 = COALESCE(?30, pdf_sha256),
+             pdf_bytes = COALESCE(?31, pdf_bytes),
+             pdf_source_url = COALESCE(?32, pdf_source_url),
+             pdf_fetch_method = COALESCE(?33, pdf_fetch_method),
+             text_extraction_status = COALESCE(?34, text_extraction_status),
+             text_extracted_at = CASE
+                 WHEN ?34 = 'extracted' THEN datetime('now')
+                 ELSE text_extracted_at
+             END,
+             text_extraction_error = CASE
+                 WHEN ?34 = 'extracted' THEN NULL
+                 WHEN ?35 IS NULL THEN text_extraction_error
+                 ELSE ?35
+             END,
+             evaluated_at = CASE WHEN ?36 = 1 THEN datetime('now') ELSE evaluated_at END,
              updated_at = datetime('now')
          WHERE uid = ?1",
         params![
@@ -3047,6 +3119,12 @@ fn update_existing_article_sync(
             full_text,
             content_type,
             pdf_path,
+            pdf_sha256,
+            pdf_bytes,
+            pdf_source_url,
+            pdf_fetch_method,
+            text_extraction_status,
+            text_extraction_error,
             mark_evaluated,
         ],
     )
@@ -3840,7 +3918,12 @@ mod tests {
         first.source = "openalex".to_string();
         first.doi = Some("10.1000/diabetes.chat".to_string());
         first.title = "Blinded Multi-Rater Comparative Evaluation".to_string();
-        assert_eq!(save_article_sync(&conn, &first, None, None, 1).unwrap().saved, 1);
+        assert_eq!(
+            save_article_sync(&conn, &first, None, None, 1)
+                .unwrap()
+                .saved,
+            1
+        );
 
         let mut same_doi = test_candidate("semantic");
         same_doi.source = "semantic_scholar".to_string();
@@ -4156,7 +4239,8 @@ mod tests {
             ("why_it_matters".to_string(), json!("Why it matters")),
         ]);
 
-        let evaluated_save = save_article_sync(&conn, &candidate, Some(&evaluation), None, 1).unwrap();
+        let evaluated_save =
+            save_article_sync(&conn, &candidate, Some(&evaluation), None, 1).unwrap();
         assert_eq!(evaluated_save.saved, 1);
         assert_eq!(evaluated_save.skipped, 0);
 
@@ -4173,6 +4257,66 @@ mod tests {
     }
 
     #[test]
+    fn fetched_pdf_payload_saves_file_metadata_and_extracted_text_state() {
+        let conn = Connection::open_in_memory().unwrap();
+        create_save_test_table(&conn);
+        let candidate = test_candidate("pdf");
+        let fetched = FetchedArticleContent {
+            full_text: Some("Extracted PDF body text".to_string()),
+            content_type: Some("pdf".to_string()),
+            pdf_path: Some("/tmp/researchwiki/pdfs/test.pdf".to_string()),
+            pdf_sha256: Some("abcdef123456".to_string()),
+            pdf_bytes: Some(12345),
+            pdf_source_url: Some("https://example.com/test.pdf".to_string()),
+            pdf_fetch_method: Some("publisher_pdf".to_string()),
+            text_extraction_status: Some("extracted".to_string()),
+            text_extraction_error: None,
+        };
+
+        let result = save_article_sync(&conn, &candidate, None, Some(&fetched), 1).unwrap();
+
+        assert_eq!(result.saved, 1);
+        let row: (
+            Option<String>,
+            Option<String>,
+            Option<String>,
+            Option<i64>,
+            Option<String>,
+            Option<String>,
+            Option<String>,
+            Option<String>,
+        ) = conn
+            .query_row(
+                "SELECT full_text, content_type, pdf_sha256, pdf_bytes, pdf_source_url,
+                        pdf_fetch_method, text_extraction_status, text_extracted_at
+                 FROM haie_rev WHERE uid = ?1",
+                [candidate.uid()],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                        row.get(5)?,
+                        row.get(6)?,
+                        row.get(7)?,
+                    ))
+                },
+            )
+            .unwrap();
+
+        assert_eq!(row.0.as_deref(), Some("Extracted PDF body text"));
+        assert_eq!(row.1.as_deref(), Some("pdf"));
+        assert_eq!(row.2.as_deref(), Some("abcdef123456"));
+        assert_eq!(row.3, Some(12345));
+        assert_eq!(row.4.as_deref(), Some("https://example.com/test.pdf"));
+        assert_eq!(row.5.as_deref(), Some("publisher_pdf"));
+        assert_eq!(row.6.as_deref(), Some("extracted"));
+        assert!(row.7.is_some(), "extracted PDFs get a timestamp");
+    }
+
+    #[test]
     fn save_skips_duplicate_articles_by_doi_or_title() {
         let conn = Connection::open_in_memory().unwrap();
         create_save_test_table(&conn);
@@ -4181,7 +4325,12 @@ mod tests {
         first.source = "openalex".to_string();
         first.doi = Some("10.1000/diabetes.chat".to_string());
         first.title = "Blinded Multi-Rater Comparative Evaluation".to_string();
-        assert_eq!(save_article_sync(&conn, &first, None, None, 1).unwrap().saved, 1);
+        assert_eq!(
+            save_article_sync(&conn, &first, None, None, 1)
+                .unwrap()
+                .saved,
+            1
+        );
 
         let mut same_doi = test_candidate("semantic");
         same_doi.source = "semantic_scholar".to_string();
@@ -4239,6 +4388,13 @@ mod tests {
                 content_type TEXT,
                 evaluated_at TEXT,
                 pdf_path TEXT,
+                pdf_sha256 TEXT,
+                pdf_bytes INTEGER,
+                pdf_source_url TEXT,
+                pdf_fetch_method TEXT,
+                text_extraction_status TEXT,
+                text_extracted_at TEXT,
+                text_extraction_error TEXT,
                 workspace_id INTEGER,
                 updated_at TEXT
             );

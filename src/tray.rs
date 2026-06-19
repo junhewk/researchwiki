@@ -9,8 +9,8 @@ mod platform {
     use std::sync::mpsc;
 
     use tray_icon::{
-        menu::{Menu, MenuEvent, MenuItem, PredefinedMenuItem},
         Icon, MouseButton, TrayIcon, TrayIconBuilder, TrayIconEvent,
+        menu::{Menu, MenuEvent, MenuItem, PredefinedMenuItem},
     };
 
     use super::TrayCommand;
@@ -113,8 +113,8 @@ mod platform {
 
             unsafe {
                 use windows_sys::Win32::UI::WindowsAndMessaging::{
-                    BringWindowToTop, IsWindow, SetForegroundWindow, ShowWindow, ShowWindowAsync,
-                    SW_RESTORE,
+                    BringWindowToTop, IsWindow, SW_RESTORE, SetForegroundWindow, ShowWindow,
+                    ShowWindowAsync,
                 };
 
                 let hwnd = hwnd as windows_sys::Win32::Foundation::HWND;

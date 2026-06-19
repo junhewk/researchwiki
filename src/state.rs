@@ -5,8 +5,8 @@ use crate::{
     services::{
         articles::ArticleService, embedding::EmbeddingService, jobs::JobService,
         knowledge_graph::KnowledgeGraphService, library::LibraryService, llm::LlmService,
-        newsletter::NewsletterService, prompts::PromptService, settings::SettingsService,
-        traces::TraceService, workspace::WorkspaceService,
+        prompts::PromptService, settings::SettingsService, traces::TraceService,
+        workspace::WorkspaceService,
     },
 };
 
@@ -18,7 +18,6 @@ pub struct AppState {
     pub knowledge_graph_service: std::sync::Arc<KnowledgeGraphService>,
     pub library_service: std::sync::Arc<LibraryService>,
     pub llm_service: std::sync::Arc<LlmService>,
-    pub newsletter_service: std::sync::Arc<NewsletterService>,
     pub settings_service: std::sync::Arc<SettingsService>,
     pub prompt_service: std::sync::Arc<PromptService>,
     pub trace_service: std::sync::Arc<TraceService>,
@@ -92,11 +91,6 @@ impl AppState {
             config.semantic_scholar_api_key_opt(),
             config.storage.pdf_dir.clone(),
         ));
-        let newsletter_service = std::sync::Arc::new(NewsletterService::new(
-            article_service.clone(),
-            llm_service.clone(),
-        ));
-
         Self {
             config,
             article_service,
@@ -104,7 +98,6 @@ impl AppState {
             knowledge_graph_service,
             library_service,
             llm_service,
-            newsletter_service,
             settings_service,
             prompt_service,
             trace_service,
