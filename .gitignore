@@ -2,6 +2,7 @@
 /data
 /.demo-data
 /.env
+/.playwright-cli/
 *.db
 *.db-*
 *.db-journal

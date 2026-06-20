@@ -87,6 +87,7 @@ pub struct KGGraphDataQuery {
     #[serde(default)]
     pub min_degree: u32,
     pub entity_types: Option<String>,
+    pub layout: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]

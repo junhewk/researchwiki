@@ -487,6 +487,7 @@ struct ApiGraphQuery {
     limit: Option<u32>,
     min_degree: Option<u32>,
     entity_types: Option<String>,
+    layout: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1410,18 +1411,29 @@ async fn knowledge_graph_page(
     let body = format!(
         r#"
 <section class="page-head"><div><h1>Knowledge Graph</h1><p>{} nodes and {} edges in this workspace.</p></div></section>
+<section class="graph-workspace">
 <section class="panel graph-panel">
   <div class="graph-toolbar">
     <label>Limit <input id="graph-limit" type="number" min="20" max="1000" value="250"></label>
     <label>Min degree <input id="graph-min-degree" type="number" min="0" value="0"></label>
     <label>Type <select id="graph-types">{type_options}</select></label>
+    <label>Layout <select id="graph-layout">
+      <option value="force">Force</option>
+      <option value="type_clusters">Type clusters</option>
+      <option value="degree_rings">Degree rings</option>
+      <option value="circle">Circle</option>
+    </select></label>
     <button id="graph-load" class="button" type="button">Reload graph</button>
+    <div class="graph-controls" aria-label="Graph controls">
+      <button id="graph-reset-layout" class="button" type="button">Reset layout</button>
+    </div>
   </div>
   <canvas id="graph-canvas" width="1200" height="680"></canvas>
 </section>
-<section class="grid two">
-  <div class="panel"><div class="panel-head"><h2>Entity types</h2></div><div class="pills">{type_counts}</div></div>
-  <div id="graph-detail" class="panel"><div class="panel-head"><h2>Entity detail</h2></div>{entity_detail}</div>
+<aside class="graph-sidebar">
+  <div class="panel graph-types-panel"><div class="panel-head"><h2>Entity types</h2></div><div class="pills">{type_counts}</div></div>
+  <div id="graph-detail" class="panel graph-detail-panel">{entity_detail}</div>
+</aside>
 </section>
 "#,
         stats.nodes, stats.edges
@@ -2107,6 +2119,7 @@ async fn api_graph_data(
                 limit: query.limit.unwrap_or(250),
                 min_degree: query.min_degree.unwrap_or(0),
                 entity_types: clean_opt(query.entity_types),
+                layout: clean_opt(query.layout),
             },
             workspace_id,
         )

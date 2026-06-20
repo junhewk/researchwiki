@@ -4223,6 +4223,7 @@ fn query_graph_data_sync(
     let limit_usize = limit as usize;
     let min_degree = i64::from(query.min_degree.min(100));
     let entity_types = parse_entity_types(query.entity_types);
+    let layout = GraphLayoutMode::from_query(query.layout.as_deref());
     let relationship_scan_limit = (limit * 8).clamp(200, 10_000);
     let relationships = query_graph_relationship_candidates(
         conn,
@@ -4275,7 +4276,6 @@ fn query_graph_data_sync(
         .filter_map(|id| entities.get(id))
         .map(graph_node_from_entity)
         .collect::<Vec<_>>();
-    apply_graph_layout(&mut nodes);
 
     let selected_names = selected_ids
         .iter()
@@ -4298,6 +4298,7 @@ fn query_graph_data_sync(
             ]),
         })
         .collect::<Vec<_>>();
+    apply_graph_layout(&mut nodes, &edges, layout);
 
     Ok(KGGraphDataResponse {
         nodes,
@@ -4510,7 +4511,54 @@ fn graph_node_from_entity(entity: &GraphEntityRow) -> KGGraphNode {
     }
 }
 
-fn apply_graph_layout(nodes: &mut [KGGraphNode]) {
+#[derive(Clone, Copy, Debug)]
+struct GraphLayoutEdge {
+    source: usize,
+    target: usize,
+    weight: f64,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct GraphLayoutPoint {
+    x: f64,
+    y: f64,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum GraphLayoutMode {
+    Force,
+    TypeClusters,
+    DegreeRings,
+    Circle,
+}
+
+impl GraphLayoutMode {
+    fn from_query(value: Option<&str>) -> Self {
+        match value
+            .unwrap_or_default()
+            .trim()
+            .to_ascii_lowercase()
+            .replace('-', "_")
+            .as_str()
+        {
+            "type" | "types" | "type_cluster" | "type_clusters" => Self::TypeClusters,
+            "degree" | "degree_ring" | "degree_rings" => Self::DegreeRings,
+            "circle" | "circular" => Self::Circle,
+            _ => Self::Force,
+        }
+    }
+
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Force => "force",
+            Self::TypeClusters => "type_clusters",
+            Self::DegreeRings => "degree_rings",
+            Self::Circle => "circle",
+        }
+    }
+}
+
+fn apply_graph_layout(nodes: &mut [KGGraphNode], edges: &[KGGraphEdge], mode: GraphLayoutMode) {
     let count = nodes.len();
     if count == 0 {
         return;
@@ -4528,25 +4576,284 @@ fn apply_graph_layout(nodes: &mut [KGGraphNode]) {
 
     if count == 1 {
         decorate_graph_node(&mut nodes[0], 0.0, 0.0, 0, max_degree);
+        nodes[0].properties.insert(
+            "layout".to_string(),
+            JsonValue::String(mode.as_str().to_string()),
+        );
         return;
     }
 
-    let max_ring = (count as f64).sqrt().ceil().max(2.0);
-    for (idx, node) in nodes.iter_mut().enumerate() {
-        if idx == 0 {
-            decorate_graph_node(node, 0.0, 0.0, idx, max_degree);
+    let positions = match mode {
+        GraphLayoutMode::Force => force_graph_positions(nodes, edges),
+        GraphLayoutMode::TypeClusters => type_cluster_graph_positions(nodes),
+        GraphLayoutMode::DegreeRings => degree_ring_graph_positions(nodes),
+        GraphLayoutMode::Circle => circle_graph_positions(count),
+    };
+
+    for (idx, (node, position)) in nodes.iter_mut().zip(positions).enumerate() {
+        decorate_graph_node(node, position.x, position.y, idx, max_degree);
+        node.properties.insert(
+            "layout".to_string(),
+            JsonValue::String(mode.as_str().to_string()),
+        );
+    }
+}
+
+fn force_graph_positions(nodes: &[KGGraphNode], edges: &[KGGraphEdge]) -> Vec<GraphLayoutPoint> {
+    let index_by_id = nodes
+        .iter()
+        .enumerate()
+        .map(|(idx, node)| (node.id.clone(), idx))
+        .collect::<HashMap<_, _>>();
+    let layout_edges = edges
+        .iter()
+        .filter_map(|edge| {
+            let source = *index_by_id.get(&edge.source)?;
+            let target = *index_by_id.get(&edge.target)?;
+            if source == target {
+                return None;
+            }
+            Some(GraphLayoutEdge {
+                source,
+                target,
+                weight: edge
+                    .properties
+                    .get("weight")
+                    .and_then(JsonValue::as_f64)
+                    .unwrap_or(1.0)
+                    .clamp(0.1, 100.0),
+            })
+        })
+        .collect::<Vec<_>>();
+
+    let mut positions = initial_graph_positions(nodes.len());
+    run_force_layout(&mut positions, &layout_edges);
+    normalize_graph_positions(&mut positions);
+    positions
+}
+
+fn type_cluster_graph_positions(nodes: &[KGGraphNode]) -> Vec<GraphLayoutPoint> {
+    let mut groups = BTreeMap::<String, Vec<usize>>::new();
+    for (idx, node) in nodes.iter().enumerate() {
+        let entity_type = node
+            .properties
+            .get("entity_type")
+            .and_then(JsonValue::as_str)
+            .unwrap_or("UNKNOWN")
+            .to_ascii_uppercase();
+        groups.entry(entity_type).or_default().push(idx);
+    }
+
+    let mut positions = vec![GraphLayoutPoint { x: 0.0, y: 0.0 }; nodes.len()];
+    let group_count = groups.len().max(1);
+    for (group_idx, members) in groups.values().enumerate() {
+        let center = if group_count == 1 {
+            GraphLayoutPoint { x: 0.0, y: 0.0 }
+        } else {
+            let angle = std::f64::consts::TAU * group_idx as f64 / group_count as f64;
+            GraphLayoutPoint {
+                x: angle.cos() * 0.62,
+                y: angle.sin() * 0.62,
+            }
+        };
+        let local_radius = (0.055 + (members.len() as f64).sqrt() * 0.018).clamp(0.08, 0.28);
+        for (member_rank, node_idx) in members.iter().copied().enumerate() {
+            let point = radial_point(member_rank, members.len(), local_radius);
+            positions[node_idx] = GraphLayoutPoint {
+                x: center.x + point.x,
+                y: center.y + point.y,
+            };
+        }
+    }
+    normalize_graph_positions(&mut positions);
+    positions
+}
+
+fn degree_ring_graph_positions(nodes: &[KGGraphNode]) -> Vec<GraphLayoutPoint> {
+    let mut ranked = nodes
+        .iter()
+        .enumerate()
+        .map(|(idx, node)| {
+            let degree = node
+                .properties
+                .get("degree")
+                .and_then(JsonValue::as_i64)
+                .unwrap_or(0);
+            let mentions = node
+                .properties
+                .get("mention_count")
+                .and_then(JsonValue::as_i64)
+                .unwrap_or(0);
+            (idx, degree, mentions, node.id.as_str())
+        })
+        .collect::<Vec<_>>();
+    ranked.sort_by(|left, right| {
+        right
+            .1
+            .cmp(&left.1)
+            .then_with(|| right.2.cmp(&left.2))
+            .then_with(|| left.3.cmp(right.3))
+    });
+
+    let mut positions = vec![GraphLayoutPoint { x: 0.0, y: 0.0 }; nodes.len()];
+    if ranked.is_empty() {
+        return positions;
+    }
+    if ranked.len() == 1 {
+        return positions;
+    }
+
+    for (rank, (node_idx, _, _, _)) in ranked.iter().copied().enumerate() {
+        if rank == 0 {
+            positions[node_idx] = GraphLayoutPoint { x: 0.0, y: 0.0 };
             continue;
         }
-        let ring = ((idx as f64).sqrt().floor() + 1.0).min(max_ring);
-        let radius = (ring / max_ring).clamp(0.18, 0.96);
-        let angle = idx as f64 * 2.399_963_229_728_653;
-        decorate_graph_node(
-            node,
-            radius * angle.cos(),
-            radius * angle.sin(),
-            idx,
-            max_degree,
-        );
+        let progress = rank as f64 / (ranked.len() - 1) as f64;
+        let radius = 0.14 + progress.sqrt() * 0.82;
+        let angle = rank as f64 * 2.399_963_229_728_653;
+        positions[node_idx] = GraphLayoutPoint {
+            x: radius * angle.cos(),
+            y: radius * angle.sin(),
+        };
+    }
+    normalize_graph_positions(&mut positions);
+    positions
+}
+
+fn circle_graph_positions(count: usize) -> Vec<GraphLayoutPoint> {
+    if count == 0 {
+        return Vec::new();
+    }
+    if count == 1 {
+        return vec![GraphLayoutPoint { x: 0.0, y: 0.0 }];
+    }
+    let mut positions = (0..count)
+        .map(|idx| {
+            let angle =
+                std::f64::consts::TAU * idx as f64 / count as f64 - std::f64::consts::FRAC_PI_2;
+            GraphLayoutPoint {
+                x: angle.cos() * 0.9,
+                y: angle.sin() * 0.9,
+            }
+        })
+        .collect::<Vec<_>>();
+    normalize_graph_positions(&mut positions);
+    positions
+}
+
+fn radial_point(rank: usize, total: usize, max_radius: f64) -> GraphLayoutPoint {
+    if total <= 1 {
+        return GraphLayoutPoint { x: 0.0, y: 0.0 };
+    }
+    let progress = (rank as f64 + 0.5) / total as f64;
+    let radius = progress.sqrt() * max_radius;
+    let angle = rank as f64 * 2.399_963_229_728_653;
+    GraphLayoutPoint {
+        x: radius * angle.cos(),
+        y: radius * angle.sin(),
+    }
+}
+
+fn initial_graph_positions(count: usize) -> Vec<GraphLayoutPoint> {
+    const GOLDEN_ANGLE: f64 = 2.399_963_229_728_653;
+    (0..count)
+        .map(|idx| {
+            let progress = (idx as f64 + 0.5) / count as f64;
+            let radius = progress.sqrt() * 0.78;
+            let angle = idx as f64 * GOLDEN_ANGLE;
+            GraphLayoutPoint {
+                x: radius * angle.cos(),
+                y: radius * angle.sin(),
+            }
+        })
+        .collect()
+}
+
+fn run_force_layout(positions: &mut [GraphLayoutPoint], edges: &[GraphLayoutEdge]) {
+    let count = positions.len();
+    if count < 2 {
+        return;
+    }
+
+    let ideal = (4.0 / count as f64).sqrt().clamp(0.08, 0.42);
+    let iterations = (140 + count.min(240)).min(320);
+    let mut displacement = vec![GraphLayoutPoint { x: 0.0, y: 0.0 }; count];
+
+    for iter in 0..iterations {
+        displacement.fill(GraphLayoutPoint { x: 0.0, y: 0.0 });
+
+        for left in 0..count {
+            for right in (left + 1)..count {
+                let dx = positions[left].x - positions[right].x;
+                let dy = positions[left].y - positions[right].y;
+                let distance = (dx * dx + dy * dy).sqrt().max(0.001);
+                let force = ((ideal * ideal) / distance).min(0.08);
+                let fx = dx / distance * force;
+                let fy = dy / distance * force;
+                displacement[left].x += fx;
+                displacement[left].y += fy;
+                displacement[right].x -= fx;
+                displacement[right].y -= fy;
+            }
+        }
+
+        for edge in edges {
+            let dx = positions[edge.target].x - positions[edge.source].x;
+            let dy = positions[edge.target].y - positions[edge.source].y;
+            let distance = (dx * dx + dy * dy).sqrt().max(0.001);
+            let weight = edge.weight.sqrt().clamp(1.0, 8.0);
+            let desired = (ideal * (1.55 / weight.powf(0.22))).clamp(0.06, 0.7);
+            let force = ((distance - desired) * 0.045 * weight).clamp(-0.08, 0.08);
+            let fx = dx / distance * force;
+            let fy = dy / distance * force;
+            displacement[edge.source].x += fx;
+            displacement[edge.source].y += fy;
+            displacement[edge.target].x -= fx;
+            displacement[edge.target].y -= fy;
+        }
+
+        for idx in 0..count {
+            displacement[idx].x -= positions[idx].x * 0.006;
+            displacement[idx].y -= positions[idx].y * 0.006;
+        }
+
+        let temperature = 0.075 * (1.0 - iter as f64 / iterations as f64).max(0.08);
+        for idx in 0..count {
+            let dx = displacement[idx].x;
+            let dy = displacement[idx].y;
+            let length = (dx * dx + dy * dy).sqrt();
+            if length > temperature {
+                positions[idx].x += dx / length * temperature;
+                positions[idx].y += dy / length * temperature;
+            } else {
+                positions[idx].x += dx;
+                positions[idx].y += dy;
+            }
+        }
+    }
+}
+
+fn normalize_graph_positions(positions: &mut [GraphLayoutPoint]) {
+    if positions.is_empty() {
+        return;
+    }
+
+    let center_x = positions.iter().map(|point| point.x).sum::<f64>() / positions.len() as f64;
+    let center_y = positions.iter().map(|point| point.y).sum::<f64>() / positions.len() as f64;
+    for point in positions.iter_mut() {
+        point.x -= center_x;
+        point.y -= center_y;
+    }
+
+    let max_extent = positions
+        .iter()
+        .map(|point| point.x.abs().max(point.y.abs()))
+        .fold(0.0_f64, f64::max)
+        .max(0.001);
+    let scale = 0.96 / max_extent;
+    for point in positions {
+        point.x = (point.x * scale).clamp(-0.96, 0.96);
+        point.y = (point.y * scale).clamp(-0.96, 0.96);
     }
 }
 
@@ -4949,15 +5256,16 @@ fn json_object<const N: usize>(pairs: [(&str, JsonValue); N]) -> Map<String, Jso
 #[cfg(test)]
 mod tests {
     use super::{
-        KG_TEXT_MAX_CHARS, KG_TEXT_TAIL_CHARS, bound_kg_text, canonicalize_relationship,
-        is_metadata_entity_name, query_graph_data_sync, validate_extraction,
-        validate_synthesis_output,
+        GraphLayoutMode, KG_TEXT_MAX_CHARS, KG_TEXT_TAIL_CHARS, apply_graph_layout, bound_kg_text,
+        canonicalize_relationship, is_metadata_entity_name, json_object, query_graph_data_sync,
+        validate_extraction, validate_synthesis_output,
     };
     use crate::models::knowledge_graph::{
-        ChunkExtraction, ExtractedEntity, ExtractedRelationship, KGGraphDataQuery,
-        SynthesisGenerationOutput,
+        ChunkExtraction, ExtractedEntity, ExtractedRelationship, KGGraphDataQuery, KGGraphEdge,
+        KGGraphNode, SynthesisGenerationOutput,
     };
     use rusqlite::{Connection, params};
+    use serde_json::json;
 
     #[test]
     fn kg_text_bound_samples_head_and_tail() {
@@ -5089,6 +5397,7 @@ mod tests {
             limit: 4,
             min_degree: 0,
             entity_types: None,
+            layout: None,
         };
 
         let graph = query_graph_data_sync(&conn, query, 1).expect("graph data");
@@ -5149,6 +5458,7 @@ mod tests {
             limit: 10,
             min_degree: 2,
             entity_types: Some("concept".to_string()),
+            layout: None,
         };
 
         let graph = query_graph_data_sync(&conn, query, 1).expect("graph data");
@@ -5165,6 +5475,148 @@ mod tests {
         assert!(!node_ids.contains(&"Clinical AI"));
         assert!(!node_ids.contains(&"Bias Audit"));
         assert_eq!(graph.edges.len(), 3);
+    }
+
+    #[test]
+    fn force_graph_layout_is_deterministic_and_normalized() {
+        let mut first = layout_test_nodes();
+        let mut second = layout_test_nodes();
+        let edges = layout_test_edges();
+
+        apply_graph_layout(&mut first, &edges, GraphLayoutMode::Force);
+        apply_graph_layout(&mut second, &edges, GraphLayoutMode::Force);
+
+        for (left, right) in first.iter().zip(second.iter()) {
+            let left_x = graph_coord(left, "x");
+            let left_y = graph_coord(left, "y");
+            let right_x = graph_coord(right, "x");
+            let right_y = graph_coord(right, "y");
+
+            assert!(left_x.is_finite());
+            assert!(left_y.is_finite());
+            assert!(left_x.abs() <= 0.960001);
+            assert!(left_y.abs() <= 0.960001);
+            assert!((left_x - right_x).abs() < 1e-12);
+            assert!((left_y - right_y).abs() < 1e-12);
+        }
+    }
+
+    #[test]
+    fn force_graph_layout_keeps_connected_nodes_closer() {
+        let mut nodes = vec![
+            layout_test_node("Connected A", 1),
+            layout_test_node("Connected B", 1),
+            layout_test_node("Distant C", 0),
+            layout_test_node("Distant D", 0),
+        ];
+        let edges = vec![layout_test_edge("Connected A", "Connected B", 25.0)];
+
+        apply_graph_layout(&mut nodes, &edges, GraphLayoutMode::Force);
+
+        let connected_distance = graph_distance(&nodes[0], &nodes[1]);
+        let nearest_unconnected = graph_distance(&nodes[0], &nodes[2])
+            .min(graph_distance(&nodes[0], &nodes[3]))
+            .min(graph_distance(&nodes[1], &nodes[2]))
+            .min(graph_distance(&nodes[1], &nodes[3]));
+
+        assert!(
+            connected_distance < nearest_unconnected,
+            "connected distance {connected_distance} should be less than nearest unconnected {nearest_unconnected}"
+        );
+    }
+
+    #[test]
+    fn graph_layout_modes_return_distinct_layout_names_and_coordinates() {
+        let edges = layout_test_edges();
+        let modes = [
+            GraphLayoutMode::Force,
+            GraphLayoutMode::TypeClusters,
+            GraphLayoutMode::DegreeRings,
+            GraphLayoutMode::Circle,
+        ];
+        let mut signatures = Vec::new();
+
+        for mode in modes {
+            let mut nodes = layout_test_nodes();
+            apply_graph_layout(&mut nodes, &edges, mode);
+            assert_eq!(
+                nodes[0]
+                    .properties
+                    .get("layout")
+                    .and_then(|value| value.as_str()),
+                Some(mode.as_str())
+            );
+            signatures.push(
+                nodes
+                    .iter()
+                    .map(|node| {
+                        (
+                            (graph_coord(node, "x") * 1000.0).round() as i64,
+                            (graph_coord(node, "y") * 1000.0).round() as i64,
+                        )
+                    })
+                    .collect::<Vec<_>>(),
+            );
+        }
+
+        signatures.dedup();
+        assert_eq!(signatures.len(), modes.len());
+    }
+
+    fn layout_test_nodes() -> Vec<KGGraphNode> {
+        vec![
+            layout_test_node("Clinical AI", 4),
+            layout_test_node("Bias Audit", 3),
+            layout_test_node("Consent", 3),
+            layout_test_node("Model Card", 2),
+            layout_test_node("Governance", 1),
+            layout_test_node("Evaluation", 1),
+        ]
+    }
+
+    fn layout_test_edges() -> Vec<KGGraphEdge> {
+        vec![
+            layout_test_edge("Clinical AI", "Bias Audit", 12.0),
+            layout_test_edge("Clinical AI", "Consent", 8.0),
+            layout_test_edge("Consent", "Model Card", 6.0),
+            layout_test_edge("Model Card", "Governance", 4.0),
+            layout_test_edge("Bias Audit", "Evaluation", 3.0),
+        ]
+    }
+
+    fn layout_test_node(name: &str, degree: i64) -> KGGraphNode {
+        KGGraphNode {
+            id: name.to_string(),
+            labels: vec!["Entity".to_string()],
+            properties: json_object([
+                ("name", json!(name)),
+                ("entity_type", json!("CONCEPT")),
+                ("description", json!(format!("{name} description"))),
+                ("degree", json!(degree)),
+                ("mention_count", json!(degree * 10)),
+            ]),
+        }
+    }
+
+    fn layout_test_edge(source: &str, target: &str, weight: f64) -> KGGraphEdge {
+        KGGraphEdge {
+            source: source.to_string(),
+            target: target.to_string(),
+            properties: json_object([("weight", json!(weight))]),
+        }
+    }
+
+    fn graph_coord(node: &KGGraphNode, key: &str) -> f64 {
+        node.properties
+            .get(key)
+            .and_then(|value| value.as_f64())
+            .expect("layout coordinate")
+    }
+
+    fn graph_distance(left: &KGGraphNode, right: &KGGraphNode) -> f64 {
+        let dx = graph_coord(left, "x") - graph_coord(right, "x");
+        let dy = graph_coord(left, "y") - graph_coord(right, "y");
+        (dx * dx + dy * dy).sqrt()
     }
 
     fn graph_test_db() -> Connection {

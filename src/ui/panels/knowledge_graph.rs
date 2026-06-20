@@ -46,6 +46,7 @@ pub struct Panel {
     limit: u32,
     min_degree: u32,
     entity_type: String,
+    layout: GraphLayoutChoice,
     nodes: Vec<KgNodeView>,
     edges: Vec<KgEdgeView>,
     graph_loading: bool,
@@ -79,6 +80,35 @@ struct KgEdgeView {
     source: usize,
     target: usize,
     weight: f64,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+enum GraphLayoutChoice {
+    #[default]
+    Force,
+    TypeClusters,
+    DegreeRings,
+    Circle,
+}
+
+impl GraphLayoutChoice {
+    fn as_query(self) -> &'static str {
+        match self {
+            Self::Force => "force",
+            Self::TypeClusters => "type_clusters",
+            Self::DegreeRings => "degree_rings",
+            Self::Circle => "circle",
+        }
+    }
+
+    fn label(self, ctx: &PanelCtx<'_>) -> String {
+        match self {
+            Self::Force => ctx.t("Force").to_string(),
+            Self::TypeClusters => ctx.t("Type clusters").to_string(),
+            Self::DegreeRings => ctx.t("Degree rings").to_string(),
+            Self::Circle => ctx.t("Circle").to_string(),
+        }
+    }
 }
 
 impl Panel {
@@ -237,6 +267,31 @@ impl Panel {
                         ui.selectable_value(&mut self.entity_type, kind, label);
                     }
                 });
+            let previous_layout = self.layout;
+            egui::ComboBox::from_id_salt("kg-layout-mode")
+                .selected_text(self.layout.label(ctx))
+                .width(150.0)
+                .show_ui(ui, |ui| {
+                    ui.selectable_value(&mut self.layout, GraphLayoutChoice::Force, ctx.t("Force"));
+                    ui.selectable_value(
+                        &mut self.layout,
+                        GraphLayoutChoice::TypeClusters,
+                        ctx.t("Type clusters"),
+                    );
+                    ui.selectable_value(
+                        &mut self.layout,
+                        GraphLayoutChoice::DegreeRings,
+                        ctx.t("Degree rings"),
+                    );
+                    ui.selectable_value(
+                        &mut self.layout,
+                        GraphLayoutChoice::Circle,
+                        ctx.t("Circle"),
+                    );
+                });
+            if self.layout != previous_layout {
+                self.load_graph(ctx);
+            }
             if ui.button(ctx.t("Load graph")).clicked() {
                 self.load_graph(ctx);
             }
@@ -244,11 +299,19 @@ impl Panel {
                 style::loading_indicator(ui, ctx.t("Loading…"));
             }
             ui.separator();
-            ui.add(
-                egui::Slider::new(&mut self.view_zoom, MIN_ZOOM..=MAX_ZOOM)
-                    .logarithmic(true)
-                    .text(ctx.t("Zoom")),
-            );
+            ui.horizontal(|ui| {
+                if ui.button("−").on_hover_text(ctx.t("Zoom out")).clicked() {
+                    self.zoom_by(1.0 / 1.2);
+                }
+                ui.add(
+                    egui::Slider::new(&mut self.view_zoom, MIN_ZOOM..=MAX_ZOOM)
+                        .logarithmic(true)
+                        .text(ctx.t("Zoom")),
+                );
+                if ui.button("+").on_hover_text(ctx.t("Zoom in")).clicked() {
+                    self.zoom_by(1.2);
+                }
+            });
             if ui.button(ctx.t("Reset view")).clicked() {
                 self.reset_view();
             }
@@ -620,6 +683,7 @@ impl Panel {
             limit: self.limit.max(1),
             min_degree: self.min_degree,
             entity_types: opt(&self.entity_type),
+            layout: Some(self.layout.as_query().to_string()),
         };
         let workspace_id = ctx.active_workspace_id;
         ctx.handle.spawn(async move {
@@ -692,6 +756,10 @@ impl Panel {
         for node in &mut self.nodes {
             node.pos = node.home_pos;
         }
+    }
+
+    fn zoom_by(&mut self, factor: f32) {
+        self.view_zoom = (self.view_zoom * factor).clamp(MIN_ZOOM, MAX_ZOOM);
     }
 
     fn reset_view_transform(&mut self) {
