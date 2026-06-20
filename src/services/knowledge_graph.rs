@@ -540,95 +540,7 @@ impl KnowledgeGraphService {
 
         run_blocking(move || {
             let conn = crate::db::open_connection(&*database_path)?;
-            let limit = i64::from(query.limit.clamp(1, 2000));
-            let min_degree = i64::from(query.min_degree.min(100));
-            let entity_types = parse_entity_types(query.entity_types);
-
-            // Workspace filter first so its `?` aligns with the leading param.
-            let mut params = vec![Value::Integer(workspace_id), Value::Integer(min_degree)];
-            let mut filters = vec![
-                format!("e.id IN {WS_ENTITY_SCOPE}"),
-                "COALESCE(d.degree, 0) >= ?".to_string(),
-            ];
-
-            if !entity_types.is_empty() {
-                let placeholders = (0..entity_types.len())
-                    .map(|_| "?".to_string())
-                    .collect::<Vec<_>>()
-                    .join(", ");
-                filters.push(format!("UPPER(e.entity_type) IN ({placeholders})"));
-                params.extend(entity_types.iter().cloned().map(Value::Text));
-            }
-
-            params.push(Value::Integer(limit));
-
-            let where_clause = filters.join(" AND ");
-            let sql = format!(
-                "
-                WITH degrees AS (
-                    SELECT entity_id, COUNT(*) AS degree
-                    FROM (
-                        SELECT source_entity_id AS entity_id FROM kg_relationships
-                        UNION ALL
-                        SELECT target_entity_id AS entity_id FROM kg_relationships
-                    )
-                    GROUP BY entity_id
-                )
-                SELECT e.id, e.canonical_name, e.entity_type, e.description, e.mention_count,
-                       COALESCE(d.degree, 0) AS degree
-                FROM kg_entities e
-                LEFT JOIN degrees d ON d.entity_id = e.id
-                WHERE {where_clause}
-                ORDER BY COALESCE(d.degree, 0) DESC, e.mention_count DESC, e.canonical_name ASC
-                LIMIT ?
-                "
-            );
-
-            let mut stmt = conn.prepare(&sql)?;
-            let rows = stmt.query_map(params_from_iter(params.iter()), |row| {
-                Ok((
-                    row.get::<_, i64>(0)?,
-                    row.get::<_, String>(1)?,
-                    row.get::<_, Option<String>>(2)?
-                        .unwrap_or_else(|| "UNKNOWN".to_string()),
-                    row.get::<_, Option<String>>(3)?,
-                    row.get::<_, Option<i64>>(4)?.unwrap_or(0),
-                    row.get::<_, i64>(5)?,
-                ))
-            })?;
-
-            let mut node_ids = Vec::new();
-            let mut node_names = Vec::new();
-            let mut nodes = Vec::new();
-
-            for row in rows {
-                let (id, name, entity_type, description, mention_count, degree) = row?;
-                node_ids.push(id);
-                node_names.push(name.clone());
-                nodes.push(KGGraphNode {
-                    id: name.clone(),
-                    labels: vec![entity_type.clone()],
-                    properties: json_object([
-                        ("entity_type", JsonValue::String(entity_type)),
-                        (
-                            "description",
-                            description
-                                .map(JsonValue::String)
-                                .unwrap_or(JsonValue::Null),
-                        ),
-                        ("mention_count", JsonValue::Number(mention_count.into())),
-                        ("degree", JsonValue::Number(degree.into())),
-                    ]),
-                });
-            }
-
-            let edges = query_graph_edges(&conn, &node_ids, &node_names, (limit * 6).max(100))?;
-
-            Ok(KGGraphDataResponse {
-                nodes,
-                edges,
-                error: None,
-            })
+            query_graph_data_sync(&conn, query, workspace_id)
         })
         .await
     }
@@ -2380,6 +2292,33 @@ impl KnowledgeGraphService {
         })
     }
 
+    pub async fn wiki_link_targets(&self, workspace_id: i64) -> Result<Vec<String>, AppError> {
+        let database_path = self.database_path.clone();
+
+        run_blocking(move || {
+            let conn = crate::db::open_connection(&*database_path)?;
+            let sql = format!(
+                "
+                SELECT e.canonical_name
+                FROM kg_entity_syntheses s
+                JOIN kg_entities e ON e.id = s.entity_id
+                WHERE COALESCE(s.source_article_count, 0) >= ?1
+                  AND s.entity_id IN (SELECT kae.entity_id FROM kg_article_entities kae
+                       JOIN haie_rev h ON h.uid = kae.article_uid WHERE h.workspace_id = ?2)
+                  AND {WIKI_ENTITY_FILTER_SQL}
+                ORDER BY LENGTH(e.canonical_name) DESC, e.canonical_name ASC
+                "
+            );
+            let mut stmt = conn.prepare(&sql)?;
+            let rows = stmt.query_map(params![WIKI_MIN_SOURCE_ARTICLES, workspace_id], |row| {
+                row.get::<_, String>(0)
+            })?;
+            rows.collect::<std::result::Result<Vec<_>, _>>()
+                .map_err(anyhow::Error::from)
+        })
+        .await
+    }
+
     pub async fn list_syntheses(
         &self,
         query: KGSynthesisListQuery,
@@ -3884,7 +3823,7 @@ fn load_wiki_sources_for_entity(
         ",
     )?;
     let rows = stmt.query_map([entity_id], map_wiki_source_row)?;
-    rows.collect::<Result<Vec<_>, _>>()
+    rows.collect::<std::result::Result<Vec<_>, _>>()
         .map_err(anyhow::Error::from)
 }
 
@@ -3899,7 +3838,7 @@ fn load_all_wiki_sources(conn: &Connection) -> Result<Vec<WikiSourceArticle>, an
         ",
     )?;
     let rows = stmt.query_map([], map_wiki_source_row)?;
-    rows.collect::<Result<Vec<_>, _>>()
+    rows.collect::<std::result::Result<Vec<_>, _>>()
         .map_err(anyhow::Error::from)
 }
 
@@ -4257,67 +4196,413 @@ fn entity_link_filename(index: &[KGEntitySynthesisSummary], entity_name: &str) -
         .map(|item| entity_markdown_filename(item.entity_id, &item.entity_name))
 }
 
-fn query_graph_edges(
+#[derive(Clone, Debug)]
+struct GraphEntityRow {
+    id: i64,
+    name: String,
+    entity_type: String,
+    description: Option<String>,
+    mention_count: i64,
+    degree: i64,
+}
+
+#[derive(Clone, Debug)]
+struct GraphRelationshipRow {
+    source: GraphEntityRow,
+    target: GraphEntityRow,
+    relationship_type: String,
+    weight: f64,
+}
+
+fn query_graph_data_sync(
     conn: &Connection,
-    node_ids: &[i64],
-    node_names: &[String],
-    limit: i64,
-) -> Result<Vec<KGGraphEdge>, anyhow::Error> {
-    if node_ids.is_empty() {
-        return Ok(Vec::new());
-    }
+    query: KGGraphDataQuery,
+    workspace_id: i64,
+) -> Result<KGGraphDataResponse, anyhow::Error> {
+    let limit = i64::from(query.limit.clamp(1, 2000));
+    let limit_usize = limit as usize;
+    let min_degree = i64::from(query.min_degree.min(100));
+    let entity_types = parse_entity_types(query.entity_types);
+    let relationship_scan_limit = (limit * 8).clamp(200, 10_000);
+    let relationships = query_graph_relationship_candidates(
+        conn,
+        workspace_id,
+        min_degree,
+        &entity_types,
+        relationship_scan_limit,
+    )?;
 
-    let placeholders = vec!["?"; node_ids.len()].join(", ");
-    let sql = format!(
-        "
-        SELECT src.canonical_name, tgt.canonical_name, rel.relationship_type, rel.weight
-        FROM kg_relationships rel
-        JOIN kg_entities src ON src.id = rel.source_entity_id
-        JOIN kg_entities tgt ON tgt.id = rel.target_entity_id
-        WHERE rel.source_entity_id IN ({placeholders})
-          AND rel.target_entity_id IN ({placeholders})
-        ORDER BY rel.weight DESC, src.canonical_name ASC, tgt.canonical_name ASC
-        LIMIT ?
-        "
-    );
+    let mut selected_ids = Vec::<i64>::new();
+    let mut selected_set = BTreeSet::<i64>::new();
+    let mut entities = HashMap::<i64, GraphEntityRow>::new();
+    let mut edge_rows = Vec::<GraphRelationshipRow>::new();
 
-    let mut params = node_ids
-        .iter()
-        .copied()
-        .map(Value::Integer)
-        .collect::<Vec<_>>();
-    params.extend(node_ids.iter().copied().map(Value::Integer));
-    params.push(Value::Integer(limit));
-
-    let valid_names = node_names.iter().cloned().collect::<BTreeSet<_>>();
-    let mut stmt = conn.prepare(&sql)?;
-    let rows = stmt.query_map(params_from_iter(params.iter()), |row| {
-        let source: String = row.get(0)?;
-        let target: String = row.get(1)?;
-        Ok((
-            source,
-            target,
-            row.get::<_, String>(2)?,
-            row.get::<_, Option<f64>>(3)?.unwrap_or(1.0),
-        ))
-    })?;
-
-    let mut edges = Vec::new();
-    for row in rows {
-        let (source, target, relationship_type, weight) = row?;
-        if valid_names.contains(&source) && valid_names.contains(&target) {
-            edges.push(KGGraphEdge {
-                source,
-                target,
-                properties: json_object([
-                    ("relationship_type", JsonValue::String(relationship_type)),
-                    ("weight", json!(weight)),
-                ]),
-            });
+    for rel in relationships {
+        let source_selected = selected_set.contains(&rel.source.id);
+        let target_selected = selected_set.contains(&rel.target.id);
+        let needed = usize::from(!source_selected) + usize::from(!target_selected);
+        if selected_ids.len() + needed <= limit_usize {
+            if !source_selected {
+                selected_set.insert(rel.source.id);
+                selected_ids.push(rel.source.id);
+                entities.insert(rel.source.id, rel.source.clone());
+            }
+            if !target_selected {
+                selected_set.insert(rel.target.id);
+                selected_ids.push(rel.target.id);
+                entities.insert(rel.target.id, rel.target.clone());
+            }
+            edge_rows.push(rel);
+        } else if source_selected && target_selected {
+            edge_rows.push(rel);
         }
     }
 
-    Ok(edges)
+    if min_degree == 0 && selected_ids.len() < limit_usize {
+        let missing = limit_usize - selected_ids.len();
+        for entity in
+            query_extra_graph_entities(conn, workspace_id, &selected_ids, &entity_types, missing)?
+        {
+            if selected_set.insert(entity.id) {
+                selected_ids.push(entity.id);
+                entities.insert(entity.id, entity);
+            }
+        }
+    }
+
+    let mut nodes = selected_ids
+        .iter()
+        .filter_map(|id| entities.get(id))
+        .map(graph_node_from_entity)
+        .collect::<Vec<_>>();
+    apply_graph_layout(&mut nodes);
+
+    let selected_names = selected_ids
+        .iter()
+        .filter_map(|id| entities.get(id).map(|entity| entity.name.clone()))
+        .collect::<BTreeSet<_>>();
+    let edges = edge_rows
+        .into_iter()
+        .filter(|edge| {
+            selected_names.contains(&edge.source.name) && selected_names.contains(&edge.target.name)
+        })
+        .map(|edge| KGGraphEdge {
+            source: edge.source.name,
+            target: edge.target.name,
+            properties: json_object([
+                (
+                    "relationship_type",
+                    JsonValue::String(edge.relationship_type),
+                ),
+                ("weight", json!(edge.weight)),
+            ]),
+        })
+        .collect::<Vec<_>>();
+
+    Ok(KGGraphDataResponse {
+        nodes,
+        edges,
+        error: None,
+    })
+}
+
+fn scoped_degrees_cte() -> &'static str {
+    "
+    WITH scoped_entities AS (
+        SELECT DISTINCT kae.entity_id AS id
+        FROM kg_article_entities kae
+        JOIN haie_rev h ON h.uid = kae.article_uid
+        WHERE h.workspace_id = ?
+    ),
+    degrees AS (
+        SELECT entity_id, COUNT(*) AS degree
+        FROM (
+            SELECT rel.source_entity_id AS entity_id
+            FROM kg_relationships rel
+            WHERE rel.source_entity_id IN (SELECT id FROM scoped_entities)
+              AND rel.target_entity_id IN (SELECT id FROM scoped_entities)
+            UNION ALL
+            SELECT rel.target_entity_id AS entity_id
+            FROM kg_relationships rel
+            WHERE rel.source_entity_id IN (SELECT id FROM scoped_entities)
+              AND rel.target_entity_id IN (SELECT id FROM scoped_entities)
+        )
+        GROUP BY entity_id
+    )
+    "
+}
+
+fn query_graph_relationship_candidates(
+    conn: &Connection,
+    workspace_id: i64,
+    min_degree: i64,
+    entity_types: &[String],
+    limit: i64,
+) -> Result<Vec<GraphRelationshipRow>, anyhow::Error> {
+    let mut filters = vec![
+        "rel.source_entity_id IN (SELECT id FROM scoped_entities)".to_string(),
+        "rel.target_entity_id IN (SELECT id FROM scoped_entities)".to_string(),
+        "COALESCE(ds.degree, 0) >= ?".to_string(),
+        "COALESCE(dt.degree, 0) >= ?".to_string(),
+        graph_entity_filter_sql("src"),
+        graph_entity_filter_sql("tgt"),
+    ];
+    let mut params = vec![
+        Value::Integer(workspace_id),
+        Value::Integer(min_degree),
+        Value::Integer(min_degree),
+    ];
+
+    if !entity_types.is_empty() {
+        let placeholders = vec!["?"; entity_types.len()].join(", ");
+        filters.push(format!(
+            "UPPER(COALESCE(src.entity_type, '')) IN ({placeholders})"
+        ));
+        filters.push(format!(
+            "UPPER(COALESCE(tgt.entity_type, '')) IN ({placeholders})"
+        ));
+        params.extend(entity_types.iter().cloned().map(Value::Text));
+        params.extend(entity_types.iter().cloned().map(Value::Text));
+    }
+    params.push(Value::Integer(limit));
+
+    let sql = format!(
+        "
+        {}
+        SELECT
+            src.id, src.canonical_name, src.entity_type, src.description, src.mention_count,
+            COALESCE(ds.degree, 0) AS source_degree,
+            tgt.id, tgt.canonical_name, tgt.entity_type, tgt.description, tgt.mention_count,
+            COALESCE(dt.degree, 0) AS target_degree,
+            rel.relationship_type, rel.weight
+        FROM kg_relationships rel
+        JOIN kg_entities src ON src.id = rel.source_entity_id
+        JOIN kg_entities tgt ON tgt.id = rel.target_entity_id
+        LEFT JOIN degrees ds ON ds.entity_id = src.id
+        LEFT JOIN degrees dt ON dt.entity_id = tgt.id
+        WHERE {}
+        ORDER BY COALESCE(rel.weight, 1.0) DESC,
+                 src.canonical_name ASC,
+                 tgt.canonical_name ASC,
+                 rel.relationship_type ASC
+        LIMIT ?
+        ",
+        scoped_degrees_cte(),
+        filters.join(" AND ")
+    );
+
+    let mut stmt = conn.prepare(&sql)?;
+    let rows = stmt.query_map(params_from_iter(params.iter()), |row| {
+        Ok(GraphRelationshipRow {
+            source: GraphEntityRow {
+                id: row.get(0)?,
+                name: row.get(1)?,
+                entity_type: row
+                    .get::<_, Option<String>>(2)?
+                    .unwrap_or_else(|| "UNKNOWN".to_string()),
+                description: row.get(3)?,
+                mention_count: row.get::<_, Option<i64>>(4)?.unwrap_or(0),
+                degree: row.get(5)?,
+            },
+            target: GraphEntityRow {
+                id: row.get(6)?,
+                name: row.get(7)?,
+                entity_type: row
+                    .get::<_, Option<String>>(8)?
+                    .unwrap_or_else(|| "UNKNOWN".to_string()),
+                description: row.get(9)?,
+                mention_count: row.get::<_, Option<i64>>(10)?.unwrap_or(0),
+                degree: row.get(11)?,
+            },
+            relationship_type: row.get(12)?,
+            weight: row.get::<_, Option<f64>>(13)?.unwrap_or(1.0),
+        })
+    })?;
+
+    rows.collect::<Result<Vec<_>, _>>()
+        .map_err(anyhow::Error::from)
+}
+
+fn query_extra_graph_entities(
+    conn: &Connection,
+    workspace_id: i64,
+    selected_ids: &[i64],
+    entity_types: &[String],
+    limit: usize,
+) -> Result<Vec<GraphEntityRow>, anyhow::Error> {
+    if limit == 0 {
+        return Ok(Vec::new());
+    }
+
+    let mut filters = vec![
+        "e.id IN (SELECT id FROM scoped_entities)".to_string(),
+        WIKI_ENTITY_FILTER_SQL.to_string(),
+    ];
+    let mut params = vec![Value::Integer(workspace_id)];
+    if !selected_ids.is_empty() {
+        let placeholders = vec!["?"; selected_ids.len()].join(", ");
+        filters.push(format!("e.id NOT IN ({placeholders})"));
+        params.extend(selected_ids.iter().copied().map(Value::Integer));
+    }
+    if !entity_types.is_empty() {
+        let placeholders = vec!["?"; entity_types.len()].join(", ");
+        filters.push(format!(
+            "UPPER(COALESCE(e.entity_type, '')) IN ({placeholders})"
+        ));
+        params.extend(entity_types.iter().cloned().map(Value::Text));
+    }
+    params.push(Value::Integer(limit as i64));
+
+    let sql = format!(
+        "
+        {}
+        SELECT e.id, e.canonical_name, e.entity_type, e.description, e.mention_count,
+               COALESCE(d.degree, 0) AS degree
+        FROM kg_entities e
+        LEFT JOIN degrees d ON d.entity_id = e.id
+        WHERE {}
+        ORDER BY e.mention_count DESC, COALESCE(d.degree, 0) DESC, e.canonical_name ASC
+        LIMIT ?
+        ",
+        scoped_degrees_cte(),
+        filters.join(" AND ")
+    );
+
+    let mut stmt = conn.prepare(&sql)?;
+    let rows = stmt.query_map(params_from_iter(params.iter()), |row| {
+        Ok(GraphEntityRow {
+            id: row.get(0)?,
+            name: row.get(1)?,
+            entity_type: row
+                .get::<_, Option<String>>(2)?
+                .unwrap_or_else(|| "UNKNOWN".to_string()),
+            description: row.get(3)?,
+            mention_count: row.get::<_, Option<i64>>(4)?.unwrap_or(0),
+            degree: row.get(5)?,
+        })
+    })?;
+
+    rows.collect::<Result<Vec<_>, _>>()
+        .map_err(anyhow::Error::from)
+}
+
+fn graph_node_from_entity(entity: &GraphEntityRow) -> KGGraphNode {
+    KGGraphNode {
+        id: entity.name.clone(),
+        labels: vec![entity.entity_type.clone()],
+        properties: json_object([
+            ("name", JsonValue::String(entity.name.clone())),
+            ("entity_type", JsonValue::String(entity.entity_type.clone())),
+            (
+                "description",
+                entity
+                    .description
+                    .clone()
+                    .map(JsonValue::String)
+                    .unwrap_or(JsonValue::Null),
+            ),
+            (
+                "mention_count",
+                JsonValue::Number(entity.mention_count.into()),
+            ),
+            ("degree", JsonValue::Number(entity.degree.into())),
+        ]),
+    }
+}
+
+fn apply_graph_layout(nodes: &mut [KGGraphNode]) {
+    let count = nodes.len();
+    if count == 0 {
+        return;
+    }
+    let max_degree = nodes
+        .iter()
+        .filter_map(|node| {
+            node.properties
+                .get("degree")
+                .and_then(JsonValue::as_i64)
+                .map(|degree| degree.max(1))
+        })
+        .max()
+        .unwrap_or(1);
+
+    if count == 1 {
+        decorate_graph_node(&mut nodes[0], 0.0, 0.0, 0, max_degree);
+        return;
+    }
+
+    let max_ring = (count as f64).sqrt().ceil().max(2.0);
+    for (idx, node) in nodes.iter_mut().enumerate() {
+        if idx == 0 {
+            decorate_graph_node(node, 0.0, 0.0, idx, max_degree);
+            continue;
+        }
+        let ring = ((idx as f64).sqrt().floor() + 1.0).min(max_ring);
+        let radius = (ring / max_ring).clamp(0.18, 0.96);
+        let angle = idx as f64 * 2.399_963_229_728_653;
+        decorate_graph_node(
+            node,
+            radius * angle.cos(),
+            radius * angle.sin(),
+            idx,
+            max_degree,
+        );
+    }
+}
+
+fn decorate_graph_node(
+    node: &mut KGGraphNode,
+    x: f64,
+    y: f64,
+    label_priority: usize,
+    max_degree: i64,
+) {
+    let degree = node
+        .properties
+        .get("degree")
+        .and_then(JsonValue::as_i64)
+        .unwrap_or(0);
+    let entity_type = node
+        .properties
+        .get("entity_type")
+        .and_then(JsonValue::as_str)
+        .unwrap_or("UNKNOWN")
+        .to_string();
+    node.properties.insert("x".to_string(), json!(x));
+    node.properties.insert("y".to_string(), json!(y));
+    node.properties.insert(
+        "radius".to_string(),
+        json!(graph_node_radius(degree, max_degree)),
+    );
+    node.properties.insert(
+        "color".to_string(),
+        JsonValue::String(graph_entity_color_hex(&entity_type).to_string()),
+    );
+    node.properties
+        .insert("label_priority".to_string(), json!(label_priority));
+}
+
+fn graph_node_radius(degree: i64, max_degree: i64) -> f64 {
+    let degree = degree.max(0) as f64;
+    let max_degree = max_degree.max(1) as f64;
+    4.5 + 8.0 * (degree / max_degree).sqrt()
+}
+
+fn graph_entity_color_hex(entity_type: &str) -> &'static str {
+    match entity_type.to_ascii_uppercase().as_str() {
+        "CONCEPT" => "#5f92dc",
+        "TECHNOLOGY" => "#50aa84",
+        "METHODOLOGY" => "#ca8f3d",
+        "DATASET" => "#a57ccd",
+        "ORGANIZATION" => "#d27670",
+        "REGULATION" => "#769c5c",
+        "MEDICAL_CONDITION" => "#bc6f99",
+        _ => "#8296a5",
+    }
+}
+
+fn graph_entity_filter_sql(alias: &str) -> String {
+    WIKI_ENTITY_FILTER_SQL.replace("e.", &format!("{alias}."))
 }
 
 /// Passive relationship phrasings and their active counterparts. A passive
@@ -4665,11 +4950,14 @@ fn json_object<const N: usize>(pairs: [(&str, JsonValue); N]) -> Map<String, Jso
 mod tests {
     use super::{
         KG_TEXT_MAX_CHARS, KG_TEXT_TAIL_CHARS, bound_kg_text, canonicalize_relationship,
-        is_metadata_entity_name, validate_extraction, validate_synthesis_output,
+        is_metadata_entity_name, query_graph_data_sync, validate_extraction,
+        validate_synthesis_output,
     };
     use crate::models::knowledge_graph::{
-        ChunkExtraction, ExtractedEntity, ExtractedRelationship, SynthesisGenerationOutput,
+        ChunkExtraction, ExtractedEntity, ExtractedRelationship, KGGraphDataQuery,
+        SynthesisGenerationOutput,
     };
+    use rusqlite::{Connection, params};
 
     #[test]
     fn kg_text_bound_samples_head_and_tail() {
@@ -4792,5 +5080,185 @@ mod tests {
         assert!(!is_metadata_entity_name("LLM"));
         assert!(!is_metadata_entity_name("Machine Learning"));
         assert!(!is_metadata_entity_name("ChatGPT-4o"));
+    }
+
+    #[test]
+    fn graph_data_prefers_relationship_pairs_over_isolated_mentions() {
+        let conn = graph_test_db();
+        let query = KGGraphDataQuery {
+            limit: 4,
+            min_degree: 0,
+            entity_types: None,
+        };
+
+        let graph = query_graph_data_sync(&conn, query, 1).expect("graph data");
+        let node_ids = graph
+            .nodes
+            .iter()
+            .map(|node| node.id.as_str())
+            .collect::<Vec<_>>();
+
+        assert_eq!(node_ids.len(), 4);
+        assert!(node_ids.contains(&"Clinical AI"));
+        assert!(node_ids.contains(&"Bias Audit"));
+        assert!(node_ids.contains(&"Consent"));
+        assert!(node_ids.contains(&"Model Card"));
+        assert!(!node_ids.contains(&"Popular Isolated"));
+        assert!(!node_ids.contains(&"The Author(s)"));
+        assert!(!node_ids.contains(&"Creative Commons Attribution License CC-BY 4.0"));
+        assert_eq!(graph.edges.len(), 2);
+
+        for node in &graph.nodes {
+            assert!(
+                node.properties
+                    .get("x")
+                    .and_then(|value| value.as_f64())
+                    .is_some()
+            );
+            assert!(
+                node.properties
+                    .get("y")
+                    .and_then(|value| value.as_f64())
+                    .is_some()
+            );
+            assert!(
+                node.properties
+                    .get("radius")
+                    .and_then(|value| value.as_f64())
+                    .is_some_and(|radius| radius > 0.0)
+            );
+            assert!(
+                node.properties
+                    .get("color")
+                    .and_then(|value| value.as_str())
+                    .is_some_and(|color| color.starts_with('#'))
+            );
+            assert!(
+                node.properties
+                    .get("label_priority")
+                    .and_then(|value| value.as_u64())
+                    .is_some()
+            );
+        }
+    }
+
+    #[test]
+    fn graph_data_honors_min_degree_and_entity_type_filters() {
+        let conn = graph_test_db();
+        let query = KGGraphDataQuery {
+            limit: 10,
+            min_degree: 2,
+            entity_types: Some("concept".to_string()),
+        };
+
+        let graph = query_graph_data_sync(&conn, query, 1).expect("graph data");
+        let node_ids = graph
+            .nodes
+            .iter()
+            .map(|node| node.id.as_str())
+            .collect::<Vec<_>>();
+
+        assert_eq!(node_ids.len(), 3);
+        assert!(node_ids.contains(&"Consent"));
+        assert!(node_ids.contains(&"Model Card"));
+        assert!(node_ids.contains(&"Governance"));
+        assert!(!node_ids.contains(&"Clinical AI"));
+        assert!(!node_ids.contains(&"Bias Audit"));
+        assert_eq!(graph.edges.len(), 3);
+    }
+
+    fn graph_test_db() -> Connection {
+        let conn = Connection::open_in_memory().expect("in-memory db");
+        conn.execute_batch(
+            "
+            CREATE TABLE haie_rev (
+                uid TEXT PRIMARY KEY,
+                workspace_id INTEGER NOT NULL
+            );
+            CREATE TABLE kg_article_entities (
+                article_uid TEXT NOT NULL,
+                entity_id INTEGER NOT NULL
+            );
+            CREATE TABLE kg_entities (
+                id INTEGER PRIMARY KEY,
+                canonical_name TEXT NOT NULL,
+                entity_type TEXT,
+                description TEXT,
+                mention_count INTEGER
+            );
+            CREATE TABLE kg_relationships (
+                source_entity_id INTEGER NOT NULL,
+                target_entity_id INTEGER NOT NULL,
+                relationship_type TEXT NOT NULL,
+                weight REAL
+            );
+            ",
+        )
+        .expect("schema");
+
+        conn.execute(
+            "INSERT INTO haie_rev (uid, workspace_id) VALUES (?1, ?2)",
+            params!["article-1", 1],
+        )
+        .expect("article");
+
+        let entities = [
+            (1, "Clinical AI", "TECHNOLOGY", 10),
+            (2, "Bias Audit", "TECHNOLOGY", 9),
+            (3, "Consent", "CONCEPT", 8),
+            (4, "Model Card", "CONCEPT", 7),
+            (5, "Governance", "CONCEPT", 6),
+            (6, "Popular Isolated", "CONCEPT", 999),
+            (7, "The Author(s)", "PERSON", 100),
+            (
+                8,
+                "Creative Commons Attribution License CC-BY 4.0",
+                "REGULATION",
+                100,
+            ),
+        ];
+        for (id, name, entity_type, mention_count) in entities {
+            conn.execute(
+                "
+                INSERT INTO kg_entities
+                    (id, canonical_name, entity_type, description, mention_count)
+                VALUES (?1, ?2, ?3, ?4, ?5)
+                ",
+                params![
+                    id,
+                    name,
+                    entity_type,
+                    format!("{name} description"),
+                    mention_count
+                ],
+            )
+            .expect("entity");
+            conn.execute(
+                "INSERT INTO kg_article_entities (article_uid, entity_id) VALUES (?1, ?2)",
+                params!["article-1", id],
+            )
+            .expect("article entity");
+        }
+
+        let relationships = [
+            (7, 8, "licenses", 99.0),
+            (1, 2, "uses", 10.0),
+            (3, 4, "documents", 9.0),
+            (4, 5, "supports", 8.0),
+            (3, 5, "requires", 7.0),
+        ];
+        for (source, target, relationship, weight) in relationships {
+            conn.execute(
+                "
+                INSERT INTO kg_relationships
+                    (source_entity_id, target_entity_id, relationship_type, weight)
+                VALUES (?1, ?2, ?3, ?4)
+                ",
+                params![source, target, relationship, weight],
+            )
+            .expect("relationship");
+        }
+
+        conn
     }
 }

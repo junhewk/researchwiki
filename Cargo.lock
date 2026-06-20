@@ -3648,6 +3648,7 @@ dependencies = [
  "mime_guess",
  "pdf-extract",
  "petgraph",
+ "pulldown-cmark",
  "quick-xml 0.38.4",
  "raw-window-handle",
  "reqwest",

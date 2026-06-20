@@ -1,5 +1,5 @@
 use std::{
-    collections::{BTreeMap, HashMap},
+    collections::{BTreeMap, BTreeSet, HashMap},
     net::SocketAddr,
     sync::Arc,
 };
@@ -14,6 +14,7 @@ use axum::{
     routing::{get, post},
 };
 use include_dir::{Dir, include_dir};
+use pulldown_cmark::{CowStr, Event, HeadingLevel, LinkType, Options, Parser, Tag, TagEnd};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use tokio::{net::TcpListener, sync::Mutex};
@@ -1405,6 +1406,7 @@ async fn knowledge_graph_page(
         .map(|(kind, count)| format!("<span class=\"pill\">{} {count}</span>", esc(kind)))
         .collect::<Vec<_>>()
         .join(" ");
+    let type_options = graph_entity_type_options(&stats.entity_types);
     let body = format!(
         r#"
 <section class="page-head"><div><h1>Knowledge Graph</h1><p>{} nodes and {} edges in this workspace.</p></div></section>
@@ -1412,7 +1414,7 @@ async fn knowledge_graph_page(
   <div class="graph-toolbar">
     <label>Limit <input id="graph-limit" type="number" min="20" max="1000" value="250"></label>
     <label>Min degree <input id="graph-min-degree" type="number" min="0" value="0"></label>
-    <label>Types <input id="graph-types" placeholder="METHOD, CONDITION"></label>
+    <label>Type <select id="graph-types">{type_options}</select></label>
     <button id="graph-load" class="button" type="button">Reload graph</button>
   </div>
   <canvas id="graph-canvas" width="1200" height="680"></canvas>
@@ -1465,6 +1467,10 @@ async fn wiki_page(
     let selected_entity = query
         .entity
         .or_else(|| syntheses.first().map(|item| item.entity_name.clone()));
+    let wiki_link_targets = app
+        .knowledge_graph_service
+        .wiki_link_targets(ctx.workspace.id)
+        .await?;
     let mut index = String::new();
     for item in &syntheses {
         index.push_str(&format!(
@@ -1507,7 +1513,13 @@ async fn wiki_page(
                     .map(|item| format!("<li>{}</li>", esc(item)))
                     .collect::<Vec<_>>()
                     .join(""),
-                markdownish(&synthesis.synthesis)
+                render_wiki_markdown_html(
+                    &synthesis.synthesis,
+                    ctx.workspace.id,
+                    &q,
+                    &wiki_link_targets,
+                    Some(&synthesis.entity_name),
+                )
             ),
             Err(error) => format!("<p class=\"notice error\">{}</p>", esc(error.to_string())),
         }
@@ -2268,7 +2280,7 @@ fn field_list(fields: &[(&str, Option<&str>)]) -> String {
         out.push_str(&format!(
             "<dt>{}</dt><dd>{}</dd>",
             esc(label),
-            markdownish(value.unwrap_or(""))
+            render_plain_markdown_html(value.unwrap_or(""))
         ));
     }
     out.push_str("</dl>");
@@ -2286,30 +2298,454 @@ fn link_opt(url: Option<&str>) -> String {
     }
 }
 
-fn markdownish(input: &str) -> String {
-    let mut out = String::new();
-    for paragraph in input.split("\n\n") {
-        let trimmed = paragraph.trim();
-        if trimmed.is_empty() {
-            continue;
-        }
-        if trimmed
-            .lines()
-            .all(|line| line.trim_start().starts_with("- "))
-        {
-            out.push_str("<ul>");
-            for line in trimmed.lines() {
-                out.push_str(&format!(
-                    "<li>{}</li>",
-                    esc(line.trim_start().trim_start_matches("- "))
-                ));
+fn graph_entity_type_options(entity_types: &BTreeMap<String, i64>) -> String {
+    let mut options = vec!["<option value=\"\">All types</option>".to_string()];
+    options.extend(entity_types.iter().map(|(kind, count)| {
+        format!(
+            "<option value=\"{}\">{} ({count})</option>",
+            attr(kind),
+            esc(entity_type_label(kind))
+        )
+    }));
+    options.join("")
+}
+
+fn entity_type_label(entity_type: &str) -> String {
+    entity_type
+        .split('_')
+        .filter(|part| !part.is_empty())
+        .map(|part| {
+            let mut chars = part.chars();
+            match chars.next() {
+                Some(first) => {
+                    first.to_uppercase().collect::<String>() + &chars.as_str().to_lowercase()
+                }
+                None => String::new(),
             }
-            out.push_str("</ul>");
-        } else {
-            out.push_str(&format!("<p>{}</p>", esc(trimmed).replace('\n', "<br>")));
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn render_plain_markdown_html(input: &str) -> String {
+    render_markdown_html(input, None)
+}
+
+fn render_wiki_markdown_html(
+    input: &str,
+    workspace_id: i64,
+    q: &str,
+    link_targets: &[String],
+    current_entity: Option<&str>,
+) -> String {
+    let current = current_entity.map(normalize_link_target);
+    let mut targets = link_targets
+        .iter()
+        .filter_map(|name| {
+            let name = name.trim();
+            if name.is_empty() {
+                return None;
+            }
+            let normalized = normalize_link_target(name);
+            if current.as_ref() == Some(&normalized) {
+                return None;
+            }
+            Some(WikiLinkTarget {
+                name: name.to_string(),
+                normalized,
+            })
+        })
+        .collect::<Vec<_>>();
+    targets.sort_by(|left, right| {
+        right
+            .name
+            .len()
+            .cmp(&left.name.len())
+            .then_with(|| left.name.cmp(&right.name))
+    });
+    targets.dedup_by(|left, right| left.normalized == right.normalized);
+
+    let mut context = WikiLinkContext {
+        workspace_id,
+        q,
+        targets,
+        used_auto_links: BTreeSet::new(),
+    };
+    render_markdown_html(input, Some(&mut context))
+}
+
+struct WikiLinkTarget {
+    name: String,
+    normalized: String,
+}
+
+struct WikiLinkContext<'a> {
+    workspace_id: i64,
+    q: &'a str,
+    targets: Vec<WikiLinkTarget>,
+    used_auto_links: BTreeSet<String>,
+}
+
+fn render_markdown_html(input: &str, mut link_context: Option<&mut WikiLinkContext<'_>>) -> String {
+    let options = Options::ENABLE_TABLES
+        | Options::ENABLE_STRIKETHROUGH
+        | Options::ENABLE_TASKLISTS
+        | Options::ENABLE_FOOTNOTES;
+    let rewritten_input = link_context
+        .as_deref_mut()
+        .map(|context| rewrite_explicit_wiki_links(input, context));
+    let parser_input = rewritten_input.as_deref().unwrap_or(input);
+    let parser = Parser::new_ext(parser_input, options);
+    let mut events = Vec::<Event<'static>>::new();
+    let mut link_depth = 0usize;
+    let mut code_block_depth = 0usize;
+
+    for event in parser {
+        match event {
+            Event::Start(tag) => {
+                if matches!(tag, Tag::Link { .. }) {
+                    link_depth += 1;
+                }
+                if matches!(tag, Tag::CodeBlock(_)) {
+                    code_block_depth += 1;
+                }
+                events.push(Event::Start(tag.into_static()));
+            }
+            Event::End(tag) => {
+                if tag == TagEnd::Link {
+                    link_depth = link_depth.saturating_sub(1);
+                }
+                if tag == TagEnd::CodeBlock {
+                    code_block_depth = code_block_depth.saturating_sub(1);
+                }
+                events.push(Event::End(tag));
+            }
+            Event::Text(text) if link_depth == 0 && code_block_depth == 0 => {
+                if let Some(context) = link_context.as_deref_mut() {
+                    push_auto_linked_text(&mut events, text.as_ref(), context);
+                } else {
+                    events.push(Event::Text(text.into_static()));
+                }
+            }
+            Event::Html(raw) | Event::InlineHtml(raw) => {
+                events.push(Event::Text(raw.into_static()));
+            }
+            other => events.push(other.into_static()),
+        }
+    }
+
+    render_markdown_events_to_html(&events)
+}
+
+fn render_markdown_events_to_html(events: &[Event<'static>]) -> String {
+    let mut out = String::new();
+    for event in events {
+        match event {
+            Event::Start(tag) => push_markdown_start(&mut out, tag),
+            Event::End(tag) => push_markdown_end(&mut out, *tag),
+            Event::Text(text) => out.push_str(&esc(text)),
+            Event::Code(code) => {
+                out.push_str("<code>");
+                out.push_str(&esc(code));
+                out.push_str("</code>");
+            }
+            Event::InlineMath(math) => {
+                out.push_str("<code>");
+                out.push_str(&esc(math));
+                out.push_str("</code>");
+            }
+            Event::DisplayMath(math) => {
+                out.push_str("<pre><code>");
+                out.push_str(&esc(math));
+                out.push_str("</code></pre>");
+            }
+            Event::Html(raw) | Event::InlineHtml(raw) => out.push_str(&esc(raw)),
+            Event::FootnoteReference(label) => {
+                out.push_str("<sup>");
+                out.push_str(&esc(label));
+                out.push_str("</sup>");
+            }
+            Event::SoftBreak => out.push('\n'),
+            Event::HardBreak => out.push_str("<br>"),
+            Event::Rule => out.push_str("<hr>"),
+            Event::TaskListMarker(checked) => {
+                out.push_str("<input type=\"checkbox\" disabled");
+                if *checked {
+                    out.push_str(" checked");
+                }
+                out.push('>');
+            }
         }
     }
     out
+}
+
+fn push_markdown_start(out: &mut String, tag: &Tag<'_>) {
+    match tag {
+        Tag::Paragraph => out.push_str("<p>"),
+        Tag::Heading { level, .. } => {
+            out.push_str(&format!("<h{}>", heading_level_number(*level)));
+        }
+        Tag::BlockQuote(_) => out.push_str("<blockquote>"),
+        Tag::CodeBlock(_) => out.push_str("<pre><code>"),
+        Tag::HtmlBlock => {}
+        Tag::List(Some(start)) => {
+            if *start == 1 {
+                out.push_str("<ol>");
+            } else {
+                out.push_str(&format!("<ol start=\"{start}\">"));
+            }
+        }
+        Tag::List(None) => out.push_str("<ul>"),
+        Tag::Item => out.push_str("<li>"),
+        Tag::FootnoteDefinition(label) => {
+            out.push_str("<section class=\"footnote\" id=\"fn-");
+            out.push_str(&attr(label));
+            out.push_str("\">");
+        }
+        Tag::DefinitionList => out.push_str("<dl>"),
+        Tag::DefinitionListTitle => out.push_str("<dt>"),
+        Tag::DefinitionListDefinition => out.push_str("<dd>"),
+        Tag::Table(_) => out.push_str("<table>"),
+        Tag::TableHead => out.push_str("<thead><tr>"),
+        Tag::TableRow => out.push_str("<tr>"),
+        Tag::TableCell => out.push_str("<td>"),
+        Tag::Emphasis => out.push_str("<em>"),
+        Tag::Strong => out.push_str("<strong>"),
+        Tag::Strikethrough => out.push_str("<del>"),
+        Tag::Superscript => out.push_str("<sup>"),
+        Tag::Subscript => out.push_str("<sub>"),
+        Tag::Link {
+            dest_url, title, ..
+        } => {
+            out.push_str("<a href=\"");
+            out.push_str(&attr(dest_url));
+            out.push('"');
+            if !title.is_empty() {
+                out.push_str(" title=\"");
+                out.push_str(&attr(title));
+                out.push('"');
+            }
+            out.push('>');
+        }
+        Tag::Image {
+            dest_url, title, ..
+        } => {
+            out.push_str("<a href=\"");
+            out.push_str(&attr(dest_url));
+            out.push_str("\" rel=\"noreferrer\" target=\"_blank\"");
+            if !title.is_empty() {
+                out.push_str(" title=\"");
+                out.push_str(&attr(title));
+                out.push('"');
+            }
+            out.push('>');
+        }
+        Tag::MetadataBlock(_) => {}
+    }
+}
+
+fn push_markdown_end(out: &mut String, tag: TagEnd) {
+    match tag {
+        TagEnd::Paragraph => out.push_str("</p>"),
+        TagEnd::Heading(level) => {
+            out.push_str(&format!("</h{}>", heading_level_number(level)));
+        }
+        TagEnd::BlockQuote(_) => out.push_str("</blockquote>"),
+        TagEnd::CodeBlock => out.push_str("</code></pre>"),
+        TagEnd::HtmlBlock => {}
+        TagEnd::List(true) => out.push_str("</ol>"),
+        TagEnd::List(false) => out.push_str("</ul>"),
+        TagEnd::Item => out.push_str("</li>"),
+        TagEnd::FootnoteDefinition => out.push_str("</section>"),
+        TagEnd::DefinitionList => out.push_str("</dl>"),
+        TagEnd::DefinitionListTitle => out.push_str("</dt>"),
+        TagEnd::DefinitionListDefinition => out.push_str("</dd>"),
+        TagEnd::Table => out.push_str("</table>"),
+        TagEnd::TableHead => out.push_str("</tr></thead>"),
+        TagEnd::TableRow => out.push_str("</tr>"),
+        TagEnd::TableCell => out.push_str("</td>"),
+        TagEnd::Emphasis => out.push_str("</em>"),
+        TagEnd::Strong => out.push_str("</strong>"),
+        TagEnd::Strikethrough => out.push_str("</del>"),
+        TagEnd::Superscript => out.push_str("</sup>"),
+        TagEnd::Subscript => out.push_str("</sub>"),
+        TagEnd::Link | TagEnd::Image => out.push_str("</a>"),
+        TagEnd::MetadataBlock(_) => {}
+    }
+}
+
+fn heading_level_number(level: HeadingLevel) -> u8 {
+    match level {
+        HeadingLevel::H1 => 1,
+        HeadingLevel::H2 => 2,
+        HeadingLevel::H3 => 3,
+        HeadingLevel::H4 => 4,
+        HeadingLevel::H5 => 5,
+        HeadingLevel::H6 => 6,
+    }
+}
+
+fn rewrite_explicit_wiki_links(input: &str, context: &mut WikiLinkContext<'_>) -> String {
+    let mut rendered = String::with_capacity(input.len());
+    let mut rest = input;
+    while let Some(start) = rest.find("[[") {
+        rendered.push_str(&rest[..start]);
+        let after_start = &rest[start + 2..];
+        let Some(end) = after_start.find("]]") else {
+            rendered.push_str(&rest[start..]);
+            return rendered;
+        };
+
+        let raw = &after_start[..end];
+        let (target, label) = raw
+            .split_once('|')
+            .map(|(target, label)| (target.trim(), label.trim()))
+            .unwrap_or_else(|| {
+                let target = raw.trim();
+                (target, target)
+            });
+        if target.is_empty() {
+            rendered.push_str("[[]]");
+        } else {
+            context
+                .used_auto_links
+                .insert(normalize_link_target(target));
+            rendered.push_str(&format!(
+                "[{}]({})",
+                escape_markdown_link_label(label),
+                wiki_href(context.workspace_id, target, context.q)
+            ));
+        }
+        rest = &after_start[end + 2..];
+    }
+    rendered.push_str(rest);
+    rendered
+}
+
+fn escape_markdown_link_label(value: &str) -> String {
+    value
+        .replace('\\', "\\\\")
+        .replace('[', "\\[")
+        .replace(']', "\\]")
+}
+
+fn push_auto_linked_text(
+    events: &mut Vec<Event<'static>>,
+    text: &str,
+    context: &mut WikiLinkContext<'_>,
+) {
+    let mut rest = text;
+    while let Some(match_) = next_auto_link(rest, context) {
+        if match_.start > 0 {
+            events.push(Event::Text(cow(&rest[..match_.start])));
+        }
+        let target_name = context.targets[match_.target_index].name.clone();
+        let normalized = context.targets[match_.target_index].normalized.clone();
+        push_internal_wiki_link(
+            events,
+            &rest[match_.start..match_.end],
+            &target_name,
+            context.workspace_id,
+            context.q,
+        );
+        context.used_auto_links.insert(normalized);
+        rest = &rest[match_.end..];
+    }
+    if !rest.is_empty() {
+        events.push(Event::Text(cow(rest)));
+    }
+}
+
+struct AutoLinkMatch {
+    start: usize,
+    end: usize,
+    target_index: usize,
+}
+
+fn next_auto_link(text: &str, context: &WikiLinkContext<'_>) -> Option<AutoLinkMatch> {
+    let mut best: Option<AutoLinkMatch> = None;
+    for (target_index, target) in context.targets.iter().enumerate() {
+        if context.used_auto_links.contains(&target.normalized) {
+            continue;
+        }
+        let Some((start, end)) = find_entity_name(text, &target.name) else {
+            continue;
+        };
+        let replace = best.as_ref().is_none_or(|current| {
+            start < current.start
+                || (start == current.start
+                    && target.name.len() > context.targets[current.target_index].name.len())
+        });
+        if replace {
+            best = Some(AutoLinkMatch {
+                start,
+                end,
+                target_index,
+            });
+        }
+    }
+    best
+}
+
+fn find_entity_name(text: &str, target: &str) -> Option<(usize, usize)> {
+    if target.len() < 3 || !target.is_ascii() {
+        return None;
+    }
+    for (start, _) in text.char_indices() {
+        let end = start + target.len();
+        let Some(candidate) = text.get(start..end) else {
+            continue;
+        };
+        if candidate.eq_ignore_ascii_case(target) && has_entity_boundary(text, start, end) {
+            return Some((start, end));
+        }
+    }
+    None
+}
+
+fn has_entity_boundary(text: &str, start: usize, end: usize) -> bool {
+    let before = text[..start].chars().next_back();
+    let after = text[end..].chars().next();
+    before.is_none_or(|ch| !is_entity_word_char(ch))
+        && after.is_none_or(|ch| !is_entity_word_char(ch))
+}
+
+fn is_entity_word_char(ch: char) -> bool {
+    ch.is_alphanumeric() || ch == '_' || ch == '-'
+}
+
+fn push_internal_wiki_link(
+    events: &mut Vec<Event<'static>>,
+    label: &str,
+    target: &str,
+    workspace_id: i64,
+    q: &str,
+) {
+    events.push(Event::Start(Tag::Link {
+        link_type: LinkType::Inline,
+        dest_url: cow(wiki_href(workspace_id, target, q)),
+        title: cow(""),
+        id: cow(""),
+    }));
+    events.push(Event::Text(cow(label)));
+    events.push(Event::End(TagEnd::Link));
+}
+
+fn wiki_href(workspace_id: i64, entity: &str, q: &str) -> String {
+    format!(
+        "/wiki?workspace_id={workspace_id}&entity={}&q={}",
+        urlencoding::encode(entity),
+        urlencoding::encode(q)
+    )
+}
+
+fn normalize_link_target(value: &str) -> String {
+    value.trim().to_lowercase()
+}
+
+fn cow(value: impl AsRef<str>) -> CowStr<'static> {
+    CowStr::Boxed(value.as_ref().to_string().into_boxed_str())
 }
 
 fn strip_code_fences(text: &str) -> String {
@@ -2358,4 +2794,86 @@ fn attr(input: impl AsRef<str>) -> String {
 #[derive(Serialize)]
 struct ApiOk {
     ok: bool,
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::BTreeMap;
+
+    use super::{graph_entity_type_options, render_plain_markdown_html, render_wiki_markdown_html};
+
+    #[test]
+    fn graph_type_options_include_methodology_and_condition() {
+        let mut types = BTreeMap::new();
+        types.insert("METHODOLOGY".to_string(), 12);
+        types.insert("MEDICAL_CONDITION".to_string(), 7);
+
+        let html = graph_entity_type_options(&types);
+
+        assert!(html.contains("<option value=\"\">All types</option>"));
+        assert!(html.contains("value=\"METHODOLOGY\""));
+        assert!(html.contains(">Methodology (12)</option>"));
+        assert!(html.contains("value=\"MEDICAL_CONDITION\""));
+        assert!(html.contains(">Medical Condition (7)</option>"));
+    }
+
+    #[test]
+    fn markdown_renderer_escapes_raw_html() {
+        let html = render_plain_markdown_html("<script>alert(1)</script>");
+
+        assert!(html.contains("&lt;script&gt;alert(1)&lt;/script&gt;"));
+        assert!(!html.contains("<script>"));
+    }
+
+    #[test]
+    fn wiki_renderer_links_explicit_wiki_syntax() {
+        let html = render_wiki_markdown_html(
+            "See [[Machine Learning|ML]] and [[Artificial Intelligence]].",
+            1,
+            "clinical ai",
+            &[],
+            None,
+        );
+
+        assert!(html.contains(
+            "<a href=\"/wiki?workspace_id=1&amp;entity=Machine%20Learning&amp;q=clinical%20ai\">ML</a>"
+        ));
+        assert!(html.contains(
+            "<a href=\"/wiki?workspace_id=1&amp;entity=Artificial%20Intelligence&amp;q=clinical%20ai\">Artificial Intelligence</a>"
+        ));
+    }
+
+    #[test]
+    fn wiki_renderer_auto_links_known_targets_once() {
+        let targets = vec![
+            "Machine Learning".to_string(),
+            "Artificial Intelligence".to_string(),
+        ];
+        let html = render_wiki_markdown_html(
+            "Machine learning relates to Artificial Intelligence. Machine Learning appears again.",
+            1,
+            "",
+            &targets,
+            None,
+        );
+
+        assert_eq!(html.matches("entity=Machine%20Learning").count(), 1);
+        assert_eq!(html.matches("entity=Artificial%20Intelligence").count(), 1);
+    }
+
+    #[test]
+    fn wiki_renderer_does_not_auto_link_code_or_existing_links() {
+        let targets = vec!["Machine Learning".to_string()];
+        let html = render_wiki_markdown_html(
+            "`Machine Learning` [Machine Learning](https://example.com) Machine Learning",
+            1,
+            "",
+            &targets,
+            None,
+        );
+
+        assert!(html.contains("<code>Machine Learning</code>"));
+        assert!(html.contains("<a href=\"https://example.com\">Machine Learning</a>"));
+        assert_eq!(html.matches("entity=Machine%20Learning").count(), 1);
+    }
 }

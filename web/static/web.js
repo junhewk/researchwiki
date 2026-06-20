@@ -48,6 +48,7 @@ async function initGraph() {
   let nodes = [];
   let edges = [];
   let hovered = null;
+  const maxLabels = 24;
 
   function fitCanvas() {
     const rect = canvas.getBoundingClientRect();
@@ -57,32 +58,61 @@ async function initGraph() {
     ctx.setTransform(ratio, 0, 0, ratio, 0, 0);
   }
 
-  function layout() {
-    const rect = canvas.getBoundingClientRect();
+  function graphPosition(node, rect) {
+    const scale = Math.min(rect.width, rect.height) * 0.44;
     const cx = rect.width / 2;
     const cy = rect.height / 2;
-    const radius = Math.max(80, Math.min(rect.width, rect.height) * 0.38);
-    nodes = nodes.map((node, index) => {
-      const angle = (Math.PI * 2 * index) / Math.max(nodes.length, 1);
-      const degree = Number(node.properties?.degree || 0);
-      const ring = radius * (0.55 + Math.min(degree, 20) / 50);
-      return { ...node, x: cx + Math.cos(angle) * ring, y: cy + Math.sin(angle) * ring };
-    });
+    const x = Number(node.properties?.x ?? 0);
+    const y = Number(node.properties?.y ?? 0);
+    return {
+      x: cx + (Number.isFinite(x) ? x : 0) * scale,
+      y: cy + (Number.isFinite(y) ? y : 0) * scale,
+    };
+  }
+
+  function nodeRadius(node) {
+    const radius = Number(node.properties?.radius);
+    if (Number.isFinite(radius)) return Math.max(5, Math.min(18, radius));
+    const degree = Number(node.properties?.degree || 0);
+    return Math.max(5, Math.min(16, 5 + degree / 2));
+  }
+
+  function nodeColor(node) {
+    const color = String(node.properties?.color || '');
+    return /^#[0-9a-f]{6}$/i.test(color) ? color : '#64748b';
+  }
+
+  function shouldLabel(node) {
+    const priority = Number(node.properties?.label_priority);
+    return hovered?.id === node.id || (Number.isFinite(priority) && priority < maxLabels);
+  }
+
+  function edgeWidth(edge) {
+    const weight = Number(edge.properties?.weight || 1);
+    return Math.max(0.8, Math.min(2.4, Math.sqrt(Math.max(0.1, weight))));
+  }
+
+  function labelText(node) {
+    return node.properties?.name || node.id;
+  }
+
+  function labelColor() {
+    return getComputedStyle(document.documentElement).getPropertyValue('--text').trim() || '#17202a';
   }
 
   function draw() {
-    fitCanvas();
     const rect = canvas.getBoundingClientRect();
+    fitCanvas();
     ctx.clearRect(0, 0, rect.width, rect.height);
-    const byId = new Map(nodes.map((n) => [n.id, n]));
+    const positions = new Map(nodes.map((node) => [node.id, graphPosition(node, rect)]));
 
-    ctx.lineWidth = 1;
     ctx.strokeStyle = '#cbd5e1';
     for (const edge of edges) {
-      const source = byId.get(edge.source);
-      const target = byId.get(edge.target);
+      const source = positions.get(edge.source);
+      const target = positions.get(edge.target);
       if (!source || !target) continue;
       ctx.globalAlpha = hovered && edge.source !== hovered.id && edge.target !== hovered.id ? 0.12 : 0.45;
+      ctx.lineWidth = edgeWidth(edge);
       ctx.beginPath();
       ctx.moveTo(source.x, source.y);
       ctx.lineTo(target.x, target.y);
@@ -91,17 +121,21 @@ async function initGraph() {
     ctx.globalAlpha = 1;
 
     for (const node of nodes) {
-      const degree = Number(node.properties?.degree || 0);
-      const r = Math.max(5, Math.min(16, 5 + degree / 2));
+      const pos = positions.get(node.id);
+      if (!pos) continue;
+      const r = nodeRadius(node);
       const isHover = hovered?.id === node.id;
       ctx.beginPath();
-      ctx.arc(node.x, node.y, isHover ? r + 3 : r, 0, Math.PI * 2);
-      ctx.fillStyle = isHover ? '#2563eb' : '#64748b';
+      ctx.arc(pos.x, pos.y, isHover ? r + 2 : r, 0, Math.PI * 2);
+      ctx.fillStyle = nodeColor(node);
       ctx.fill();
-      if (isHover) {
-        ctx.fillStyle = '#17202a';
+      ctx.lineWidth = isHover ? 2 : 1;
+      ctx.strokeStyle = isHover ? '#111827' : '#475569';
+      ctx.stroke();
+      if (shouldLabel(node)) {
+        ctx.fillStyle = labelColor();
         ctx.font = '12px system-ui';
-        ctx.fillText(node.id, node.x + r + 6, node.y - r);
+        ctx.fillText(labelText(node), pos.x + r + 6, pos.y - r);
       }
     }
   }
@@ -132,10 +166,11 @@ async function initGraph() {
     let best = null;
     let bestDist = 999999;
     for (const node of nodes) {
-      const dx = node.x - x;
-      const dy = node.y - y;
+      const pos = graphPosition(node, rect);
+      const dx = pos.x - x;
+      const dy = pos.y - y;
       const dist = Math.sqrt(dx * dx + dy * dy);
-      if (dist < bestDist && dist < 24) {
+      if (dist < bestDist && dist < nodeRadius(node) + 8) {
         best = node;
         bestDist = dist;
       }
@@ -167,14 +202,12 @@ async function initGraph() {
     const data = await response.json();
     nodes = data.nodes || [];
     edges = data.edges || [];
-    layout();
     draw();
     if (loadButton) loadButton.textContent = 'Load graph';
   }
 
   loadButton?.addEventListener('click', loadGraph);
   window.addEventListener('resize', () => {
-    layout();
     draw();
   });
   updateDetail(null);

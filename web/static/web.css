@@ -743,7 +743,8 @@ pre {
   }
 
   .filters input,
-  .graph-toolbar input {
+  .graph-toolbar input,
+  .graph-toolbar select {
     width: 100%;
   }
 

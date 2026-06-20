@@ -68,6 +68,10 @@ struct KgNodeView {
     degree: i64,
     mention_count: i64,
     pos: egui::Pos2,
+    home_pos: egui::Pos2,
+    radius: f32,
+    color: egui::Color32,
+    label_priority: usize,
 }
 
 #[derive(Clone, Debug)]
@@ -196,11 +200,43 @@ impl Panel {
             ui.label(ctx.t("Min degree"));
             ui.add(egui::DragValue::new(&mut self.min_degree).range(0..=20));
             ui.label(ctx.t("Type"));
-            ui.add(
-                egui::TextEdit::singleline(&mut self.entity_type)
-                    .hint_text("(any)")
-                    .desired_width(120.0),
-            );
+            let mut type_options = self
+                .stats
+                .as_ref()
+                .map(|stats| {
+                    stats
+                        .entity_types
+                        .iter()
+                        .map(|(kind, count)| (kind.clone(), *count))
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default();
+            if !self.entity_type.is_empty()
+                && !type_options
+                    .iter()
+                    .any(|(kind, _)| kind == &self.entity_type)
+            {
+                type_options.push((self.entity_type.clone(), 0));
+            }
+            let selected_type = if self.entity_type.is_empty() {
+                ctx.t("All types").to_string()
+            } else {
+                entity_type_label(&self.entity_type)
+            };
+            egui::ComboBox::from_id_salt("kg-entity-type-filter")
+                .selected_text(selected_type)
+                .width(160.0)
+                .show_ui(ui, |ui| {
+                    ui.selectable_value(&mut self.entity_type, String::new(), ctx.t("All types"));
+                    for (kind, count) in type_options {
+                        let label = if count > 0 {
+                            format!("{} ({count})", entity_type_label(&kind))
+                        } else {
+                            entity_type_label(&kind)
+                        };
+                        ui.selectable_value(&mut self.entity_type, kind, label);
+                    }
+                });
             if ui.button(ctx.t("Load graph")).clicked() {
                 self.load_graph(ctx);
             }
@@ -343,19 +379,18 @@ impl Panel {
             }
         }
 
-        let max_degree = self.nodes.iter().map(|node| node.degree).max().unwrap_or(1);
         for (idx, node) in self.nodes.iter().enumerate() {
             let screen = graph_to_screen(node.pos, center, scale);
             let selected = self.selected_entity.as_deref() == Some(node.name.as_str());
             let hovered = hovered == Some(idx);
-            let radius = node_radius(node, max_degree);
+            let radius = node.radius;
             let dimmed = connected
                 .as_ref()
                 .is_some_and(|connected| !connected[idx] && !hovered);
             let color = if dimmed {
-                entity_color(&node.entity_type).gamma_multiply(0.38)
+                node.color.gamma_multiply(0.38)
             } else {
-                entity_color(&node.entity_type)
+                node.color
             };
             painter.circle_filled(screen, radius, color);
             painter.circle_stroke(
@@ -371,7 +406,7 @@ impl Panel {
                 ),
             );
 
-            if selected || hovered || idx < MAX_LABELS || self.view_zoom > 1.6 {
+            if selected || hovered || node.label_priority < MAX_LABELS || self.view_zoom > 1.6 {
                 painter.text(
                     screen + egui::vec2(radius + 3.0, -radius - 2.0),
                     egui::Align2::LEFT_TOP,
@@ -495,17 +530,46 @@ impl Panel {
                 .get("mention_count")
                 .and_then(|v| v.as_i64())
                 .unwrap_or(0);
+            let pos = egui::pos2(
+                node.properties
+                    .get("x")
+                    .and_then(|v| v.as_f64())
+                    .unwrap_or(0.0) as f32,
+                node.properties
+                    .get("y")
+                    .and_then(|v| v.as_f64())
+                    .unwrap_or(0.0) as f32,
+            );
+            let radius = node
+                .properties
+                .get("radius")
+                .and_then(|v| v.as_f64())
+                .unwrap_or(8.0) as f32;
+            let color = node
+                .properties
+                .get("color")
+                .and_then(|v| v.as_str())
+                .and_then(color_from_hex)
+                .unwrap_or_else(|| entity_color(&entity_type));
             let idx = nodes.len();
+            let label_priority = node
+                .properties
+                .get("label_priority")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(idx as u64) as usize;
             idx_by_id.insert(node.id.clone(), idx);
             nodes.push(KgNodeView {
                 name,
                 entity_type,
                 degree,
                 mention_count,
-                pos: egui::pos2(0.0, 0.0),
+                pos,
+                home_pos: pos,
+                radius,
+                color,
+                label_priority,
             });
         }
-        layout_nodes(&mut nodes);
 
         let mut edges = Vec::new();
         for edge in &resp.edges {
@@ -606,13 +670,12 @@ impl Panel {
     }
 
     fn node_at(&self, cursor: egui::Pos2, center: egui::Pos2, scale: f32) -> Option<usize> {
-        let max_degree = self.nodes.iter().map(|node| node.degree).max().unwrap_or(1);
         self.nodes
             .iter()
             .enumerate()
             .filter_map(|(idx, node)| {
                 let screen = graph_to_screen(node.pos, center, scale);
-                let radius = node_radius(node, max_degree) + 4.0;
+                let radius = node.radius + 4.0;
                 let dist = screen.distance(cursor);
                 (dist <= radius).then_some((idx, dist))
             })
@@ -626,7 +689,9 @@ impl Panel {
 
     fn reset_view(&mut self) {
         self.reset_view_transform();
-        layout_nodes(&mut self.nodes);
+        for node in &mut self.nodes {
+            node.pos = node.home_pos;
+        }
     }
 
     fn reset_view_transform(&mut self) {
@@ -645,27 +710,21 @@ fn opt(s: &str) -> Option<String> {
     }
 }
 
-fn layout_nodes(nodes: &mut [KgNodeView]) {
-    let count = nodes.len();
-    if count == 0 {
-        return;
-    }
-    if count == 1 {
-        nodes[0].pos = egui::pos2(0.0, 0.0);
-        return;
-    }
-
-    let max_ring = (count as f32).sqrt().ceil().max(2.0);
-    for (idx, node) in nodes.iter_mut().enumerate() {
-        if idx == 0 {
-            node.pos = egui::pos2(0.0, 0.0);
-            continue;
-        }
-        let ring = ((idx as f32).sqrt().floor() + 1.0).min(max_ring);
-        let radius = (ring / max_ring).clamp(0.18, 0.96);
-        let angle = idx as f32 * 2.399_963_1;
-        node.pos = egui::pos2(radius * angle.cos(), radius * angle.sin());
-    }
+fn entity_type_label(entity_type: &str) -> String {
+    entity_type
+        .split('_')
+        .filter(|part| !part.is_empty())
+        .map(|part| {
+            let mut chars = part.chars();
+            match chars.next() {
+                Some(first) => {
+                    first.to_uppercase().collect::<String>() + &chars.as_str().to_lowercase()
+                }
+                None => String::new(),
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 fn graph_to_screen(pos: egui::Pos2, center: egui::Pos2, scale: f32) -> egui::Pos2 {
@@ -697,12 +756,6 @@ fn connected_nodes(selected: usize, edges: &[KgEdgeView], node_count: usize) -> 
     connected
 }
 
-fn node_radius(node: &KgNodeView, max_degree: i64) -> f32 {
-    let degree = node.degree.max(0) as f32;
-    let max_degree = max_degree.max(1) as f32;
-    4.5 + 8.0 * (degree / max_degree).sqrt()
-}
-
 fn entity_color(entity_type: &str) -> egui::Color32 {
     match entity_type.to_ascii_uppercase().as_str() {
         "CONCEPT" => egui::Color32::from_rgb(95, 146, 220),
@@ -714,4 +767,15 @@ fn entity_color(entity_type: &str) -> egui::Color32 {
         "MEDICAL_CONDITION" => egui::Color32::from_rgb(188, 111, 153),
         _ => egui::Color32::from_rgb(130, 150, 165),
     }
+}
+
+fn color_from_hex(raw: &str) -> Option<egui::Color32> {
+    let hex = raw.strip_prefix('#').unwrap_or(raw);
+    if hex.len() != 6 {
+        return None;
+    }
+    let r = u8::from_str_radix(&hex[0..2], 16).ok()?;
+    let g = u8::from_str_radix(&hex[2..4], 16).ok()?;
+    let b = u8::from_str_radix(&hex[4..6], 16).ok()?;
+    Some(egui::Color32::from_rgb(r, g, b))
 }
