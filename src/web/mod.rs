@@ -2,6 +2,7 @@ use std::{
     collections::{BTreeMap, BTreeSet, HashMap},
     net::SocketAddr,
     sync::Arc,
+    time::Duration,
 };
 
 use askama::Template;
@@ -17,7 +18,11 @@ use include_dir::{Dir, include_dir};
 use pulldown_cmark::{CowStr, Event, HeadingLevel, LinkType, Options, Parser, Tag, TagEnd};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
-use tokio::{net::TcpListener, sync::Mutex};
+use tokio::{
+    net::TcpListener,
+    sync::{Mutex, watch},
+    task::JoinHandle,
+};
 use tower_http::trace::TraceLayer;
 
 use crate::{
@@ -44,6 +49,7 @@ use crate::{
 
 static STATIC_DIR: Dir<'_> = include_dir!("$CARGO_MANIFEST_DIR/web/static");
 const WORKSPACE_COOKIE: &str = "rw_workspace_id";
+const WEB_SCHEDULER_INTERVAL: Duration = Duration::from_secs(30);
 
 #[derive(Clone)]
 pub struct WebState {
@@ -55,6 +61,57 @@ struct WebStateInner {
     workspace_service: Arc<WorkspaceService>,
     settings_service: Arc<SettingsService>,
     cache: Mutex<HashMap<i64, Arc<AppState>>>,
+    scheduler_status: Mutex<WebSchedulerSnapshot>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+struct WebSchedulerSnapshot {
+    status: String,
+    enabled: bool,
+    running: bool,
+    last_checked_at: Option<String>,
+    next_check_at: Option<String>,
+    due_auto: Vec<WebSchedulerDueItem>,
+    due_manual: Vec<WebSchedulerDueItem>,
+    last_enqueued: Vec<WebSchedulerEnqueuedRun>,
+    last_errors: Vec<String>,
+}
+
+impl Default for WebSchedulerSnapshot {
+    fn default() -> Self {
+        Self {
+            status: "starting".to_string(),
+            enabled: false,
+            running: false,
+            last_checked_at: None,
+            next_check_at: None,
+            due_auto: Vec::new(),
+            due_manual: Vec::new(),
+            last_enqueued: Vec::new(),
+            last_errors: Vec::new(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Serialize)]
+struct WebSchedulerDueItem {
+    workspace_id: i64,
+    workspace_name: String,
+    cadence_days: i32,
+    cadence_auto: bool,
+    days_since_last_gather: Option<i64>,
+    lookback_days: i32,
+    last_gathered_at: Option<String>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+struct WebSchedulerEnqueuedRun {
+    workspace_id: i64,
+    workspace_name: String,
+    source: String,
+    lookback_days: i32,
+    run_id: String,
+    enqueued_at: String,
 }
 
 #[derive(Clone)]
@@ -157,8 +214,174 @@ impl WebState {
                 workspace_service,
                 settings_service,
                 cache: Mutex::new(HashMap::new()),
+                scheduler_status: Mutex::new(WebSchedulerSnapshot::default()),
             }),
         }
+    }
+
+    pub fn spawn_scheduler(&self, shutdown_rx: watch::Receiver<bool>) -> JoinHandle<()> {
+        let state = self.clone();
+        tokio::spawn(async move {
+            state.run_scheduler_loop(shutdown_rx).await;
+        })
+    }
+
+    async fn run_scheduler_loop(self, mut shutdown_rx: watch::Receiver<bool>) {
+        {
+            let mut snapshot = self.inner.scheduler_status.lock().await;
+            snapshot.status = "running".to_string();
+            snapshot.running = true;
+        }
+
+        let mut interval = tokio::time::interval(WEB_SCHEDULER_INTERVAL);
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
+        loop {
+            tokio::select! {
+                changed = shutdown_rx.changed() => {
+                    if changed.is_err() || *shutdown_rx.borrow() {
+                        break;
+                    }
+                }
+                _ = interval.tick() => {
+                    if let Err(error) = self.check_web_scheduler(false).await {
+                        self.record_scheduler_error(error.message).await;
+                    }
+                }
+            }
+        }
+
+        let mut snapshot = self.inner.scheduler_status.lock().await;
+        snapshot.status = "stopped".to_string();
+        snapshot.running = false;
+        snapshot.next_check_at = None;
+    }
+
+    async fn scheduler_snapshot(&self) -> WebSchedulerSnapshot {
+        self.inner.scheduler_status.lock().await.clone()
+    }
+
+    async fn run_due_scheduled_gathers(&self) -> WebResult<Vec<WebSchedulerEnqueuedRun>> {
+        self.check_web_scheduler(true).await
+    }
+
+    async fn check_web_scheduler(
+        &self,
+        enqueue_manual: bool,
+    ) -> WebResult<Vec<WebSchedulerEnqueuedRun>> {
+        let settings = self.inner.settings_service.get_settings().await?;
+        let workspaces = self.inner.workspace_service.list_full().await?;
+        let now = chrono::Utc::now().naive_utc();
+        let next_check_at =
+            now + chrono::Duration::seconds(WEB_SCHEDULER_INTERVAL.as_secs() as i64);
+
+        let mut due_auto = Vec::new();
+        let mut due_manual = Vec::new();
+        for workspace in workspaces {
+            let Some(item) = scheduler_due_item(&workspace, now) else {
+                continue;
+            };
+            if item.cadence_auto {
+                due_auto.push(item);
+            } else {
+                due_manual.push(item);
+            }
+        }
+
+        let mut enqueue_items = Vec::new();
+        let mut queued_workspace_ids = BTreeSet::new();
+        if settings.scheduler.enabled {
+            for item in &due_auto {
+                if queued_workspace_ids.insert(item.workspace_id) {
+                    enqueue_items.push(item.clone());
+                }
+            }
+        }
+        if enqueue_manual {
+            for item in due_auto.iter().chain(due_manual.iter()) {
+                if queued_workspace_ids.insert(item.workspace_id) {
+                    enqueue_items.push(item.clone());
+                }
+            }
+        }
+
+        let mut enqueued = Vec::new();
+        let mut successful_workspace_ids = BTreeSet::new();
+        let mut errors = Vec::new();
+
+        for item in enqueue_items {
+            let app = match self.app_for_workspace(item.workspace_id).await {
+                Ok(app) => app,
+                Err(error) => {
+                    errors.push(format!("{}: {}", item.workspace_name, error.message));
+                    continue;
+                }
+            };
+            match app
+                .job_service
+                .enqueue_source("all", item.lookback_days, item.workspace_id)
+                .await
+            {
+                Ok(job) => {
+                    successful_workspace_ids.insert(item.workspace_id);
+                    enqueued.push(WebSchedulerEnqueuedRun {
+                        workspace_id: item.workspace_id,
+                        workspace_name: item.workspace_name,
+                        source: job.source,
+                        lookback_days: job.days_back,
+                        run_id: job.run_id,
+                        enqueued_at: job
+                            .requested_at
+                            .unwrap_or_else(|| format_scheduler_time(now)),
+                    });
+                }
+                Err(error) => {
+                    errors.push(format!("{}: {error}", item.workspace_name));
+                }
+            }
+        }
+
+        due_auto.retain(|item| !successful_workspace_ids.contains(&item.workspace_id));
+        due_manual.retain(|item| !successful_workspace_ids.contains(&item.workspace_id));
+
+        let status = if !settings.scheduler.enabled && !enqueue_manual {
+            "disabled"
+        } else if !errors.is_empty() && enqueued.is_empty() {
+            "error"
+        } else if !errors.is_empty() {
+            "partial"
+        } else if !enqueued.is_empty() {
+            "queued"
+        } else {
+            "checked"
+        };
+
+        let running = self.inner.scheduler_status.lock().await.running;
+        let snapshot = WebSchedulerSnapshot {
+            status: status.to_string(),
+            enabled: settings.scheduler.enabled,
+            running,
+            last_checked_at: Some(format_scheduler_time(now)),
+            next_check_at: Some(format_scheduler_time(next_check_at)),
+            due_auto,
+            due_manual,
+            last_enqueued: enqueued.clone(),
+            last_errors: errors,
+        };
+        *self.inner.scheduler_status.lock().await = snapshot;
+
+        Ok(enqueued)
+    }
+
+    async fn record_scheduler_error(&self, message: String) {
+        let now = chrono::Utc::now().naive_utc();
+        let next_check_at =
+            now + chrono::Duration::seconds(WEB_SCHEDULER_INTERVAL.as_secs() as i64);
+        let mut snapshot = self.inner.scheduler_status.lock().await;
+        snapshot.status = "error".to_string();
+        snapshot.last_checked_at = Some(format_scheduler_time(now));
+        snapshot.next_check_at = Some(format_scheduler_time(next_check_at));
+        snapshot.last_errors = vec![message];
     }
 
     async fn app_for_workspace(&self, workspace_id: i64) -> WebResult<Arc<AppState>> {
@@ -227,6 +450,7 @@ pub fn router(state: WebState) -> Router {
         .route("/workspaces/{id}/update", post(update_workspace))
         .route("/gather", get(gather_page))
         .route("/gather/run", post(run_gather))
+        .route("/gather/scheduler/run-due", post(run_due_gathers))
         .route("/gather/{run_id}/cancel", post(cancel_job))
         .route("/gather/kg-backfill", post(start_kg_backfill))
         .route("/gather/full-backfill", post(start_full_backfill))
@@ -254,6 +478,7 @@ pub fn router(state: WebState) -> Router {
         .route("/settings/misc", post(save_misc_settings))
         .route("/api/graph-data", get(api_graph_data))
         .route("/api/entity", get(api_entity))
+        .route("/api/scheduler", get(api_scheduler))
         .route("/api/jobs", get(api_jobs))
         .route("/api/ops", get(api_ops))
         .route("/static/{*path}", get(static_asset))
@@ -897,8 +1122,7 @@ async fn gather_page(
     let ctx = page_context(&state, &headers, &query, "gather").await?;
     let app = state.app_for_workspace(ctx.workspace.id).await?;
     let jobs = app.job_service.list_jobs(25, ctx.workspace.id).await?;
-    let settings = app.settings_service.get_settings().await?;
-    let scheduler = app.job_service.scheduler_status(&settings.scheduler);
+    let scheduler = state.scheduler_snapshot().await;
     let kg = app
         .knowledge_graph_service
         .get_stats(ctx.workspace.id)
@@ -954,9 +1178,18 @@ async fn gather_page(
     <div class="panel-head"><h2>Scheduler</h2><a href="/settings?workspace_id={}">Edit</a></div>
     <dl class="kv">
       <dt>Status</dt><dd>{}</dd>
-      <dt>Jobs</dt><dd>{}</dd>
+      <dt>Enabled</dt><dd>{}</dd>
+      <dt>Last check</dt><dd>{}</dd>
+      <dt>Next check</dt><dd>{}</dd>
+      <dt>Due auto</dt><dd>{}</dd>
+      <dt>Due manual</dt><dd>{}</dd>
       <dt>KG</dt><dd>{} nodes, {} edges</dd>
     </dl>
+    <form class="inline" method="post" action="/gather/scheduler/run-due">
+      <input type="hidden" name="workspace_id" value="{}">
+      <button class="button" type="submit">Run due gathers now</button>
+    </form>
+    <pre data-status-url="/api/scheduler?workspace_id={}">{}</pre>
   </div>
 </section>
 <section class="grid three">
@@ -995,9 +1228,16 @@ async fn gather_page(
         ctx.workspace.lookback_days,
         ctx.workspace.id,
         esc(&scheduler.status),
-        scheduler.jobs.len(),
+        yes_no(scheduler.enabled),
+        esc(scheduler.last_checked_at.as_deref().unwrap_or("")),
+        esc(scheduler.next_check_at.as_deref().unwrap_or("")),
+        scheduler.due_auto.len(),
+        scheduler.due_manual.len(),
         kg.nodes,
         kg.edges,
+        ctx.workspace.id,
+        ctx.workspace.id,
+        esc(serde_json::to_string_pretty(&scheduler).unwrap_or_default()),
         ctx.workspace.id,
         ctx.workspace.id,
         esc(serde_json::to_string_pretty(&backfill).unwrap_or_default()),
@@ -1031,6 +1271,22 @@ async fn run_gather(
             form.workspace_id,
             urlencoding::encode(&job.source)
         ),
+        form.workspace_id,
+    ))
+}
+
+async fn run_due_gathers(
+    State(state): State<WebState>,
+    Form(form): Form<WorkspaceSelectForm>,
+) -> WebResult<Response> {
+    let runs = state.run_due_scheduled_gathers().await?;
+    let notice = if runs.is_empty() {
+        "No%20due%20scheduled%20gathers".to_string()
+    } else {
+        format!("Queued%20{}%20due%20scheduled%20gather(s)", runs.len())
+    };
+    Ok(redirect_with_cookie(
+        &format!("/gather?workspace_id={}&notice={notice}", form.workspace_id),
         form.workspace_id,
     ))
 }
@@ -1945,6 +2201,7 @@ async fn settings_page(
     <div class="panel-head"><h2>Scheduler</h2><button class="button primary" type="submit">Save</button></div>
     <input type="hidden" name="workspace_id" value="{}">
     <label class="check"><input type="checkbox" name="enabled" value="1" {}> Enabled</label>
+    <p class="hint">Enabled controls the web cadence scheduler. Workspace cadence is configured in Input Set.</p>
     <div class="form-row"><label><span>arXiv hour</span><input type="number" min="0" max="23" name="arxiv_schedule_hour" value="{}"></label><label><span>Minute</span><input type="number" min="0" max="59" name="arxiv_schedule_minute" value="{}"></label></div>
     <div class="form-row"><label><span>PMC hour</span><input type="number" min="0" max="23" name="pmc_schedule_hour" value="{}"></label><label><span>Minute</span><input type="number" min="0" max="59" name="pmc_schedule_minute" value="{}"></label></div>
     <div class="form-row"><label><span>PubMed hour</span><input type="number" min="0" max="23" name="pubmed_schedule_hour" value="{}"></label><label><span>Minute</span><input type="number" min="0" max="59" name="pubmed_schedule_minute" value="{}"></label></div>
@@ -2142,6 +2399,13 @@ async fn api_entity(
     Ok(Json(json!(entity)))
 }
 
+async fn api_scheduler(
+    State(state): State<WebState>,
+    Query(_query): Query<ApiWorkspaceQuery>,
+) -> WebResult<Json<serde_json::Value>> {
+    Ok(Json(json!(state.scheduler_snapshot().await)))
+}
+
 async fn api_jobs(
     State(state): State<WebState>,
     Query(query): Query<ApiWorkspaceQuery>,
@@ -2224,6 +2488,42 @@ fn parse_cadence(input: &str) -> Option<i32> {
     input.trim().parse::<i32>().ok().filter(|days| *days >= 1)
 }
 
+fn scheduler_due_item(
+    workspace: &Workspace,
+    now: chrono::NaiveDateTime,
+) -> Option<WebSchedulerDueItem> {
+    let cadence_days = workspace.cadence_days?;
+    let days_since_last_gather = days_since_at(workspace.last_gathered_at.as_deref(), now);
+    let due = days_since_last_gather.is_none_or(|days| days >= i64::from(cadence_days));
+    if !due {
+        return None;
+    }
+
+    let lookback_days = days_since_last_gather
+        .map(|days| (days as i32 + 1).clamp(1, 3650))
+        .unwrap_or_else(|| workspace.lookback_days.clamp(1, 3650));
+
+    Some(WebSchedulerDueItem {
+        workspace_id: workspace.id,
+        workspace_name: workspace.name.clone(),
+        cadence_days,
+        cadence_auto: workspace.cadence_auto,
+        days_since_last_gather,
+        lookback_days,
+        last_gathered_at: workspace.last_gathered_at.clone(),
+    })
+}
+
+fn days_since_at(timestamp: Option<&str>, now: chrono::NaiveDateTime) -> Option<i64> {
+    let parsed =
+        chrono::NaiveDateTime::parse_from_str(timestamp?.trim(), "%Y-%m-%d %H:%M:%S").ok()?;
+    Some((now - parsed).num_days().max(0))
+}
+
+fn format_scheduler_time(time: chrono::NaiveDateTime) -> String {
+    time.format("%Y-%m-%d %H:%M:%S").to_string()
+}
+
 fn clean_opt(value: Option<String>) -> Option<String> {
     value
         .map(|value| value.trim().to_string())
@@ -2244,6 +2544,10 @@ fn nonempty_opt(value: &str) -> Option<&str> {
 
 fn checked(value: bool) -> &'static str {
     if value { "checked" } else { "" }
+}
+
+fn yes_no(value: bool) -> &'static str {
+    if value { "yes" } else { "no" }
 }
 
 fn language_options(selected: UiLanguage) -> String {
@@ -2813,7 +3117,20 @@ struct ApiOk {
 mod tests {
     use std::collections::BTreeMap;
 
-    use super::{graph_entity_type_options, render_plain_markdown_html, render_wiki_markdown_html};
+    use super::{
+        days_since_at, empty_workspace, graph_entity_type_options, render_plain_markdown_html,
+        render_wiki_markdown_html, scheduler_due_item,
+    };
+
+    fn scheduler_workspace() -> crate::models::workspace::Workspace {
+        let mut workspace = empty_workspace();
+        workspace.id = 42;
+        workspace.name = "Healthcare AI ethics".to_string();
+        workspace.lookback_days = 180;
+        workspace.cadence_days = Some(7);
+        workspace.cadence_auto = true;
+        workspace
+    }
 
     #[test]
     fn graph_type_options_include_methodology_and_condition() {
@@ -2888,5 +3205,60 @@ mod tests {
         assert!(html.contains("<code>Machine Learning</code>"));
         assert!(html.contains("<a href=\"https://example.com\">Machine Learning</a>"));
         assert_eq!(html.matches("entity=Machine%20Learning").count(), 1);
+    }
+
+    #[test]
+    fn scheduler_due_item_uses_workspace_lookback_when_never_gathered() {
+        let workspace = scheduler_workspace();
+        let now = chrono::NaiveDateTime::parse_from_str("2026-06-20 12:00:00", "%Y-%m-%d %H:%M:%S")
+            .expect("test time");
+
+        let item = scheduler_due_item(&workspace, now).expect("workspace is due");
+
+        assert_eq!(item.workspace_id, 42);
+        assert_eq!(item.days_since_last_gather, None);
+        assert_eq!(item.lookback_days, 180);
+        assert!(item.cadence_auto);
+    }
+
+    #[test]
+    fn scheduler_due_item_skips_recent_gather() {
+        let mut workspace = scheduler_workspace();
+        workspace.last_gathered_at = Some("2026-06-19 12:00:00".to_string());
+        let now = chrono::NaiveDateTime::parse_from_str("2026-06-20 12:00:00", "%Y-%m-%d %H:%M:%S")
+            .expect("test time");
+
+        assert!(scheduler_due_item(&workspace, now).is_none());
+    }
+
+    #[test]
+    fn scheduler_due_item_covers_gap_plus_one_day() {
+        let mut workspace = scheduler_workspace();
+        workspace.last_gathered_at = Some("2026-06-12 12:00:00".to_string());
+        let now = chrono::NaiveDateTime::parse_from_str("2026-06-20 12:00:00", "%Y-%m-%d %H:%M:%S")
+            .expect("test time");
+
+        let item = scheduler_due_item(&workspace, now).expect("workspace is due");
+
+        assert_eq!(item.days_since_last_gather, Some(8));
+        assert_eq!(item.lookback_days, 9);
+    }
+
+    #[test]
+    fn scheduler_due_item_respects_disabled_cadence() {
+        let mut workspace = scheduler_workspace();
+        workspace.cadence_days = None;
+        let now = chrono::NaiveDateTime::parse_from_str("2026-06-20 12:00:00", "%Y-%m-%d %H:%M:%S")
+            .expect("test time");
+
+        assert!(scheduler_due_item(&workspace, now).is_none());
+    }
+
+    #[test]
+    fn days_since_at_returns_none_for_malformed_timestamps() {
+        let now = chrono::NaiveDateTime::parse_from_str("2026-06-20 12:00:00", "%Y-%m-%d %H:%M:%S")
+            .expect("test time");
+
+        assert_eq!(days_since_at(Some("not a date"), now), None);
     }
 }

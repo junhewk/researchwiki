@@ -1,6 +1,7 @@
 /target
 /data
 /.demo-data
+/pdfs*/
 /.env
 /.playwright-cli/
 *.db

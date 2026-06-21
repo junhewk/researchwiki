@@ -48,7 +48,7 @@ key in the setup wizard.
 
 Pre-built desktop artifacts are attached to tagged releases:
 
-Latest release: **v0.1.4**.
+Latest release: **v0.1.6**.
 
 | Platform | File |
 |---|---|
@@ -58,30 +58,25 @@ Latest release: **v0.1.4**.
 On macOS, open the DMG and copy `ResearchWiki.app` to `/Applications`.
 On Windows, unzip `ResearchWiki-windows.zip` and run `ResearchWiki.exe` from the extracted folder.
 
-### What's new in v0.1.4
+### What's new in v0.1.6
 
-- **Full text finally reaches the pipeline.** Fetched full text is now saved with each
-  article, so evaluation, embeddings, and the knowledge graph work from the whole paper
-  instead of only the abstract. Downloaded PDFs are kept on disk and a **Re‑extract PDF**
-  button in the article detail retries text extraction (and refreshes embeddings/KG).
-- **Abstracts are preserved separately.** Source abstracts now live in their own
-  `abstract_text` field while `full_text` remains reserved for extracted PDF/XML/body
-  content. Older abstract-only rows are migrated automatically.
-- **Stronger PDF fetching.** Acquisition now falls through arXiv → Unpaywall → publisher
-  URL patterns (incl. Frontiers, PLOS, eLife) → DOI content negotiation → the landing
-  page's `citation_pdf_url` meta tag.
-- **New DOAJ source** (free API, no key) and **cross‑source deduplication**: the same
-  paper arriving from several sources is detected by normalized DOI/title before any LLM
-  call, and a duplicate's evaluation enriches the existing record instead of being
-  discarded.
-- **Article scoring removed.** The per‑article 0–100 scores and tiers were a personal
-  study aid with no role in the pipeline; evaluation keeps the classification, summaries,
-  and strengths/weaknesses.
-- **Knowledge‑graph robustness.** Interrupted article extractions resume at the failed
-  chunk without inflating mention counts or edge weights; relationship types are
-  canonicalized ("developed by" merges into "develops" with the edge direction flipped,
-  existing duplicates are merged on upgrade); empty LLM syntheses no longer overwrite
-  good wiki pages; and failed wiki exports are retried on the next compile pass.
+- **Web cadence scheduler.** The source-run web UI can now run the same workspace cadence
+  scheduler as the desktop app. It checks every 30 seconds, scans every input set, and
+  queues due auto-gathers through the normal gather pipeline. Manual cadence sets appear
+  in the scheduler panel and can be queued with **Run due gathers now**.
+- **Scheduler status and controls.** The Gather page shows scheduler state, due auto/manual
+  counts, last/next check times, recent queued runs, and errors through a live
+  `/api/scheduler` status endpoint.
+- **Fetch-only diagnostics.** `cargo run --bin check_fetch` lists candidates from one
+  source and fetches content/PDFs without screening, evaluation, saving, embedding, KG
+  extraction, or wiki compilation. `check_sources` remains the list-only connectivity
+  check for all sources.
+- **Graph and wiki web polish.** The web graph keeps the JavaScript renderer but now has
+  richer layouts, node dragging, click-through wiki links, and compact detail panels. Wiki
+  pages render Markdown and auto-link known in-wiki entities.
+- **Full-text and PDF handling remains included.** Open-access PDFs are kept on disk,
+  extracted text feeds evaluation/embeddings/KG/wiki, and source abstracts live in
+  `abstract_text` while `full_text` is reserved for extracted article body text.
 
 ## Build from source
 
@@ -226,8 +221,8 @@ templates) · **Traces** (LLM call log) · **Settings**.
 
 - `cargo clippy --all-targets` and `cargo test` for checks.
 - Set `RESEARCHWIKI_DEV=1` to reveal the Gather tab's advanced diagnostics.
-- Dev binaries: `check_sources` (source health), `run_demo_gather`, `seed_diabetes_demo`,
-  `eval`.
+- Dev binaries: `check_sources` (source health), `check_fetch` (fetch-only health),
+  `run_demo_gather`, `seed_diabetes_demo`, `eval`.
 
 ## License
 

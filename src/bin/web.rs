@@ -23,6 +23,9 @@ async fn main() -> Result<()> {
     bootstrap_db(&config).await?;
 
     let state = web::WebState::new(config);
+    let (scheduler_shutdown_tx, scheduler_shutdown_rx) = tokio::sync::watch::channel(false);
+    let scheduler_handle = state.spawn_scheduler(scheduler_shutdown_rx);
+    let router = web::router(state);
     let addr = std::env::var("RESEARCHWIKI_WEB_ADDR")
         .ok()
         .and_then(|value| value.parse::<SocketAddr>().ok())
@@ -30,8 +33,12 @@ async fn main() -> Result<()> {
     let listener = TcpListener::bind(addr).await?;
     info!("ResearchWiki web UI listening on http://{addr}");
 
-    axum::serve(listener, web::router(state))
-        .with_graceful_shutdown(web::shutdown_signal())
+    axum::serve(listener, router)
+        .with_graceful_shutdown(async move {
+            web::shutdown_signal().await;
+            let _ = scheduler_shutdown_tx.send(true);
+            let _ = scheduler_handle.await;
+        })
         .await?;
 
     Ok(())

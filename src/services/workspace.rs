@@ -55,6 +55,19 @@ impl WorkspaceService {
         .await
     }
 
+    pub async fn list_full(&self) -> Result<Vec<Workspace>, AppError> {
+        let meta_path = self.meta_path.clone();
+
+        run_blocking_db(move || {
+            let conn = crate::db::open_connection(&*meta_path)?;
+            let sql = format!("SELECT {WORKSPACE_COLUMNS} FROM workspaces ORDER BY id ASC");
+            let mut stmt = conn.prepare(&sql)?;
+            let rows = stmt.query_map([], map_workspace_row)?;
+            rows.collect::<Result<Vec<_>, _>>()
+        })
+        .await
+    }
+
     pub async fn get(&self, id: i64) -> Result<Workspace, AppError> {
         let meta_path = self.meta_path.clone();
         run_blocking_db(move || {
@@ -340,6 +353,7 @@ mod tests {
             .research_context(workspace.id)
             .await
             .expect("research context");
+        let full_list = service.list_full().await.expect("full workspace list");
 
         assert_eq!(context.name, "Diabetes chatbot evidence map");
         assert_eq!(
@@ -361,6 +375,13 @@ mod tests {
         );
         assert_eq!(context.topic_descriptor, "diabetes chatbot self-management");
         assert_eq!(context.lookback_days, 365);
+        assert_eq!(full_list.len(), 2);
+        let listed = full_list
+            .iter()
+            .find(|listed| listed.id == workspace.id)
+            .expect("created workspace in list");
+        assert_eq!(listed.primary_question, context.primary_question);
+        assert_eq!(listed.seed_concepts, context.seed_concepts);
 
         let _ = std::fs::remove_dir_all(root);
     }
