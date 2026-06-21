@@ -1,6 +1,6 @@
 [package]
 name = "researchwiki"
-version = "0.1.6"
+version = "0.1.7"
 edition = "2024"
 description = "Native desktop app for gathering academic articles and building a knowledge-graph wiki"
 license = "MIT"
@@ -73,6 +73,7 @@ tower-http = { version = "0.6.7", features = ["trace"] }
 # Tray icon works on both Windows and macOS (tray-icon links system frameworks
 # natively — no pkg-config). Linux is excluded (its tray needs GTK/appindicator).
 [target.'cfg(any(target_os = "windows", target_os = "macos"))'.dependencies]
+auto-launch = "0.6.0"
 raw-window-handle = "0.6"
 tray-icon = { version = "0.23.1", default-features = false }
 

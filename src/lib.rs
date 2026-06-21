@@ -5,6 +5,7 @@ pub mod error;
 pub mod models;
 pub mod runtime;
 pub mod services;
+pub mod startup;
 pub mod state;
 pub mod tray;
 pub mod ui;

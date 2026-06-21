@@ -9,9 +9,13 @@ use researchwiki::{
     init_tracing, register_sqlite_vec,
     runtime::DesktopRuntime,
     services::settings::{load_overrides_sync, load_setup_complete_sync, load_ui_language_sync},
+    startup,
 };
 
 fn main() -> eframe::Result<()> {
+    let hidden_launch = cfg!(any(target_os = "windows", target_os = "macos"))
+        && startup::is_hidden_launch(std::env::args());
+
     dotenvy::dotenv().ok();
     init_tracing();
     // sqlite-vec must register before any Connection::open in any thread.
@@ -54,6 +58,9 @@ fn main() -> eframe::Result<()> {
         .with_title("ResearchWiki")
         .with_inner_size([1100.0, 720.0])
         .with_min_inner_size([720.0, 480.0]);
+    if hidden_launch {
+        viewport = viewport.with_visible(false).with_active(false);
+    }
     if let Some(icon) = load_window_icon() {
         viewport = viewport.with_icon(icon);
     }
@@ -74,6 +81,7 @@ fn main() -> eframe::Result<()> {
                 config,
                 language,
                 setup_complete,
+                hidden_launch,
             )))
         }),
     )

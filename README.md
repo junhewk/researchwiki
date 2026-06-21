@@ -29,7 +29,7 @@ embedding endpoint — hosted (OpenAI, etc.) or local (Ollama, LM Studio, llama.
   (e.g. every 7 days), checked when you open the app and while it runs — no always‑on
   server needed.
 - **Traces** tab to inspect every LLM call (prompt, tokens, latency, cost, errors).
-- System‑tray support, light modern UI, and English/Korean interface.
+- System‑tray support, optional start-at-login, light modern UI, and English/Korean interface.
 
 ## Requirements
 
@@ -48,7 +48,7 @@ key in the setup wizard.
 
 Pre-built desktop artifacts are attached to tagged releases:
 
-Latest release: **v0.1.6**.
+Latest release: **v0.1.7**.
 
 | Platform | File |
 |---|---|
@@ -58,25 +58,13 @@ Latest release: **v0.1.6**.
 On macOS, open the DMG and copy `ResearchWiki.app` to `/Applications`.
 On Windows, unzip `ResearchWiki-windows.zip` and run `ResearchWiki.exe` from the extracted folder.
 
-### What's new in v0.1.6
+### What's new in v0.1.7
 
-- **Web cadence scheduler.** The source-run web UI can now run the same workspace cadence
-  scheduler as the desktop app. It checks every 30 seconds, scans every input set, and
-  queues due auto-gathers through the normal gather pipeline. Manual cadence sets appear
-  in the scheduler panel and can be queued with **Run due gathers now**.
-- **Scheduler status and controls.** The Gather page shows scheduler state, due auto/manual
-  counts, last/next check times, recent queued runs, and errors through a live
-  `/api/scheduler` status endpoint.
-- **Fetch-only diagnostics.** `cargo run --bin check_fetch` lists candidates from one
-  source and fetches content/PDFs without screening, evaluation, saving, embedding, KG
-  extraction, or wiki compilation. `check_sources` remains the list-only connectivity
-  check for all sources.
-- **Graph and wiki web polish.** The web graph keeps the JavaScript renderer but now has
-  richer layouts, node dragging, click-through wiki links, and compact detail panels. Wiki
-  pages render Markdown and auto-link known in-wiki entities.
-- **Full-text and PDF handling remains included.** Open-access PDFs are kept on disk,
-  extracted text feeds evaluation/embeddings/KG/wiki, and source abstracts live in
-  `abstract_text` while `full_text` is reserved for extracted article body text.
+- **Start at login.** On macOS and Windows, Settings now includes a Startup toggle that
+  registers ResearchWiki as a per-user login item and launches it hidden in the tray /
+  menu bar so scheduled gathers can run after sign-in.
+- **Hidden launch mode.** Login launches use a private `--hidden` startup flag and fall
+  back to showing the window if the system tray cannot be initialized.
 
 ## Build from source
 
@@ -198,6 +186,8 @@ QUERY="diabetes" DAYS_BACK=365 cargo run --bin check_sources
 Minimizing hides the window to the tray / menu bar and keeps the app running, so scheduled
 gathers can fire. Closing the window asks whether to **minimize to tray** or **quit**
 (with a "don't ask again" option). Use the tray's **Open** to restore the window.
+In **Settings → Startup**, enable **Start ResearchWiki at login** to launch hidden in the
+tray / menu bar when you sign in.
 (There is no system tray on Linux; the app closes normally there.)
 
 ## Tabs

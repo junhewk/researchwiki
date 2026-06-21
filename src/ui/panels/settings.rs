@@ -2,6 +2,7 @@ use crate::{
     config::{EmbeddingConfig, LlmConfig, normalize_api_key},
     models::settings::UiLanguage,
     runtime::UiEvent,
+    startup::{self, LoginStartupStatus},
     ui::{style, toast::ToastKind},
 };
 
@@ -11,9 +12,11 @@ enum Msg {
     Loaded {
         embedding_dimensions: Option<u32>,
         ui_language: UiLanguage,
+        login_startup: Result<LoginStartupStatus, String>,
     },
     LoadError(String),
     Saved(&'static str),
+    StartupSaved(LoginStartupStatus),
     SaveError(String),
 }
 
@@ -27,6 +30,10 @@ pub struct Panel {
     loading: bool,
 
     ui_language: UiLanguage,
+
+    login_startup_supported: bool,
+    login_startup_enabled: bool,
+    login_startup_loading: bool,
 
     llm_base_url: String,
     llm_model: String,
@@ -92,6 +99,9 @@ impl Panel {
                 self.section_interface(ui, ctx);
                 ui.add_space(8.0);
                 ui.separator();
+                self.section_login_startup(ui, ctx);
+                ui.add_space(8.0);
+                ui.separator();
                 self.section_llm(ui, ctx);
                 ui.add_space(8.0);
                 ui.separator();
@@ -131,8 +141,22 @@ impl Panel {
                 Msg::Loaded {
                     embedding_dimensions,
                     ui_language,
+                    login_startup,
                 } => {
                     self.ui_language = ui_language;
+                    match login_startup {
+                        Ok(status) => {
+                            self.login_startup_supported = status.supported;
+                            self.login_startup_enabled = status.enabled;
+                        }
+                        Err(err) => {
+                            self.login_startup_supported = false;
+                            self.login_startup_enabled = false;
+                            self.error =
+                                Some(format!("Failed to read login startup setting: {err}"));
+                        }
+                    }
+                    self.login_startup_loading = false;
                     self.embedding_dim_persisted = embedding_dimensions;
                     if let Some(dim) = embedding_dimensions {
                         self.embedding_dim_input = dim.to_string();
@@ -141,6 +165,7 @@ impl Panel {
                 }
                 Msg::LoadError(err) => {
                     self.loading = false;
+                    self.login_startup_loading = false;
                     self.error = Some(format!("Failed to load settings: {err}"));
                 }
                 Msg::Saved(what) => {
@@ -156,6 +181,15 @@ impl Panel {
                         "Semantic Scholar key" => self.s2_dirty = false,
                         _ => {}
                     }
+                }
+                Msg::StartupSaved(status) => {
+                    self.saving = None;
+                    self.login_startup_supported = status.supported;
+                    self.login_startup_enabled = status.enabled;
+                    let _ = ctx.ui_tx.send(UiEvent::Toast {
+                        kind: ToastKind::Success,
+                        message: "Startup setting saved.".to_string(),
+                    });
                 }
                 Msg::SaveError(err) => {
                     self.saving = None;
@@ -181,6 +215,7 @@ impl Panel {
 
     fn spawn_load(&mut self, ctx: &PanelCtx<'_>) {
         self.loading = true;
+        self.login_startup_loading = true;
         let Some(channel) = self.channel.as_ref() else {
             return;
         };
@@ -190,9 +225,11 @@ impl Panel {
             match svc.get_settings().await {
                 Ok(resp) => {
                     let dim = svc.get_embedding_dimensions().await.ok().flatten();
+                    let login_startup = blocking_login_startup_status().await;
                     let _ = tx.send(Msg::Loaded {
                         embedding_dimensions: dim,
                         ui_language: resp.ui_language,
+                        login_startup,
                     });
                 }
                 Err(err) => {
@@ -219,6 +256,36 @@ impl Panel {
                 self.save_language(ctx, next);
             }
         });
+    }
+
+    fn section_login_startup(&mut self, ui: &mut egui::Ui, ctx: &PanelCtx<'_>) {
+        style::section_heading(ui, ctx.t("Startup"));
+        let mut enabled = self.login_startup_enabled;
+        let can_edit =
+            self.login_startup_supported && !self.login_startup_loading && self.saving.is_none();
+        let response = ui.add_enabled(
+            can_edit,
+            egui::Checkbox::new(&mut enabled, ctx.t("Start ResearchWiki at login")),
+        );
+        if response.changed() {
+            self.login_startup_enabled = enabled;
+            self.save_login_startup(ctx, enabled);
+        }
+
+        if self.login_startup_supported {
+            style::muted_label(
+                ui,
+                ctx.t("Launch hidden in the system tray so scheduled gathers can run."),
+            );
+        } else {
+            style::muted_label(ui, ctx.t("Available in macOS and Windows desktop builds."));
+        }
+
+        if self.login_startup_loading {
+            style::loading_indicator(ui, ctx.t("Loading settings..."));
+        } else if self.saving == Some("Startup setting") {
+            style::loading_indicator(ui, ctx.t("Saving…"));
+        }
     }
 
     fn section_llm(&mut self, ui: &mut egui::Ui, ctx: &PanelCtx<'_>) {
@@ -608,6 +675,21 @@ impl Panel {
         });
     }
 
+    fn save_login_startup(&mut self, ctx: &PanelCtx<'_>, enabled: bool) {
+        let Some(channel) = self.channel.as_ref() else {
+            return;
+        };
+        self.saving = Some("Startup setting");
+        let tx = channel.tx.clone();
+        ctx.handle.spawn(async move {
+            let result = blocking_set_login_startup_enabled(enabled).await;
+            let _ = match result {
+                Ok(status) => tx.send(Msg::StartupSaved(status)),
+                Err(err) => tx.send(Msg::SaveError(err)),
+            };
+        });
+    }
+
     fn save_embedding_endpoint(&mut self, ctx: &PanelCtx<'_>) {
         let Some(channel) = self.channel.as_ref() else {
             return;
@@ -645,6 +727,20 @@ impl Panel {
         });
         self.embedding_dim_persisted = Some(new_dim);
     }
+}
+
+async fn blocking_login_startup_status() -> Result<LoginStartupStatus, String> {
+    tokio::task::spawn_blocking(startup::login_startup_status)
+        .await
+        .map_err(|error| error.to_string())?
+        .map_err(|error| error.to_string())
+}
+
+async fn blocking_set_login_startup_enabled(enabled: bool) -> Result<LoginStartupStatus, String> {
+    tokio::task::spawn_blocking(move || startup::set_login_startup_enabled(enabled))
+        .await
+        .map_err(|error| error.to_string())?
+        .map_err(|error| error.to_string())
 }
 
 fn path_row(ui: &mut egui::Ui, ctx: &PanelCtx<'_>, label: &'static str, path: &std::path::Path) {

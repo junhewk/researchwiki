@@ -114,6 +114,7 @@ impl DesktopApp {
         config: AppConfig,
         language: UiLanguage,
         setup_complete: bool,
+        hidden_launch: bool,
     ) -> Self {
         install_system_font_fallbacks(&cc.egui_ctx);
         style::apply_app_style(&cc.egui_ctx);
@@ -139,7 +140,7 @@ impl DesktopApp {
             ui_rx: runtime.ui_rx,
             tray: None,
             tray_error_reported: false,
-            hidden_to_tray: false,
+            hidden_to_tray: hidden_launch,
             restoring_from_tray: false,
             native_window_handle: native_window_handle(cc),
             first_run: FirstRunForm::default(),
@@ -393,6 +394,11 @@ impl DesktopApp {
                 self.tray_error_reported = true;
                 warn!("failed to initialize system tray: {err:#}");
                 self.status = Some(format!("System tray unavailable: {err}"));
+                if self.hidden_to_tray {
+                    self.hidden_to_tray = false;
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+                }
             }
         }
     }

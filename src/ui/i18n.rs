@@ -19,6 +19,14 @@ pub fn t(language: UiLanguage, text: &'static str) -> &'static str {
         "Traces" => "추적",
         "Interface" => "인터페이스",
         "Language" => "언어",
+        "Startup" => "시작",
+        "Start ResearchWiki at login" => "로그인 시 ResearchWiki 시작",
+        "Launch hidden in the system tray so scheduled gathers can run." => {
+            "예약 수집이 실행될 수 있도록 시스템 트레이에 숨겨서 시작합니다."
+        }
+        "Available in macOS and Windows desktop builds." => {
+            "macOS 및 Windows 데스크톱 빌드에서 사용할 수 있습니다."
+        }
         "Language updated." => "언어가 변경되었습니다.",
         "Loading settings..." => "설정을 불러오는 중...",
         "Welcome to ResearchWiki" => "ResearchWiki에 오신 것을 환영합니다",
