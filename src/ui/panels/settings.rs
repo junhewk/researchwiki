@@ -292,9 +292,7 @@ impl Panel {
         style::section_heading(ui, ctx.t("LLM endpoint"));
         style::muted_label(
             ui,
-            ctx.t(
-                "Changes are saved to settings.json. Restart to apply to the running LLM client.",
-            ),
+            ctx.t("Changes are saved to settings.json. New LLM requests use them immediately."),
         );
         ui.add_space(4.0);
 
@@ -441,7 +439,9 @@ impl Panel {
         style::section_heading(ui, ctx.t("Embedding endpoint"));
         style::muted_label(
             ui,
-            ctx.t("Used to embed article chunks for semantic + hybrid search. Restart to apply."),
+            ctx.t(
+                "Used to embed article chunks for semantic + hybrid search. New embedding requests use saved changes immediately.",
+            ),
         );
         ui.add_space(4.0);
 
@@ -602,15 +602,19 @@ impl Panel {
         };
         self.saving = Some("LLM endpoint");
         let tx = channel.tx.clone();
+        let ui_tx = ctx.ui_tx.clone();
         let mut new_llm: LlmConfig = ctx.state.config.llm.clone();
         new_llm.base_url = self.llm_base_url.trim().trim_end_matches('/').to_string();
         new_llm.model = self.llm_model.trim().to_string();
         new_llm.api_key = normalize_api_key(&self.llm_api_key);
         let svc = ctx.state.settings_service.clone();
         ctx.handle.spawn(async move {
-            let result = svc.set_llm_config(new_llm).await;
+            let result = svc.set_llm_config(new_llm.clone()).await;
             let _ = match result {
-                Ok(()) => tx.send(Msg::Saved("LLM endpoint")),
+                Ok(()) => {
+                    let _ = ui_tx.send(UiEvent::LlmConfigChanged(new_llm));
+                    tx.send(Msg::Saved("LLM endpoint"))
+                }
                 Err(err) => tx.send(Msg::SaveError(err.to_string())),
             };
         });
@@ -622,15 +626,19 @@ impl Panel {
         };
         self.saving = Some("Contact email");
         let tx = channel.tx.clone();
+        let ui_tx = ctx.ui_tx.clone();
         let email = {
             let trimmed = self.contact_email.trim();
             (!trimmed.is_empty()).then(|| trimmed.to_string())
         };
         let svc = ctx.state.settings_service.clone();
         ctx.handle.spawn(async move {
-            let result = svc.set_contact_email(email).await;
+            let result = svc.set_contact_email(email.clone()).await;
             let _ = match result {
-                Ok(()) => tx.send(Msg::Saved("Contact email")),
+                Ok(()) => {
+                    let _ = ui_tx.send(UiEvent::ContactEmailChanged(email));
+                    tx.send(Msg::Saved("Contact email"))
+                }
                 Err(err) => tx.send(Msg::SaveError(err.to_string())),
             };
         });
@@ -642,15 +650,19 @@ impl Panel {
         };
         self.saving = Some("Semantic Scholar key");
         let tx = channel.tx.clone();
+        let ui_tx = ctx.ui_tx.clone();
         let key = {
             let trimmed = self.semantic_scholar_api_key.trim();
             (!trimmed.is_empty()).then(|| trimmed.to_string())
         };
         let svc = ctx.state.settings_service.clone();
         ctx.handle.spawn(async move {
-            let result = svc.set_semantic_scholar_api_key(key).await;
+            let result = svc.set_semantic_scholar_api_key(key.clone()).await;
             let _ = match result {
-                Ok(()) => tx.send(Msg::Saved("Semantic Scholar key")),
+                Ok(()) => {
+                    let _ = ui_tx.send(UiEvent::SemanticScholarApiKeyChanged(key));
+                    tx.send(Msg::Saved("Semantic Scholar key"))
+                }
                 Err(err) => tx.send(Msg::SaveError(err.to_string())),
             };
         });
@@ -696,6 +708,7 @@ impl Panel {
         };
         self.saving = Some("Embedding endpoint");
         let tx = channel.tx.clone();
+        let ui_tx = ctx.ui_tx.clone();
         let new_embed = EmbeddingConfig {
             base_url: self.embed_base_url.trim().trim_end_matches('/').to_string(),
             model: self.embed_model.trim().to_string(),
@@ -703,9 +716,12 @@ impl Panel {
         };
         let svc = ctx.state.settings_service.clone();
         ctx.handle.spawn(async move {
-            let result = svc.set_embedding_config(new_embed).await;
+            let result = svc.set_embedding_config(new_embed.clone()).await;
             let _ = match result {
-                Ok(()) => tx.send(Msg::Saved("Embedding endpoint")),
+                Ok(()) => {
+                    let _ = ui_tx.send(UiEvent::EmbeddingConfigChanged(new_embed));
+                    tx.send(Msg::Saved("Embedding endpoint"))
+                }
                 Err(err) => tx.send(Msg::SaveError(err.to_string())),
             };
         });

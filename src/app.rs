@@ -1,4 +1,4 @@
-use std::{path::Path, sync::Arc, time::Duration};
+use std::{collections::HashSet, path::Path, sync::Arc, time::Duration};
 
 use anyhow::{Context, Result};
 use tokio::{
@@ -11,11 +11,12 @@ use crate::{
     config::AppConfig,
     db,
     models::{
+        job::JobRunResponse,
         settings::UiLanguage,
         workspace::{WorkspaceSummary, WorkspaceUpdate},
     },
     runtime::{DesktopRuntime, UiEvent},
-    services::{settings::SettingsService, workspace::WorkspaceService},
+    services::{pipeline::source_label, settings::SettingsService, workspace::WorkspaceService},
     state::AppState,
     tray::{TrayCommand, TrayController},
     ui::{
@@ -42,6 +43,8 @@ struct PersistentUi {
 
 const PERSIST_SCHEMA: u32 = 2;
 const PERSIST_KEY: &str = "researchwiki_ui";
+const ACTIVE_JOB_POLL_INTERVAL: Duration = Duration::from_secs(2);
+const ACTIVE_JOB_QUERY_LIMIT: u32 = 25;
 
 /// Default prompt templates embedded at build time so a distributed binary /
 /// `.app` is self-contained. Seeded into the user's prompts dir on first run
@@ -63,6 +66,27 @@ fn days_since(timestamp: Option<&str>) -> Option<i64> {
     let parsed =
         chrono::NaiveDateTime::parse_from_str(timestamp?.trim(), "%Y-%m-%d %H:%M:%S").ok()?;
     Some((chrono::Utc::now().naive_utc() - parsed).num_days().max(0))
+}
+
+fn is_active_job_status(status: &str) -> bool {
+    matches!(status, "queued" | "running")
+}
+
+fn truncate_for_status(text: &str, max_chars: usize) -> String {
+    let mut chars = text.chars();
+    let truncated = chars.by_ref().take(max_chars).collect::<String>();
+    if chars.next().is_some() {
+        format!("{truncated}...")
+    } else {
+        truncated
+    }
+}
+
+fn source_display_name(source: &str) -> String {
+    match source_label(source) {
+        Some(label) => label.to_string(),
+        None => source.to_string(),
+    }
 }
 
 pub struct DesktopApp {
@@ -101,6 +125,15 @@ pub struct DesktopApp {
     panels: Panels,
     persistent: PersistentUi,
     status: Option<String>,
+    active_jobs: Vec<JobRunResponse>,
+    active_jobs_workspace: Option<i64>,
+    active_jobs_refreshed_at: Option<std::time::Instant>,
+    active_jobs_loading: bool,
+    active_jobs_error: Option<String>,
+    article_refresh_revision: u64,
+    article_result_run_ids: HashSet<String>,
+    interrupted_jobs: Vec<JobRunResponse>,
+    deferred_interrupted_run_ids: HashSet<String>,
     toasts: Toasts,
     workspaces: Vec<WorkspaceSummary>,
     workspaces_refreshed_at: Option<std::time::Instant>,
@@ -155,6 +188,15 @@ impl DesktopApp {
             panels: Panels::default(),
             persistent,
             status: None,
+            active_jobs: Vec::new(),
+            active_jobs_workspace: None,
+            active_jobs_refreshed_at: None,
+            active_jobs_loading: false,
+            active_jobs_error: None,
+            article_refresh_revision: 0,
+            article_result_run_ids: HashSet::new(),
+            interrupted_jobs: Vec::new(),
+            deferred_interrupted_run_ids: HashSet::new(),
             toasts: Toasts::default(),
             workspaces: Vec::new(),
             workspaces_refreshed_at: None,
@@ -234,15 +276,19 @@ impl DesktopApp {
 
         let prompt_service = state.prompt_service.clone();
         let job_service = state.job_service.clone();
-        self.handle.block_on(async move {
+        let interrupted_jobs = self.handle.block_on(async move {
             if let Err(err) = prompt_service.seed_prompt_versions().await {
                 warn!("seed_prompt_versions failed: {err:#}");
             }
             match job_service.recover_interrupted_runs().await {
-                Ok(n) if n > 0 => info!("marked {n} interrupted job runs as failed"),
+                Ok(n) if n > 0 => info!("marked {n} running job runs as interrupted"),
                 Ok(_) => {}
                 Err(err) => warn!("recover_interrupted_runs failed: {err:#}"),
             }
+            job_service
+                .list_interrupted_jobs(workspace_id)
+                .await
+                .unwrap_or_default()
         });
 
         // Re-evaluate this research set's gather cadence on the next frame.
@@ -252,6 +298,15 @@ impl DesktopApp {
 
         self.persistent.active_workspace_id = workspace_id;
         self.state = Some(state);
+        self.active_jobs.clear();
+        self.active_jobs_workspace = Some(workspace_id);
+        self.active_jobs_refreshed_at = None;
+        self.active_jobs_loading = false;
+        self.active_jobs_error = None;
+        self.article_refresh_revision = self.article_refresh_revision.wrapping_add(1);
+        self.article_result_run_ids.clear();
+        self.interrupted_jobs = interrupted_jobs;
+        self.deferred_interrupted_run_ids.clear();
         self.status = Some(i18n::t(self.language, "Ready.").to_string());
     }
 
@@ -334,6 +389,56 @@ impl DesktopApp {
                     self.toasts
                         .push(ToastKind::Success, i18n::t(language, "Language updated."));
                 }
+                UiEvent::LlmConfigChanged(llm) => {
+                    self.config.llm = llm;
+                    self.rebuild_active_state_after_settings_change(
+                        "LLM endpoint updated for new requests.",
+                    );
+                }
+                UiEvent::EmbeddingConfigChanged(embedding) => {
+                    self.config.embedding = embedding;
+                    self.rebuild_active_state_after_settings_change(
+                        "Embedding endpoint updated for new requests.",
+                    );
+                }
+                UiEvent::ContactEmailChanged(email) => {
+                    self.config.contact_email = email.unwrap_or_default();
+                    self.rebuild_active_state_after_settings_change(
+                        "Contact email updated for new gathers.",
+                    );
+                }
+                UiEvent::SemanticScholarApiKeyChanged(key) => {
+                    self.config.semantic_scholar_api_key = key.unwrap_or_default();
+                    self.rebuild_active_state_after_settings_change(
+                        "Semantic Scholar key updated for new gathers.",
+                    );
+                }
+                UiEvent::ActiveJobsUpdated { workspace_id, jobs } => {
+                    if workspace_id == self.persistent.active_workspace_id {
+                        if self.record_completed_article_jobs(&jobs) {
+                            self.article_refresh_revision =
+                                self.article_refresh_revision.wrapping_add(1);
+                        }
+                        self.active_jobs = jobs
+                            .into_iter()
+                            .filter(|job| is_active_job_status(&job.status))
+                            .collect();
+                        self.active_jobs_workspace = Some(workspace_id);
+                        self.active_jobs_refreshed_at = Some(std::time::Instant::now());
+                        self.active_jobs_loading = false;
+                        self.active_jobs_error = None;
+                    }
+                }
+                UiEvent::ActiveJobsLoadFailed {
+                    workspace_id,
+                    message,
+                } => {
+                    if workspace_id == self.persistent.active_workspace_id {
+                        self.active_jobs_loading = false;
+                        self.active_jobs_refreshed_at = Some(std::time::Instant::now());
+                        self.active_jobs_error = Some(message);
+                    }
+                }
                 UiEvent::JobProgress {
                     run_id,
                     step,
@@ -359,6 +464,117 @@ impl DesktopApp {
                     self.toasts.push(kind, line.clone());
                     self.status = Some(line);
                 }
+            }
+        }
+    }
+
+    fn rebuild_active_state_after_settings_change(&mut self, status: &str) {
+        let workspace_id = self.persistent.active_workspace_id;
+        if self.state.is_some() && workspace_id > 0 {
+            self.build_state_for_workspace(workspace_id);
+        }
+        self.status = Some(status.to_string());
+    }
+
+    fn maybe_refresh_active_jobs(&mut self, ctx: &egui::Context) {
+        let Some(state) = &self.state else {
+            self.active_jobs.clear();
+            self.active_jobs_workspace = None;
+            self.active_jobs_refreshed_at = None;
+            self.active_jobs_loading = false;
+            self.active_jobs_error = None;
+            return;
+        };
+
+        let workspace_id = self.persistent.active_workspace_id;
+        if workspace_id <= 0 {
+            return;
+        }
+
+        if self.active_jobs_workspace != Some(workspace_id) {
+            self.active_jobs.clear();
+            self.active_jobs_workspace = Some(workspace_id);
+            self.active_jobs_refreshed_at = None;
+            self.active_jobs_loading = false;
+            self.active_jobs_error = None;
+        }
+
+        ctx.request_repaint_after(ACTIVE_JOB_POLL_INTERVAL);
+        let stale = self
+            .active_jobs_refreshed_at
+            .is_none_or(|last| last.elapsed() >= ACTIVE_JOB_POLL_INTERVAL);
+        if self.active_jobs_loading || !stale {
+            return;
+        }
+
+        self.active_jobs_loading = true;
+        let jobs = state.job_service.clone();
+        let tx = self.ui_tx.clone();
+        self.handle.spawn(async move {
+            let result = jobs.list_jobs(ACTIVE_JOB_QUERY_LIMIT, workspace_id).await;
+            let _ = match result {
+                Ok(jobs) => tx.send(UiEvent::ActiveJobsUpdated { workspace_id, jobs }),
+                Err(err) => tx.send(UiEvent::ActiveJobsLoadFailed {
+                    workspace_id,
+                    message: err.to_string(),
+                }),
+            };
+        });
+    }
+
+    fn record_completed_article_jobs(&mut self, jobs: &[JobRunResponse]) -> bool {
+        let mut changed = false;
+        for job in jobs {
+            if job.status == "completed"
+                && job.candidates_saved > 0
+                && self.article_result_run_ids.insert(job.run_id.clone())
+            {
+                changed = true;
+            }
+        }
+        changed
+    }
+
+    fn active_gather_status_text(&self) -> Option<String> {
+        match self.active_jobs.as_slice() {
+            [] => None,
+            [job] => {
+                let source = source_display_name(&job.source);
+                let step = job.current_step.as_deref().unwrap_or(job.status.as_str());
+                let mut text = format!(
+                    "Gather: {source} {step} | found {} screened {} relevant {} saved {} errors {}",
+                    job.candidates_found,
+                    job.candidates_screened,
+                    job.candidates_relevant,
+                    job.candidates_saved,
+                    job.errors
+                );
+                if let Some(item) = job.current_item.as_deref().filter(|item| !item.is_empty()) {
+                    text.push_str(" | ");
+                    text.push_str(&truncate_for_status(item, 110));
+                }
+                Some(text)
+            }
+            jobs => {
+                let summaries = jobs
+                    .iter()
+                    .take(3)
+                    .map(|job| {
+                        let source = source_display_name(&job.source);
+                        let step = job.current_step.as_deref().unwrap_or(job.status.as_str());
+                        format!("{source}: {step}")
+                    })
+                    .collect::<Vec<_>>()
+                    .join(" | ");
+                let suffix = if jobs.len() > 3 {
+                    format!(" | +{} more", jobs.len() - 3)
+                } else {
+                    String::new()
+                };
+                Some(format!(
+                    "{} active gather jobs | {summaries}{suffix}",
+                    jobs.len()
+                ))
             }
         }
     }
@@ -709,6 +925,126 @@ impl DesktopApp {
             self.cadence_due = None;
         }
     }
+
+    fn show_interrupted_gather_modal(&mut self, ctx: &egui::Context) {
+        let Some(job) = self
+            .interrupted_jobs
+            .iter()
+            .find(|job| !self.deferred_interrupted_run_ids.contains(&job.run_id))
+            .cloned()
+        else {
+            return;
+        };
+
+        let lang = self.language;
+        let source = source_display_name(&job.source);
+        let step = job.current_step.as_deref().unwrap_or("interrupted");
+        let detail = format!(
+            "{source} · {step} · saved {} · errors {} · run {}",
+            job.candidates_saved, job.errors, job.run_id
+        );
+        let mut resume = false;
+        let mut later = false;
+        let mut mark_failed = false;
+
+        let modal = egui::Modal::new(egui::Id::new("interrupted_gather_modal")).show(ctx, |ui| {
+            ui.set_width(440.0);
+            style::section_heading(ui, i18n::t(lang, "Resume interrupted gather?"));
+            style::body_label(
+                ui,
+                i18n::t(
+                    lang,
+                    "ResearchWiki found a gather that was interrupted before it finished.",
+                ),
+            );
+            style::muted_label(ui, detail);
+            ui.add_space(10.0);
+            ui.horizontal_wrapped(|ui| {
+                if style::primary_button(ui, i18n::t(lang, "Resume")).clicked() {
+                    resume = true;
+                }
+                if style::secondary_button(ui, i18n::t(lang, "Later")).clicked() {
+                    later = true;
+                }
+                if style::danger_button(ui, i18n::t(lang, "Mark failed")).clicked() {
+                    mark_failed = true;
+                }
+            });
+        });
+        later |= modal.should_close();
+
+        if resume {
+            self.deferred_interrupted_run_ids.insert(job.run_id.clone());
+            self.resume_interrupted_job(job);
+        } else if mark_failed {
+            self.deferred_interrupted_run_ids.insert(job.run_id.clone());
+            self.mark_interrupted_job_failed(job);
+        } else if later {
+            self.deferred_interrupted_run_ids.insert(job.run_id);
+        }
+    }
+
+    fn resume_interrupted_job(&mut self, job: JobRunResponse) {
+        let Some(state) = self.state.as_ref() else {
+            return;
+        };
+        let jobs = state.job_service.clone();
+        let tx = self.ui_tx.clone();
+        let workspace_id = self.persistent.active_workspace_id;
+        let run_id = job.run_id.clone();
+        self.status = Some(format!("Resuming gather {run_id}…"));
+        self.handle.spawn(async move {
+            match jobs.resume_job(&run_id, workspace_id).await {
+                Ok(run) => {
+                    let _ = tx.send(UiEvent::Status(format!(
+                        "Resumed {} gather ({})",
+                        source_display_name(&run.source),
+                        run.run_id
+                    )));
+                    let _ = tx.send(UiEvent::Toast {
+                        kind: ToastKind::Success,
+                        message: format!("Resumed gather {}", run.run_id),
+                    });
+                }
+                Err(err) => {
+                    let _ = tx.send(UiEvent::Toast {
+                        kind: ToastKind::Error,
+                        message: format!("Resume failed: {err}"),
+                    });
+                }
+            }
+        });
+    }
+
+    fn mark_interrupted_job_failed(&mut self, job: JobRunResponse) {
+        let Some(state) = self.state.as_ref() else {
+            return;
+        };
+        let jobs = state.job_service.clone();
+        let tx = self.ui_tx.clone();
+        let run_id = job.run_id.clone();
+        self.status = Some(format!("Marking gather {run_id} failed…"));
+        self.handle.spawn(async move {
+            match jobs.mark_interrupted_failed(&run_id).await {
+                Ok(run) => {
+                    let _ = tx.send(UiEvent::Status(format!(
+                        "Marked gather {} failed",
+                        run.run_id
+                    )));
+                    let _ = tx.send(UiEvent::Toast {
+                        kind: ToastKind::Info,
+                        message: format!("Marked gather {} failed", run.run_id),
+                    });
+                }
+                Err(err) => {
+                    let _ = tx.send(UiEvent::Toast {
+                        kind: ToastKind::Error,
+                        message: format!("Mark failed failed: {err}"),
+                    });
+                }
+            }
+        });
+    }
 }
 
 impl eframe::App for DesktopApp {
@@ -767,6 +1103,7 @@ impl eframe::App for DesktopApp {
             return;
         }
 
+        self.show_interrupted_gather_modal(ctx);
         self.check_cadence();
         if self.cadence_due.is_some() {
             self.show_cadence_modal(ctx);
@@ -774,6 +1111,7 @@ impl eframe::App for DesktopApp {
 
         self.handle_shortcuts(ctx);
         self.maybe_refresh_workspaces();
+        self.maybe_refresh_active_jobs(ctx);
 
         let mut pending_switch: Option<i64> = None;
         let workspace_items: Vec<(i64, String)> = self
@@ -790,7 +1128,7 @@ impl eframe::App for DesktopApp {
                     .inner_margin(egui::Margin::symmetric(12, 8)),
             )
             .show(ctx, |ui| {
-                ui.horizontal_wrapped(|ui| {
+                ui.horizontal(|ui| {
                     ui.label(egui::RichText::new(style::icon::FOLDERS).color(style::color::MUTED));
                     let mut selected = active_ws;
                     let current = workspace_items
@@ -798,7 +1136,9 @@ impl eframe::App for DesktopApp {
                         .find(|(id, _)| *id == selected)
                         .map(|(_, name)| name.clone())
                         .unwrap_or_else(|| "—".to_string());
+                    let selector_width = ui.available_width().clamp(180.0, 520.0);
                     egui::ComboBox::from_id_salt("workspace_switcher")
+                        .width(selector_width)
                         .selected_text(current)
                         .show_ui(ui, |ui| {
                             for (id, name) in &workspace_items {
@@ -808,34 +1148,43 @@ impl eframe::App for DesktopApp {
                     if selected != active_ws {
                         pending_switch = Some(selected);
                     }
-
-                    ui.separator();
-                    for (group_idx, group) in [Tab::MAIN, Tab::CONFIG].into_iter().enumerate() {
-                        if group_idx > 0 {
-                            ui.separator();
-                        }
-                        for tab in group {
-                            let selected_tab = self.persistent.active_tab == tab;
-                            let shortcut = Tab::ALL
-                                .iter()
-                                .position(|t| *t == tab)
-                                .map(|i| if i == 9 { 0 } else { i + 1 });
-                            let response = style::nav_tab(
-                                ui,
-                                selected_tab,
-                                tab.icon(),
-                                tab.label_for(self.language),
-                            );
-                            let response = match shortcut {
-                                Some(n) => response.on_hover_text(format!("Ctrl+{n}")),
-                                None => response,
-                            };
-                            if response.clicked() {
-                                self.persistent.active_tab = tab;
-                            }
-                        }
-                    }
                 });
+
+                ui.add_space(6.0);
+                egui::ScrollArea::horizontal()
+                    .id_salt("top-tab-scroll")
+                    .auto_shrink([false, true])
+                    .show(ui, |ui| {
+                        ui.horizontal(|ui| {
+                            for (group_idx, group) in
+                                [Tab::MAIN, Tab::CONFIG].into_iter().enumerate()
+                            {
+                                if group_idx > 0 {
+                                    ui.separator();
+                                }
+                                for tab in group {
+                                    let selected_tab = self.persistent.active_tab == tab;
+                                    let shortcut = Tab::ALL
+                                        .iter()
+                                        .position(|t| *t == tab)
+                                        .map(|i| if i == 9 { 0 } else { i + 1 });
+                                    let response = style::nav_tab(
+                                        ui,
+                                        selected_tab,
+                                        tab.icon(),
+                                        tab.label_for(self.language),
+                                    );
+                                    let response = match shortcut {
+                                        Some(n) => response.on_hover_text(format!("Ctrl+{n}")),
+                                        None => response,
+                                    };
+                                    if response.clicked() {
+                                        self.persistent.active_tab = tab;
+                                    }
+                                }
+                            }
+                        });
+                    });
             });
 
         if let Some(new_id) = pending_switch {
@@ -849,7 +1198,29 @@ impl eframe::App for DesktopApp {
                     .inner_margin(egui::Margin::symmetric(12, 4)),
             )
             .show(ctx, |ui| {
-                style::muted_label(ui, self.status.as_deref().unwrap_or(""));
+                ui.horizontal_wrapped(|ui| {
+                    if let Some(text) = self.active_gather_status_text() {
+                        ui.label(
+                            egui::RichText::new(text)
+                                .strong()
+                                .color(style::color::ACCENT),
+                        );
+                        ui.separator();
+                        if ui
+                            .small_button(i18n::t(self.language, "Open Gather"))
+                            .clicked()
+                        {
+                            self.persistent.active_tab = Tab::Gather;
+                        }
+                    } else if let Some(err) = &self.active_jobs_error {
+                        ui.colored_label(
+                            egui::Color32::from_rgb(180, 55, 55),
+                            format!("Gather status unavailable: {err}"),
+                        );
+                    } else {
+                        style::muted_label(ui, self.status.as_deref().unwrap_or(""));
+                    }
+                });
             });
 
         egui::CentralPanel::default().show(ctx, |ui| {
@@ -859,6 +1230,7 @@ impl eframe::App for DesktopApp {
                     handle: &self.handle,
                     ui_tx: &self.ui_tx,
                     active_workspace_id: self.persistent.active_workspace_id,
+                    article_refresh_revision: self.article_refresh_revision,
                     language: self.language,
                 };
                 self.panels.show(self.persistent.active_tab, ui, &panel_ctx);

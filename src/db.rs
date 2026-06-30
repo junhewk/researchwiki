@@ -270,6 +270,25 @@ fn initialize_sync(database_path: &std::path::Path, embedding_dimensions: u32) -
 
         CREATE INDEX IF NOT EXISTS idx_job_events_run_id ON job_events(run_id);
 
+        CREATE TABLE IF NOT EXISTS job_candidates (
+            run_id TEXT NOT NULL REFERENCES job_runs(id) ON DELETE CASCADE,
+            uid TEXT NOT NULL,
+            source TEXT NOT NULL,
+            source_index INTEGER NOT NULL DEFAULT 0,
+            candidate_index INTEGER NOT NULL DEFAULT 0,
+            candidate_json TEXT NOT NULL,
+            status TEXT NOT NULL DEFAULT 'listed',
+            error_message TEXT,
+            created_at TEXT DEFAULT (datetime('now')),
+            updated_at TEXT DEFAULT (datetime('now')),
+            PRIMARY KEY (run_id, uid)
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_job_candidates_run_source
+            ON job_candidates(run_id, source, candidate_index);
+        CREATE INDEX IF NOT EXISTS idx_job_candidates_run_status
+            ON job_candidates(run_id, status);
+
         CREATE TABLE IF NOT EXISTS kg_entities (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             canonical_name TEXT NOT NULL UNIQUE,

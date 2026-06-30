@@ -109,6 +109,9 @@ pub struct PanelCtx<'a> {
     /// The workspace currently selected in the top-bar switcher. Panels scope
     /// their queries to this id.
     pub active_workspace_id: i64,
+    /// Bumped when gathered article content changes so panels with cached
+    /// article queries can invalidate themselves.
+    pub article_refresh_revision: u64,
     pub language: UiLanguage,
 }
 

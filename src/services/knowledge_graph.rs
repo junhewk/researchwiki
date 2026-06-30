@@ -18,14 +18,14 @@ use crate::{
     error::{AppError, run_blocking},
     models::knowledge_graph::{
         ChunkExtraction, EntityVerificationResult, ExtractedEntity, KGArticleEntitiesResponse,
-        KGArticleEntityItem, KGBackfillStartResponse, KGBackfillStatusResponse, KGEntityNeighbor,
-        KGEntityResponse, KGEntitySynthesis, KGEntitySynthesisSummary, KGFullBackfillStartResponse,
-        KGFullBackfillStatus, KGGapAnalysisResponse, KGGapAnalysisResult, KGGraphDataQuery,
-        KGGraphDataResponse, KGGraphEdge, KGGraphNode, KGInsertResponse, KGInsertResult,
-        KGQueryRequest, KGQueryResponse, KGSearchEntity, KGSearchRelationship, KGSearchSource,
-        KGStatsResponse, KGSynthesisCompileStartResponse, KGSynthesisCompileStatus,
-        KGSynthesisListQuery, KGSynthesisListResponse, KGSynthesisRelatedEntity,
-        RelationshipEvidenceOutput, SynthesisGenerationOutput,
+        KGArticleEntityItem, KGBackfillOverview, KGBackfillStartResponse, KGBackfillStatusResponse,
+        KGEntityNeighbor, KGEntityResponse, KGEntitySynthesis, KGEntitySynthesisSummary,
+        KGFullBackfillStartResponse, KGFullBackfillStatus, KGGapAnalysisResponse,
+        KGGapAnalysisResult, KGGraphDataQuery, KGGraphDataResponse, KGGraphEdge, KGGraphNode,
+        KGInsertResponse, KGInsertResult, KGQueryRequest, KGQueryResponse, KGSearchEntity,
+        KGSearchRelationship, KGSearchSource, KGStatsResponse, KGSynthesisCompileStartResponse,
+        KGSynthesisCompileStatus, KGSynthesisListQuery, KGSynthesisListResponse,
+        KGSynthesisRelatedEntity, RelationshipEvidenceOutput, SynthesisGenerationOutput,
     },
     models::workspace::WorkspaceResearchContext,
     services::{
@@ -833,6 +833,23 @@ impl KnowledgeGraphService {
         Ok(state.clone())
     }
 
+    pub async fn get_backfill_overview(&self) -> Result<KGBackfillOverview, AppError> {
+        let (kg_total_articles, kg_completed_articles) = self.count_kg_article_progress().await?;
+        let wiki_total_entities = self.count_synthesis_candidates(true, None).await?;
+        let wiki_pending_entities = self.count_synthesis_candidates(false, None).await?;
+        let kg_remaining_articles = (kg_total_articles - kg_completed_articles).max(0);
+        let wiki_compiled_entities = (wiki_total_entities - wiki_pending_entities).max(0);
+
+        Ok(KGBackfillOverview {
+            kg_total_articles,
+            kg_completed_articles,
+            kg_remaining_articles,
+            wiki_total_entities,
+            wiki_compiled_entities,
+            wiki_pending_entities,
+        })
+    }
+
     pub async fn start_backfill(
         &self,
         batch_size: u32,
@@ -848,19 +865,31 @@ impl KnowledgeGraphService {
                     "Backfill already in progress".to_string(),
                 ));
             }
-            *state = KGBackfillStatusResponse {
-                running: true,
-                processed: 0,
-                inserted: 0,
-                failed: 0,
-                total: actual_batch,
-                current_article_uid: None,
-                current_article_title: None,
-                current_article_index: None,
-                error: None,
-            };
+            if actual_batch > 0 {
+                *state = KGBackfillStatusResponse {
+                    running: true,
+                    processed: 0,
+                    inserted: 0,
+                    failed: 0,
+                    total: actual_batch,
+                    current_article_uid: None,
+                    current_article_title: None,
+                    current_article_index: None,
+                    error: None,
+                };
+            } else {
+                *state = KGBackfillStatusResponse::default();
+            }
             Ok(())
         })?;
+
+        if actual_batch <= 0 {
+            return Ok(KGBackfillStartResponse {
+                status: "skipped".to_string(),
+                message: "No KG article candidates to backfill.".to_string(),
+                total_articles: 0,
+            });
+        }
 
         let service = self.clone();
         tokio::spawn(async move {
@@ -1112,7 +1141,6 @@ impl KnowledgeGraphService {
 
             let response = self.start_backfill(kg_batch_size, 0).await?;
             if response.total_articles <= 0 {
-                let _ = self.wait_for_backfill_batch().await?;
                 self.update_full_backfill(|state| {
                     state.message =
                         Some("KG backfill complete. Starting wiki compile.".to_string());
@@ -1151,9 +1179,8 @@ impl KnowledgeGraphService {
                 .start_synthesis_compilation(wiki_batch_size, false, None)
                 .await?;
             if response.total_entities <= 0 {
-                let _ = self.wait_for_synthesis_batch().await?;
                 self.update_full_backfill(|state| {
-                    state.message = Some("Wiki compile complete.".to_string());
+                    state.message = Some(response.message);
                     Ok(())
                 })?;
                 break;
@@ -1803,6 +1830,25 @@ impl KnowledgeGraphService {
                 |row| row.get::<_, i64>(0),
             )?;
             Ok(count)
+        })
+        .await
+    }
+
+    async fn count_kg_article_progress(&self) -> Result<(i64, i64), AppError> {
+        let database_path = self.database_path.clone();
+        run_blocking(move || {
+            let conn = crate::db::open_connection(&*database_path)?;
+            let (total, completed) = conn.query_row(
+                "
+                SELECT COUNT(*),
+                       COALESCE(SUM(CASE WHEN COALESCE(has_kg_entities, 0) = 1 THEN 1 ELSE 0 END), 0)
+                FROM haie_rev
+                WHERE full_text IS NOT NULL
+                ",
+                [],
+                |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)),
+            )?;
+            Ok((total, completed))
         })
         .await
     }
@@ -2706,18 +2752,30 @@ impl KnowledgeGraphService {
                     "Synthesis compilation already in progress".to_string(),
                 ));
             }
-            *state = KGSynthesisCompileStatus {
-                running: true,
-                processed: 0,
-                compiled: 0,
-                failed: 0,
-                total: actual_batch,
-                current_entity_id: None,
-                current_entity_index: None,
-                error: None,
-            };
+            if actual_batch > 0 {
+                *state = KGSynthesisCompileStatus {
+                    running: true,
+                    processed: 0,
+                    compiled: 0,
+                    failed: 0,
+                    total: actual_batch,
+                    current_entity_id: None,
+                    current_entity_index: None,
+                    error: None,
+                };
+            } else {
+                *state = KGSynthesisCompileStatus::default();
+            }
             Ok(())
         })?;
+
+        if actual_batch <= 0 {
+            return Ok(KGSynthesisCompileStartResponse {
+                status: "skipped".to_string(),
+                message: "No wiki-eligible KG entities to compile.".to_string(),
+                total_entities: 0,
+            });
+        }
 
         let service = self.clone();
         tokio::spawn(async move {

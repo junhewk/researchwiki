@@ -5,7 +5,8 @@ use tokio::{
     sync::{mpsc, watch},
 };
 
-use crate::models::settings::UiLanguage;
+use crate::config::{EmbeddingConfig, LlmConfig};
+use crate::models::{job::JobRunResponse, settings::UiLanguage};
 use crate::ui::{panels::Tab, toast::ToastKind};
 
 #[derive(Debug, Clone)]
@@ -19,6 +20,20 @@ pub enum UiEvent {
     /// Navigate the main window to a tab (e.g. from an empty-state action).
     SwitchTab(Tab),
     LanguageChanged(UiLanguage),
+    /// Settings that are part of AppState's service graph changed; rebuild the
+    /// active workspace state so new requests use the saved config immediately.
+    LlmConfigChanged(LlmConfig),
+    EmbeddingConfigChanged(EmbeddingConfig),
+    ContactEmailChanged(Option<String>),
+    SemanticScholarApiKeyChanged(Option<String>),
+    ActiveJobsUpdated {
+        workspace_id: i64,
+        jobs: Vec<JobRunResponse>,
+    },
+    ActiveJobsLoadFailed {
+        workspace_id: i64,
+        message: String,
+    },
     JobProgress {
         run_id: String,
         step: String,

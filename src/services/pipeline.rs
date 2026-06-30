@@ -9,6 +9,7 @@ use chrono::{Datelike, Days, NaiveDate, Utc};
 use quick_xml::{Reader, events::Event};
 use reqwest::{Client, StatusCode};
 use rusqlite::{Connection, params};
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tokio::{sync::Mutex, task};
 
@@ -137,7 +138,7 @@ impl ArxivRequestLimiter {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ArticleCandidate {
     pub source: String,
     pub source_id: String,

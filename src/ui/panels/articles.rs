@@ -39,6 +39,7 @@ pub struct Panel {
     /// Workspace the current data was fetched for; a mismatch triggers a
     /// refetch while keeping the user's filters/sort/page-size intact.
     loaded_workspace: Option<i64>,
+    loaded_article_revision: u64,
 
     items: Vec<ArticleResponse>,
     total: i64,
@@ -75,6 +76,7 @@ impl Panel {
         }
         if self.loaded_workspace != Some(ctx.active_workspace_id) {
             self.loaded_workspace = Some(ctx.active_workspace_id);
+            self.loaded_article_revision = ctx.article_refresh_revision;
             self.items.clear();
             self.total = 0;
             self.pages = 0;
@@ -83,6 +85,9 @@ impl Panel {
             self.selected_index = None;
             self.detail_open = false;
             self.error = None;
+            self.fetch(ctx);
+        } else if self.loaded_article_revision != ctx.article_refresh_revision {
+            self.loaded_article_revision = ctx.article_refresh_revision;
             self.fetch(ctx);
         }
 

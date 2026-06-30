@@ -148,6 +148,16 @@ pub struct KGBackfillStartResponse {
     pub total_articles: i64,
 }
 
+#[derive(Debug, Serialize, Clone, Default)]
+pub struct KGBackfillOverview {
+    pub kg_total_articles: i64,
+    pub kg_completed_articles: i64,
+    pub kg_remaining_articles: i64,
+    pub wiki_total_entities: i64,
+    pub wiki_compiled_entities: i64,
+    pub wiki_pending_entities: i64,
+}
+
 #[derive(Debug, Deserialize)]
 pub struct KGFullBackfillRequest {
     #[serde(default = "default_synthesis_batch")]

@@ -235,10 +235,18 @@ impl Panel {
             if self.compiling {
                 ui.spinner();
                 if let Some(status) = &self.compile_status {
-                    ui.label(format!(
-                        "compiling {}/{} ({} ok, {} failed)",
-                        status.processed, status.total, status.compiled, status.failed,
-                    ));
+                    ui.vertical(|ui| {
+                        ui.label(format!(
+                            "compiling {}/{} ({} ok, {} failed)",
+                            status.processed, status.total, status.compiled, status.failed,
+                        ));
+                        compile_progress_bar(
+                            ui,
+                            status.processed,
+                            status.total,
+                            format!("{} / {}", status.processed, status.total),
+                        );
+                    });
                 }
             }
         });
@@ -491,6 +499,20 @@ fn opt(s: &str) -> Option<String> {
     } else {
         Some(t.to_string())
     }
+}
+
+fn compile_progress_bar(ui: &mut egui::Ui, done: i64, total: i64, text: String) {
+    let fraction = if total > 0 {
+        (done as f32 / total as f32).clamp(0.0, 1.0)
+    } else {
+        0.0
+    };
+    ui.add(
+        egui::ProgressBar::new(fraction)
+            .desired_width(ui.available_width().clamp(180.0, 420.0))
+            .show_percentage()
+            .text(text),
+    );
 }
 
 fn markdown_with_entity_links(markdown: &str) -> (String, Vec<(String, String)>) {

@@ -208,11 +208,11 @@ pub fn t(language: UiLanguage, text: &'static str) -> &'static str {
 
         "LLM endpoint" => "LLM 엔드포인트",
         "Embedding endpoint" => "임베딩 엔드포인트",
-        "Changes are saved to settings.json. Restart to apply to the running LLM client." => {
-            "변경 사항은 settings.json에 저장됩니다. 실행 중인 LLM 클라이언트에 적용하려면 다시 시작하세요."
+        "Changes are saved to settings.json. New LLM requests use them immediately." => {
+            "변경 사항은 settings.json에 저장됩니다. 새 LLM 요청에 즉시 적용됩니다."
         }
-        "Used to embed article chunks for semantic + hybrid search. Restart to apply." => {
-            "의미 검색 + 하이브리드 검색을 위해 논문 청크를 임베딩합니다. 적용하려면 다시 시작하세요."
+        "Used to embed article chunks for semantic + hybrid search. New embedding requests use saved changes immediately." => {
+            "의미 검색 + 하이브리드 검색을 위해 논문 청크를 임베딩합니다. 저장한 변경 사항은 새 임베딩 요청에 즉시 적용됩니다."
         }
         "Paths" => "경로",
         "Scheduler" => "스케줄러",
@@ -352,6 +352,14 @@ pub fn t(language: UiLanguage, text: &'static str) -> &'static str {
             "이 필터에 해당하는 논문이 없습니다. 조건을 넓히거나 초기화해 보세요."
         }
         "Open Gather" => "수집 탭 열기",
+        "Interrupted runs" => "중단된 실행",
+        "Resume" => "재개",
+        "Later" => "나중에",
+        "Mark failed" => "실패로 표시",
+        "Resume interrupted gather?" => "중단된 수집을 재개할까요?",
+        "ResearchWiki found a gather that was interrupted before it finished." => {
+            "완료되기 전에 중단된 수집이 있습니다."
+        }
         "Re-extract PDF" => "PDF 다시 추출",
         "Extracting…" => "추출 중…",
         "Runs text extraction again over the stored PDF and refreshes embeddings and the knowledge graph." => {
@@ -379,6 +387,10 @@ pub fn t(language: UiLanguage, text: &'static str) -> &'static str {
         }
         "Entities synthesized per compile batch. Larger batches finish faster but use more LLM tokens per run." => {
             "컴파일 배치당 종합되는 개체 수입니다. 배치가 클수록 빨리 끝나지만 실행당 LLM 토큰을 더 사용합니다."
+        }
+        "Continue KG + wiki backfill" => "지식 그래프 + 위키 백필 계속",
+        "Continues from articles without KG entities and entities without current wiki syntheses." => {
+            "KG 개체가 없는 논문과 최신 위키 종합이 없는 개체부터 이어서 처리합니다."
         }
         "How far back gathers search for articles (1–3650 days). Scheduled gathers auto-extend to cover the gap since the last run." => {
             "수집이 논문을 검색하는 기간입니다(1–3650일). 예약 수집은 마지막 실행 이후 공백을 자동으로 보완합니다."

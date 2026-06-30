@@ -10,7 +10,7 @@ use crate::{
     models::{
         job::{JobEventResponse, JobRunDetailResponse, JobRunResponse},
         knowledge_graph::{
-            KGBackfillStatusResponse, KGFullBackfillStatus, KGStatsResponse,
+            KGBackfillOverview, KGBackfillStatusResponse, KGFullBackfillStatus, KGStatsResponse,
             KGSynthesisCompileStatus,
         },
         settings::{SchedulerSettings, SchedulerStatusResponse, SettingsUpdate},
@@ -26,13 +26,15 @@ const HISTORY_LIMIT: u32 = 50;
 const ACTIVE_STATUSES: &[&str] = &["queued", "running"];
 const SCHEDULER_SOURCE_IDS: &[&str] = &["arxiv", "pmc", "pubmed"];
 const JOB_POLL_INTERVAL: Duration = Duration::from_secs(2);
-const OPS_POLL_INTERVAL: Duration = Duration::from_secs(5);
+const OPS_POLL_INTERVAL: Duration = Duration::from_secs(2);
 
 enum Msg {
     JobsLoaded(Vec<JobRunResponse>),
     JobDetail(JobRunDetailResponse),
     JobStarted(JobRunResponse),
+    JobResumed(JobRunResponse),
     JobCancelled(JobRunResponse),
+    JobMarkedFailed(JobRunResponse),
     OperationsLoaded(KgSnapshot),
     OperationNotice(String),
     SchedulerLoaded(SchedulerSettings, SchedulerStatusResponse),
@@ -47,6 +49,7 @@ enum Msg {
 
 struct KgSnapshot {
     stats: KGStatsResponse,
+    overview: KGBackfillOverview,
     backfill: KGBackfillStatusResponse,
     synthesis: KGSynthesisCompileStatus,
     full: KGFullBackfillStatus,
@@ -79,6 +82,7 @@ pub struct Panel {
     kg_batch_size: i32,
     wiki_batch_size: i32,
     kg_stats: Option<KGStatsResponse>,
+    kg_overview: Option<KGBackfillOverview>,
     kg_backfill_status: Option<KGBackfillStatusResponse>,
     kg_synthesis_status: Option<KGSynthesisCompileStatus>,
     kg_full_status: Option<KGFullBackfillStatus>,
@@ -119,6 +123,7 @@ impl Panel {
             self.selected_run_id = None;
             self.detail = None;
             self.kg_stats = None;
+            self.kg_overview = None;
             self.kg_backfill_status = None;
             self.kg_synthesis_status = None;
             self.kg_full_status = None;
@@ -147,6 +152,8 @@ impl Panel {
                 self.show_error(ui, ctx);
                 style::section_break(ui);
                 self.show_active_runs(ui, ctx);
+                style::section_break(ui);
+                self.show_interrupted_runs(ui, ctx);
                 style::section_break(ui);
                 self.show_history(ui, ctx);
                 style::section_break(ui);
@@ -231,14 +238,30 @@ impl Panel {
                     upsert_job(&mut self.jobs, run);
                     self.last_refresh = None;
                 }
+                Msg::JobResumed(run) => {
+                    self.action_in_flight = false;
+                    toast(
+                        ToastKind::Success,
+                        format!("Resumed {} gather ({})", label_for(&run.source), run.run_id),
+                    );
+                    upsert_job(&mut self.jobs, run);
+                    self.last_refresh = None;
+                }
                 Msg::JobCancelled(run) => {
                     self.action_in_flight = false;
                     toast(ToastKind::Success, format!("Cancelled run {}", run.run_id));
                     upsert_job(&mut self.jobs, run);
                     self.last_refresh = None;
                 }
+                Msg::JobMarkedFailed(run) => {
+                    self.action_in_flight = false;
+                    toast(ToastKind::Info, format!("Marked run {} failed", run.run_id));
+                    upsert_job(&mut self.jobs, run);
+                    self.last_refresh = None;
+                }
                 Msg::OperationsLoaded(snapshot) => {
                     self.kg_stats = Some(snapshot.stats);
+                    self.kg_overview = Some(snapshot.overview);
                     self.kg_backfill_status = Some(snapshot.backfill);
                     self.kg_synthesis_status = Some(snapshot.synthesis);
                     self.kg_full_status = Some(snapshot.full);
@@ -393,11 +416,19 @@ impl Panel {
                 .kg_full_status
                 .as_ref()
                 .is_some_and(|status| status.running);
+            let remaining_work = self.kg_overview.as_ref().is_some_and(|overview| {
+                overview.kg_remaining_articles > 0 || overview.wiki_pending_entities > 0
+            });
+            let full_label = if remaining_work {
+                ctx.t("Continue KG + wiki backfill")
+            } else {
+                ctx.t("Run full KG + wiki backfill")
+            };
             if ui
-                .add_enabled(
-                    !self.action_in_flight && !full_busy,
-                    egui::Button::new(ctx.t("Run full KG + wiki backfill")),
-                )
+                .add_enabled(!self.action_in_flight && !full_busy, egui::Button::new(full_label))
+                .on_hover_text(ctx.t(
+                    "Continues from articles without KG entities and entities without current wiki syntheses.",
+                ))
                 .clicked()
             {
                 self.start_full_backfill(ctx);
@@ -594,14 +625,29 @@ impl Panel {
             .show(ui, |ui| {
                 ui.strong("Backfill");
                 if let Some(status) = &self.kg_backfill_status {
-                    ui.label(format!(
-                        "{} | processed {}/{} | inserted {} | failed {}",
-                        running_label(status.running),
-                        status.processed,
-                        status.total,
-                        status.inserted,
-                        status.failed
-                    ));
+                    ui.vertical(|ui| {
+                        ui.label(format!(
+                            "{} | processed {}/{} | inserted {} | failed {}",
+                            running_label(status.running),
+                            status.processed,
+                            status.total,
+                            status.inserted,
+                            status.failed
+                        ));
+                        progress_bar(
+                            ui,
+                            status.processed,
+                            status.total,
+                            format!("batch {} / {}", status.processed, status.total),
+                        );
+                        if let Some(title) = status
+                            .current_article_title
+                            .as_deref()
+                            .or(status.current_article_uid.as_deref())
+                        {
+                            ui.add(egui::Label::new(title).truncate());
+                        }
+                    });
                 } else {
                     ui.label("unavailable");
                 }
@@ -609,14 +655,25 @@ impl Panel {
 
                 ui.strong("Wiki syntheses");
                 if let Some(status) = &self.kg_synthesis_status {
-                    ui.label(format!(
-                        "{} | processed {}/{} | compiled {} | failed {}",
-                        running_label(status.running),
-                        status.processed,
-                        status.total,
-                        status.compiled,
-                        status.failed
-                    ));
+                    ui.vertical(|ui| {
+                        ui.label(format!(
+                            "{} | processed {}/{} | compiled {} | failed {}",
+                            running_label(status.running),
+                            status.processed,
+                            status.total,
+                            status.compiled,
+                            status.failed
+                        ));
+                        progress_bar(
+                            ui,
+                            status.processed,
+                            status.total,
+                            format!("batch {} / {}", status.processed, status.total),
+                        );
+                        if let Some(index) = status.current_entity_index {
+                            ui.label(format!("entity {index} / {}", status.total));
+                        }
+                    });
                 } else {
                     ui.label("unavailable");
                 }
@@ -625,20 +682,73 @@ impl Panel {
                 ui.strong("Full backfill");
                 if let Some(status) = &self.kg_full_status {
                     let message = status.message.as_deref().unwrap_or("no message");
-                    ui.add(
-                        egui::Label::new(format!(
-                            "{} | phase {} | KG processed {} inserted {} failed {} | Wiki processed {} compiled {} failed {} | {message}",
-                            running_label(status.running),
-                            status.phase,
-                            status.kg_processed,
-                            status.kg_inserted,
-                            status.kg_failed,
-                            status.wiki_processed,
-                            status.wiki_compiled,
-                            status.wiki_failed
-                        ))
-                        .truncate(),
-                    );
+                    ui.vertical(|ui| {
+                        ui.add(
+                            egui::Label::new(format!(
+                                "{} | phase {} | KG processed {} inserted {} failed {} | Wiki processed {} compiled {} failed {} | {message}",
+                                running_label(status.running),
+                                status.phase,
+                                status.kg_processed,
+                                status.kg_inserted,
+                                status.kg_failed,
+                                status.wiki_processed,
+                                status.wiki_compiled,
+                                status.wiki_failed
+                            ))
+                            .truncate(),
+                        );
+                        if let Some(overview) = &self.kg_overview {
+                            let overall_done =
+                                overview.kg_completed_articles + overview.wiki_compiled_entities;
+                            let overall_total =
+                                overview.kg_total_articles + overview.wiki_total_entities;
+                            progress_bar(
+                                ui,
+                                overall_done,
+                                overall_total,
+                                format!("overall {overall_done} / {overall_total}"),
+                            );
+                            ui.add(
+                                egui::Label::new(format!(
+                                    "remaining: KG {} articles, wiki {} entities",
+                                    overview.kg_remaining_articles,
+                                    overview.wiki_pending_entities
+                                ))
+                                .truncate(),
+                            );
+                        }
+                        if status.running {
+                            match status.phase.as_str() {
+                                "kg" => {
+                                    if let Some(batch) = &self.kg_backfill_status {
+                                        progress_bar(
+                                            ui,
+                                            batch.processed,
+                                            batch.total,
+                                            format!(
+                                                "current KG batch {} / {}",
+                                                batch.processed, batch.total
+                                            ),
+                                        );
+                                    }
+                                }
+                                "wiki" => {
+                                    if let Some(batch) = &self.kg_synthesis_status {
+                                        progress_bar(
+                                            ui,
+                                            batch.processed,
+                                            batch.total,
+                                            format!(
+                                                "current wiki batch {} / {}",
+                                                batch.processed, batch.total
+                                            ),
+                                        );
+                                    }
+                                }
+                                _ => {}
+                            }
+                        }
+                    });
                 } else {
                     ui.label("unavailable");
                 }
@@ -788,6 +898,96 @@ impl Panel {
         }
         if let Some(run_id) = cancel_request {
             self.cancel_job(ctx, &run_id);
+        }
+    }
+
+    fn show_interrupted_runs(&mut self, ui: &mut egui::Ui, ctx: &PanelCtx<'_>) {
+        let interrupted = self
+            .jobs
+            .iter()
+            .enumerate()
+            .filter(|(_, job)| job.status == "interrupted")
+            .map(|(idx, _)| idx)
+            .collect::<Vec<_>>();
+
+        if interrupted.is_empty() {
+            return;
+        }
+
+        style::section_heading(ui, ctx.t("Interrupted runs"));
+        let mut detail_request: Option<String> = None;
+        let mut resume_request: Option<String> = None;
+        let mut mark_failed_request: Option<String> = None;
+
+        for idx in interrupted {
+            let Some(job) = self.jobs.get(idx) else {
+                continue;
+            };
+
+            style::card(ui, |ui| {
+                ui.set_width(ui.available_width());
+                ui.horizontal_wrapped(|ui| {
+                    ui.strong(format!("{} interrupted", label_for(&job.source)));
+                    ui.separator();
+                    ui.label(format!(
+                        "found {} | screened {} | relevant {} | saved {} | errors {}",
+                        job.candidates_found,
+                        job.candidates_screened,
+                        job.candidates_relevant,
+                        job.candidates_saved,
+                        job.errors
+                    ));
+                });
+
+                ui.add_space(4.0);
+                ui.add(egui::Label::new(format!("Run: {}", job.run_id)).wrap());
+                ui.add(
+                    egui::Label::new(format!(
+                        "Last step: {}",
+                        job.current_step.as_deref().unwrap_or("interrupted")
+                    ))
+                    .wrap(),
+                );
+                if let Some(item) = &job.current_item {
+                    ui.add(egui::Label::new(format!("Last item: {item}")).wrap());
+                }
+                if let Some(error) = &job.error_message {
+                    ui.colored_label(egui::Color32::from_rgb(180, 55, 55), error);
+                }
+
+                ui.add_space(4.0);
+                ui.horizontal(|ui| {
+                    if ui
+                        .add_enabled(!self.action_in_flight, egui::Button::new(ctx.t("Resume")))
+                        .clicked()
+                    {
+                        resume_request = Some(job.run_id.clone());
+                    }
+                    if ui
+                        .add_enabled(
+                            !self.action_in_flight,
+                            egui::Button::new(ctx.t("Mark failed")),
+                        )
+                        .clicked()
+                    {
+                        mark_failed_request = Some(job.run_id.clone());
+                    }
+                    if ui.button(ctx.t("Details")).clicked() {
+                        detail_request = Some(job.run_id.clone());
+                    }
+                });
+            });
+            ui.add_space(6.0);
+        }
+
+        if let Some(run_id) = detail_request {
+            self.load_detail(ctx, &run_id);
+        }
+        if let Some(run_id) = resume_request {
+            self.resume_job(ctx, &run_id);
+        }
+        if let Some(run_id) = mark_failed_request {
+            self.mark_interrupted_failed(ctx, &run_id);
         }
     }
 
@@ -1005,6 +1205,59 @@ impl Panel {
                 }
                 Err(err) => {
                     let _ = tx.send(Msg::Error(format!("Cancel failed: {err}")));
+                }
+            }
+        });
+    }
+
+    fn resume_job(&mut self, ctx: &PanelCtx<'_>, run_id: &str) {
+        let Some(channel) = self.channel.as_ref() else {
+            return;
+        };
+        self.action_in_flight = true;
+        let tx = channel.tx.clone();
+        let ui_tx = ctx.ui_tx.clone();
+        let jobs = ctx.state.job_service.clone();
+        let workspace_id = ctx.active_workspace_id;
+        let run_id = run_id.to_string();
+        ctx.handle.spawn(async move {
+            let result = jobs.resume_job(&run_id, workspace_id).await;
+            match result {
+                Ok(run) => {
+                    let _ = ui_tx.send(crate::runtime::UiEvent::Status(format!(
+                        "Resumed gather run {}",
+                        run.run_id
+                    )));
+                    let _ = tx.send(Msg::JobResumed(run));
+                }
+                Err(err) => {
+                    let _ = tx.send(Msg::Error(format!("Resume failed: {err}")));
+                }
+            }
+        });
+    }
+
+    fn mark_interrupted_failed(&mut self, ctx: &PanelCtx<'_>, run_id: &str) {
+        let Some(channel) = self.channel.as_ref() else {
+            return;
+        };
+        self.action_in_flight = true;
+        let tx = channel.tx.clone();
+        let ui_tx = ctx.ui_tx.clone();
+        let jobs = ctx.state.job_service.clone();
+        let run_id = run_id.to_string();
+        ctx.handle.spawn(async move {
+            let result = jobs.mark_interrupted_failed(&run_id).await;
+            match result {
+                Ok(run) => {
+                    let _ = ui_tx.send(crate::runtime::UiEvent::Status(format!(
+                        "Marked gather run {} failed",
+                        run.run_id
+                    )));
+                    let _ = tx.send(Msg::JobMarkedFailed(run));
+                }
+                Err(err) => {
+                    let _ = tx.send(Msg::Error(format!("Mark failed failed: {err}")));
                 }
             }
         });
@@ -1419,17 +1672,33 @@ fn running_label(running: bool) -> &'static str {
     if running { "running" } else { "idle" }
 }
 
+fn progress_bar(ui: &mut egui::Ui, done: i64, total: i64, text: String) {
+    let fraction = if total > 0 {
+        (done as f32 / total as f32).clamp(0.0, 1.0)
+    } else {
+        0.0
+    };
+    ui.add(
+        egui::ProgressBar::new(fraction)
+            .desired_width(ui.available_width().clamp(180.0, 520.0))
+            .show_percentage()
+            .text(text),
+    );
+}
+
 async fn load_kg_snapshot(
     kg: &crate::services::knowledge_graph::KnowledgeGraphService,
     workspace_id: i64,
 ) -> Result<KgSnapshot, crate::error::AppError> {
     let stats = kg.get_stats(workspace_id).await?;
+    let overview = kg.get_backfill_overview().await?;
     let backfill = kg.get_backfill_status()?;
     let synthesis = kg.get_synthesis_compile_status()?;
     let full = kg.get_full_backfill_status()?;
 
     Ok(KgSnapshot {
         stats,
+        overview,
         backfill,
         synthesis,
         full,
