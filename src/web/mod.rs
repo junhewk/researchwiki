@@ -50,6 +50,8 @@ use crate::{
 static STATIC_DIR: Dir<'_> = include_dir!("$CARGO_MANIFEST_DIR/web/static");
 const WORKSPACE_COOKIE: &str = "rw_workspace_id";
 const WEB_SCHEDULER_INTERVAL: Duration = Duration::from_secs(30);
+const GATHER_DAYS_MIN: i32 = 1;
+const GATHER_DAYS_MAX: i32 = 3650;
 
 #[derive(Clone)]
 pub struct WebState {
@@ -555,8 +557,24 @@ struct WorkspaceForm {
 #[derive(Debug, Deserialize)]
 struct GatherForm {
     workspace_id: i64,
-    source: String,
-    days_back: i32,
+    source: Option<String>,
+    days_back: Option<i32>,
+}
+
+fn gather_job_request(form: &GatherForm, workspace_lookback_days: i32) -> JobCreateRequest {
+    let source = form
+        .source
+        .as_deref()
+        .map(str::trim)
+        .filter(|source| !source.is_empty())
+        .unwrap_or("all")
+        .to_string();
+    let days_back = form
+        .days_back
+        .unwrap_or(workspace_lookback_days)
+        .clamp(GATHER_DAYS_MIN, GATHER_DAYS_MAX);
+
+    JobCreateRequest { source, days_back }
 }
 
 #[derive(Debug, Deserialize)]
@@ -1127,6 +1145,7 @@ async fn gather_page(
         .knowledge_graph_service
         .get_stats(ctx.workspace.id)
         .await?;
+    let overview = app.knowledge_graph_service.get_backfill_overview().await?;
     let backfill = app.knowledge_graph_service.get_backfill_status()?;
     let full = app.knowledge_graph_service.get_full_backfill_status()?;
     let compile = app.knowledge_graph_service.get_synthesis_compile_status()?;
@@ -1153,7 +1172,7 @@ async fn gather_page(
         };
         job_rows.push_str(&format!(
             "<tr><td>{}</td><td>{}</td><td>{}</td><td>{}/{}/{}</td><td>{}</td><td>{cancel}</td></tr>",
-            esc(&job.source),
+            esc(source_label(&job.source).unwrap_or(job.source.as_str())),
             status_pill(&job.status),
             esc(job.requested_at.as_deref().unwrap_or("")),
             job.candidates_found,
@@ -1163,89 +1182,106 @@ async fn gather_page(
         ));
     }
 
+    let workspace_id = ctx.workspace.id;
+    let lookback_days = ctx
+        .workspace
+        .lookback_days
+        .clamp(GATHER_DAYS_MIN, GATHER_DAYS_MAX);
+    let workspace_name = esc(&ctx.workspace.name);
+    let scheduler_json = esc(serde_json::to_string_pretty(&scheduler).unwrap_or_default());
+    let backfill_json = esc(serde_json::to_string_pretty(&backfill).unwrap_or_default());
+    let compile_json = esc(serde_json::to_string_pretty(&compile).unwrap_or_default());
+    let full_json = esc(serde_json::to_string_pretty(&full).unwrap_or_default());
+    let full_label = if overview.kg_remaining_articles > 0 || overview.wiki_pending_entities > 0 {
+        "Continue KG + wiki backfill"
+    } else {
+        "Run full KG + wiki backfill"
+    };
+
     let body = format!(
         r#"
-<section class="page-head"><div><h1>Gather</h1><p>Run source harvests, monitor jobs, and backfill the knowledge graph and wiki.</p></div></section>
-<section class="grid two">
-  <form class="panel form" method="post" action="/gather/run">
-    <div class="panel-head"><h2>Run gather</h2><button class="button primary" type="submit">Queue</button></div>
-    <input type="hidden" name="workspace_id" value="{}">
-    <label><span>Source</span><select name="source">{source_options}</select></label>
-    <label><span>Days back</span><input type="number" min="1" max="3650" name="days_back" value="{}"></label>
-    <p class="hint">PDFs are saved under the configured PDF directory and extracted into article text for KG/wiki use.</p>
-  </form>
+<section class="page-head"><div><h1>Gather</h1><p>Start a harvest for the active Input Set, monitor runs, and build the knowledge graph/wiki.</p></div><a class="button" href="/workspaces?workspace_id={workspace_id}">Edit Input Set</a></section>
+<section class="grid two wide-left">
+  <div class="panel gather-start">
+    <div class="panel-head"><h2>Start gather</h2></div>
+    <form class="form" method="post" action="/gather/run">
+      <input type="hidden" name="workspace_id" value="{workspace_id}">
+      <input type="hidden" name="source" value="all">
+      <input type="hidden" name="days_back" value="{lookback_days}">
+      <p class="hint">Active Input Set: <strong>{workspace_name}</strong> · {lookback_days} days back.</p>
+      <button class="button primary" type="submit">Run all sources</button>
+    </form>
+    <details>
+      <summary>More sources</summary>
+      <form class="form" method="post" action="/gather/run">
+        <input type="hidden" name="workspace_id" value="{workspace_id}">
+        <label><span>Source</span><select name="source">{source_options}</select></label>
+        <label><span>Days back</span><input type="number" min="1" max="3650" name="days_back" value="{lookback_days}"></label>
+        <button class="button" type="submit">Run selected source</button>
+      </form>
+    </details>
+  </div>
   <div class="panel">
-    <div class="panel-head"><h2>Scheduler</h2><a href="/settings?workspace_id={}">Edit</a></div>
+    <div class="panel-head"><h2>Scheduler</h2><a href="/settings?workspace_id={workspace_id}">Edit</a></div>
     <dl class="kv">
       <dt>Status</dt><dd>{}</dd>
       <dt>Enabled</dt><dd>{}</dd>
-      <dt>Last check</dt><dd>{}</dd>
       <dt>Next check</dt><dd>{}</dd>
-      <dt>Due auto</dt><dd>{}</dd>
-      <dt>Due manual</dt><dd>{}</dd>
-      <dt>KG</dt><dd>{} nodes, {} edges</dd>
+      <dt>Due</dt><dd>{} auto · {} ask-first</dd>
+      <dt>KG</dt><dd>{} nodes · {} edges</dd>
     </dl>
     <form class="inline" method="post" action="/gather/scheduler/run-due">
-      <input type="hidden" name="workspace_id" value="{}">
+      <input type="hidden" name="workspace_id" value="{workspace_id}">
       <button class="button" type="submit">Run due gathers now</button>
     </form>
-    <pre data-status-url="/api/scheduler?workspace_id={}">{}</pre>
+    <details><summary>Scheduler status</summary><pre data-status-url="/api/scheduler?workspace_id={workspace_id}">{scheduler_json}</pre></details>
   </div>
 </section>
+<section class="section-head"><div><h2>Build knowledge graph and wiki</h2><p>Continue the downstream KG and wiki work after articles have been gathered.</p></div></section>
 <section class="grid three">
-  <form class="panel form" method="post" action="/gather/kg-backfill">
-    <div class="panel-head"><h2>KG backfill</h2><button class="button" type="submit">Start</button></div>
-    <input type="hidden" name="workspace_id" value="{}">
-    <label><span>Batch size</span><input type="number" min="1" name="batch_size" value="20"></label>
-    <label><span>Offset</span><input type="number" min="0" name="offset" value="0"></label>
-    <pre data-status-url="/api/ops?workspace_id={}">{}</pre>
-  </form>
-  <form class="panel form" method="post" action="/gather/wiki-compile">
-    <div class="panel-head"><h2>Wiki compile</h2><button class="button" type="submit">Start</button></div>
-    <input type="hidden" name="workspace_id" value="{}">
-    <label><span>Batch size</span><input type="number" min="1" name="batch_size" value="20"></label>
-    <label class="check"><input type="checkbox" name="force_all" value="1"> Force all</label>
-    <pre>{}</pre>
-  </form>
-  <form class="panel form" method="post" action="/gather/full-backfill">
-    <div class="panel-head"><h2>Full rebuild</h2><button class="button" type="submit">Start</button></div>
-    <input type="hidden" name="workspace_id" value="{}">
-    <label><span>KG batch</span><input type="number" min="1" name="kg_batch_size" value="20"></label>
-    <label><span>Wiki batch</span><input type="number" min="1" name="wiki_batch_size" value="20"></label>
-    <pre>{}</pre>
-  </form>
+    <div class="panel">
+      <form class="form" method="post" action="/gather/full-backfill">
+        <div class="panel-head"><h2>Full KG + wiki</h2><button class="button primary" type="submit">{full_label}</button></div>
+        <input type="hidden" name="workspace_id" value="{workspace_id}">
+        <label><span>KG batch</span><input type="number" min="1" name="kg_batch_size" value="20"></label>
+        <label><span>Wiki batch</span><input type="number" min="1" name="wiki_batch_size" value="20"></label>
+      </form>
+      <form class="inline" method="post" action="/gather/full-backfill/stop">
+        <input type="hidden" name="workspace_id" value="{workspace_id}">
+        <button class="button danger" type="submit">Stop full backfill</button>
+      </form>
+      <p class="hint">Remaining: KG {kg_remaining} articles · wiki {wiki_pending} entities.</p>
+      <details><summary>Full status</summary><pre>{full_json}</pre></details>
+    </div>
+    <form class="panel form" method="post" action="/gather/kg-backfill">
+      <div class="panel-head"><h2>KG batch</h2><button class="button" type="submit">Backfill KG batch</button></div>
+      <input type="hidden" name="workspace_id" value="{workspace_id}">
+      <label><span>Batch size</span><input type="number" min="1" name="batch_size" value="20"></label>
+      <input type="hidden" name="offset" value="0">
+      <details><summary>KG status</summary><pre data-status-url="/api/ops?workspace_id={workspace_id}">{backfill_json}</pre></details>
+    </form>
+    <form class="panel form" method="post" action="/gather/wiki-compile">
+      <div class="panel-head"><h2>Wiki syntheses</h2><button class="button" type="submit">Compile wiki</button></div>
+      <input type="hidden" name="workspace_id" value="{workspace_id}">
+      <label><span>Batch size</span><input type="number" min="1" name="batch_size" value="20"></label>
+      <label class="check"><input type="checkbox" name="force_all" value="1"> Force all</label>
+      <details><summary>Wiki status</summary><pre>{compile_json}</pre></details>
+    </form>
 </section>
-<form class="inline" method="post" action="/gather/full-backfill/stop">
-  <input type="hidden" name="workspace_id" value="{}">
-  <button class="button danger" type="submit">Stop full rebuild</button>
-</form>
 <section class="panel">
   <div class="panel-head"><h2>Recent runs</h2></div>
   <table><thead><tr><th>Source</th><th>Status</th><th>Requested</th><th>Found/Saved/Errors</th><th>Step</th><th></th></tr></thead><tbody>{job_rows}</tbody></table>
 </section>
 "#,
-        ctx.workspace.id,
-        ctx.workspace.lookback_days,
-        ctx.workspace.id,
         esc(&scheduler.status),
         yes_no(scheduler.enabled),
-        esc(scheduler.last_checked_at.as_deref().unwrap_or("")),
         esc(scheduler.next_check_at.as_deref().unwrap_or("")),
         scheduler.due_auto.len(),
         scheduler.due_manual.len(),
         kg.nodes,
         kg.edges,
-        ctx.workspace.id,
-        ctx.workspace.id,
-        esc(serde_json::to_string_pretty(&scheduler).unwrap_or_default()),
-        ctx.workspace.id,
-        ctx.workspace.id,
-        esc(serde_json::to_string_pretty(&backfill).unwrap_or_default()),
-        ctx.workspace.id,
-        esc(serde_json::to_string_pretty(&compile).unwrap_or_default()),
-        ctx.workspace.id,
-        esc(serde_json::to_string_pretty(&full).unwrap_or_default()),
-        ctx.workspace.id,
+        kg_remaining = overview.kg_remaining_articles,
+        wiki_pending = overview.wiki_pending_entities,
     );
     render_page(&ctx, "Gather", body)
 }
@@ -1255,15 +1291,11 @@ async fn run_gather(
     Form(form): Form<GatherForm>,
 ) -> WebResult<Response> {
     let app = state.app_for_workspace(form.workspace_id).await?;
+    let workspace = state.inner.workspace_service.get(form.workspace_id).await?;
+    let request = gather_job_request(&form, workspace.lookback_days);
     let job = app
         .job_service
-        .enqueue_job(
-            JobCreateRequest {
-                source: form.source,
-                days_back: form.days_back,
-            },
-            form.workspace_id,
-        )
+        .enqueue_job(request, form.workspace_id)
         .await?;
     Ok(redirect_with_cookie(
         &format!(
@@ -3118,8 +3150,8 @@ mod tests {
     use std::collections::BTreeMap;
 
     use super::{
-        days_since_at, empty_workspace, graph_entity_type_options, render_plain_markdown_html,
-        render_wiki_markdown_html, scheduler_due_item,
+        GatherForm, days_since_at, empty_workspace, gather_job_request, graph_entity_type_options,
+        render_plain_markdown_html, render_wiki_markdown_html, scheduler_due_item,
     };
 
     fn scheduler_workspace() -> crate::models::workspace::Workspace {
@@ -3145,6 +3177,52 @@ mod tests {
         assert!(html.contains(">Methodology (12)</option>"));
         assert!(html.contains("value=\"MEDICAL_CONDITION\""));
         assert!(html.contains(">Medical Condition (7)</option>"));
+    }
+
+    #[test]
+    fn gather_form_defaults_to_all_sources_and_workspace_lookback() {
+        let form = GatherForm {
+            workspace_id: 42,
+            source: None,
+            days_back: None,
+        };
+
+        let request = gather_job_request(&form, 180);
+
+        assert_eq!(request.source, "all");
+        assert_eq!(request.days_back, 180);
+    }
+
+    #[test]
+    fn gather_form_preserves_explicit_source_and_days() {
+        let form = GatherForm {
+            workspace_id: 42,
+            source: Some("pubmed".to_string()),
+            days_back: Some(14),
+        };
+
+        let request = gather_job_request(&form, 180);
+
+        assert_eq!(request.source, "pubmed");
+        assert_eq!(request.days_back, 14);
+    }
+
+    #[test]
+    fn gather_form_clamps_day_values() {
+        let too_low = GatherForm {
+            workspace_id: 42,
+            source: Some("".to_string()),
+            days_back: Some(0),
+        };
+        let too_high = GatherForm {
+            workspace_id: 42,
+            source: Some("arxiv".to_string()),
+            days_back: Some(5000),
+        };
+
+        assert_eq!(gather_job_request(&too_low, 180).days_back, 1);
+        assert_eq!(gather_job_request(&too_low, 180).source, "all");
+        assert_eq!(gather_job_request(&too_high, 180).days_back, 3650);
     }
 
     #[test]

@@ -142,9 +142,22 @@ pub fn t(language: UiLanguage, text: &'static str) -> &'static str {
         "Last gathered" => "마지막 수집",
 
         "Run gather" => "수집 실행",
+        "Start gather" => "수집 시작",
+        "Active input set" => "활성 입력 세트",
+        "days back" => "일 전까지",
+        "Runs every source with the saved Input Set lookback." => {
+            "저장된 입력 세트의 조회 기간으로 모든 소스를 실행합니다."
+        }
+        "Edit Input Set" => "입력 세트 편집",
+        "More sources" => "추가 소스",
+        "Use this when you need to retry or inspect one source." => {
+            "한 소스만 다시 시도하거나 확인해야 할 때 사용하세요."
+        }
+        "Run selected source" => "선택한 소스 실행",
         "Active runs" => "실행 중인 작업",
         "Run history" => "실행 기록",
         "Knowledge graph / wiki backfill" => "지식 그래프 / 위키 백필",
+        "Build knowledge graph and wiki" => "지식 그래프와 위키 구축",
         "Advanced diagnostics" => "고급 진단",
         "Pipeline smoke test" => "파이프라인 스모크 테스트",
         "Scheduler check" => "스케줄러 확인",

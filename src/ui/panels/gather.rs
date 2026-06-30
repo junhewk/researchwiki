@@ -14,21 +14,25 @@ use crate::{
             KGSynthesisCompileStatus,
         },
         settings::{SchedulerSettings, SchedulerStatusResponse, SettingsUpdate},
+        workspace::Workspace,
     },
     runtime::UiEvent,
     services::pipeline::{GATHER_SOURCE_IDS, source_label},
     ui::{style, toast::ToastKind},
 };
 
-use super::{MsgChannel, PanelCtx};
+use super::{MsgChannel, PanelCtx, Tab};
 
 const HISTORY_LIMIT: u32 = 50;
 const ACTIVE_STATUSES: &[&str] = &["queued", "running"];
 const SCHEDULER_SOURCE_IDS: &[&str] = &["arxiv", "pmc", "pubmed"];
+const DAYS_BACK_MIN: i32 = 1;
+const DAYS_BACK_MAX: i32 = 3650;
 const JOB_POLL_INTERVAL: Duration = Duration::from_secs(2);
 const OPS_POLL_INTERVAL: Duration = Duration::from_secs(2);
 
 enum Msg {
+    WorkspaceLoaded(Workspace),
     JobsLoaded(Vec<JobRunResponse>),
     JobDetail(JobRunDetailResponse),
     JobStarted(JobRunResponse),
@@ -71,12 +75,15 @@ pub struct Panel {
     /// Workspace the current jobs/statuses belong to; a mismatch clears them
     /// and forces every poller to refetch, keeping the user's inputs.
     loaded_workspace: Option<i64>,
+    workspace_name: Option<String>,
+    workspace_lookback_days: Option<i32>,
 
     days_back: i32,
     jobs: Vec<JobRunResponse>,
     selected_run_id: Option<String>,
     detail: Option<JobRunDetailResponse>,
 
+    manual_source: String,
     test_source: String,
     scheduler_test_source: String,
     kg_batch_size: i32,
@@ -91,6 +98,7 @@ pub struct Panel {
     scheduler_test: Option<SchedulerTestState>,
 
     loading: bool,
+    workspace_loading: bool,
     ops_loading: bool,
     scheduler_loading: bool,
     action_in_flight: bool,
@@ -111,6 +119,7 @@ impl Panel {
         self.drain(ctx);
         if !self.initialized {
             self.initialized = true;
+            self.manual_source = "arxiv".to_string();
             self.test_source = "arxiv".to_string();
             self.scheduler_test_source = "arxiv".to_string();
             self.days_back = 2;
@@ -119,6 +128,8 @@ impl Panel {
         }
         if self.loaded_workspace != Some(ctx.active_workspace_id) {
             self.loaded_workspace = Some(ctx.active_workspace_id);
+            self.workspace_name = None;
+            self.workspace_lookback_days = None;
             self.jobs.clear();
             self.selected_run_id = None;
             self.detail = None;
@@ -132,6 +143,7 @@ impl Panel {
             self.last_refresh = None;
             self.last_ops_refresh = None;
             self.last_scheduler_refresh = None;
+            self.refresh_workspace(ctx);
             self.refresh(ctx);
             self.refresh_operations(ctx);
             self.refresh_scheduler(ctx);
@@ -147,7 +159,7 @@ impl Panel {
         egui::ScrollArea::vertical()
             .auto_shrink([false, false])
             .show(ui, |ui| {
-                style::section_heading(ui, ctx.t("Run gather"));
+                style::section_heading(ui, ctx.t("Start gather"));
                 self.show_controls(ui, ctx);
                 self.show_error(ui, ctx);
                 style::section_break(ui);
@@ -213,6 +225,15 @@ impl Panel {
 
         for msg in drained {
             match msg {
+                Msg::WorkspaceLoaded(workspace) => {
+                    if self.loaded_workspace == Some(workspace.id) {
+                        self.workspace_name = Some(workspace.name);
+                        let days = clamp_days_back(workspace.lookback_days);
+                        self.workspace_lookback_days = Some(days);
+                        self.days_back = days;
+                    }
+                    self.workspace_loading = false;
+                }
                 Msg::JobsLoaded(jobs) => {
                     let had_active_jobs = self.has_active_jobs();
                     self.jobs = jobs;
@@ -307,6 +328,7 @@ impl Panel {
                 }
                 Msg::Error(err) => {
                     self.loading = false;
+                    self.workspace_loading = false;
                     self.ops_loading = false;
                     self.scheduler_loading = false;
                     self.action_in_flight = false;
@@ -330,8 +352,8 @@ impl Panel {
             ui.label(ctx.t("Days back"));
             ui.add(
                 egui::DragValue::new(&mut self.days_back)
-                    .range(1..=30)
-                    .speed(0.2),
+                    .range(DAYS_BACK_MIN..=DAYS_BACK_MAX)
+                    .speed(0.5),
             );
 
             let running_sources = self.running_sources();
@@ -353,9 +375,60 @@ impl Panel {
     }
 
     fn show_kg_ops(&mut self, ui: &mut egui::Ui, ctx: &PanelCtx<'_>) {
-        style::section_heading(ui, ctx.t("Knowledge graph / wiki backfill"));
+        style::section_heading(ui, ctx.t("Build knowledge graph and wiki"));
 
         ui.horizontal_wrapped(|ui| {
+            let kg_busy = self
+                .kg_backfill_status
+                .as_ref()
+                .is_some_and(|status| status.running);
+            let synthesis_busy = self
+                .kg_synthesis_status
+                .as_ref()
+                .is_some_and(|status| status.running);
+            let full_busy = self
+                .kg_full_status
+                .as_ref()
+                .is_some_and(|status| status.running);
+            let remaining_work = self.kg_overview.as_ref().is_some_and(|overview| {
+                overview.kg_remaining_articles > 0 || overview.wiki_pending_entities > 0
+            });
+            let full_label = if remaining_work {
+                ctx.t("Continue KG + wiki backfill")
+            } else {
+                ctx.t("Run full KG + wiki backfill")
+            };
+
+            if ui
+                .add_enabled_ui(!self.action_in_flight && !full_busy, |ui| {
+                    style::primary_button(ui, full_label)
+                })
+                .inner
+                .on_hover_text(ctx.t(
+                    "Continues from articles without KG entities and entities without current wiki syntheses.",
+                ))
+                .clicked()
+            {
+                self.start_full_backfill(ctx);
+            }
+
+            if ui
+                .add_enabled(
+                    !self.action_in_flight && full_busy,
+                    egui::Button::new(ctx.t("Stop full backfill")),
+                )
+                .clicked()
+            {
+                self.stop_full_backfill(ctx);
+            }
+
+            if ui
+                .add_enabled(!self.ops_loading, egui::Button::new(ctx.t("Refresh KG")))
+                .clicked()
+            {
+                self.refresh_operations(ctx);
+            }
+
             ui.label(ctx.t("KG batch"));
             style::help_icon(
                 ui,
@@ -378,17 +451,6 @@ impl Panel {
             );
 
             if ui
-                .add_enabled(!self.ops_loading, egui::Button::new(ctx.t("Refresh KG")))
-                .clicked()
-            {
-                self.refresh_operations(ctx);
-            }
-
-            let kg_busy = self
-                .kg_backfill_status
-                .as_ref()
-                .is_some_and(|status| status.running);
-            if ui
                 .add_enabled(
                     !self.action_in_flight && !kg_busy,
                     egui::Button::new(ctx.t("Backfill KG batch")),
@@ -398,10 +460,6 @@ impl Panel {
                 self.start_kg_backfill(ctx);
             }
 
-            let synthesis_busy = self
-                .kg_synthesis_status
-                .as_ref()
-                .is_some_and(|status| status.running);
             if ui
                 .add_enabled(
                     !self.action_in_flight && !synthesis_busy,
@@ -410,38 +468,6 @@ impl Panel {
                 .clicked()
             {
                 self.start_synthesis(ctx);
-            }
-
-            let full_busy = self
-                .kg_full_status
-                .as_ref()
-                .is_some_and(|status| status.running);
-            let remaining_work = self.kg_overview.as_ref().is_some_and(|overview| {
-                overview.kg_remaining_articles > 0 || overview.wiki_pending_entities > 0
-            });
-            let full_label = if remaining_work {
-                ctx.t("Continue KG + wiki backfill")
-            } else {
-                ctx.t("Run full KG + wiki backfill")
-            };
-            if ui
-                .add_enabled(!self.action_in_flight && !full_busy, egui::Button::new(full_label))
-                .on_hover_text(ctx.t(
-                    "Continues from articles without KG entities and entities without current wiki syntheses.",
-                ))
-                .clicked()
-            {
-                self.start_full_backfill(ctx);
-            }
-
-            if ui
-                .add_enabled(
-                    !self.action_in_flight && full_busy,
-                    egui::Button::new(ctx.t("Stop full backfill")),
-                )
-                .clicked()
-            {
-                self.stop_full_backfill(ctx);
             }
 
             if self.ops_loading {
@@ -522,57 +548,115 @@ impl Panel {
     }
 
     fn show_controls(&mut self, ui: &mut egui::Ui, ctx: &PanelCtx<'_>) {
-        ui.horizontal_wrapped(|ui| {
-            ui.label(ctx.t("Days back"));
-            style::help_icon(
-                ui,
-                ctx.t(
-                    "Gather caps: each source returns ~50 candidates per query; PMC only looks back 30 days. A long lookback broadens coverage across sources rather than exhaustively.",
-                ),
-            );
-            ui.add(
-                egui::DragValue::new(&mut self.days_back)
-                    .range(1..=30)
-                    .speed(0.2),
-            );
+        let running_sources = self.running_sources();
+        let lookback = self.primary_days_back();
+        let all_busy = self.source_is_busy("all", &running_sources);
+        let workspace_ready = self.workspace_lookback_days.is_some();
 
-            if ui
-                .add_enabled(!self.action_in_flight, egui::Button::new(ctx.t("Refresh")))
-                .clicked()
-            {
-                self.refresh(ctx);
-            }
+        style::card(ui, |ui| {
+            ui.set_width(ui.available_width());
+            ui.horizontal_wrapped(|ui| {
+                ui.vertical(|ui| {
+                    ui.label(
+                        egui::RichText::new(ctx.t("Start gather"))
+                            .strong()
+                            .color(style::color::TEXT),
+                    );
+                    let workspace = self
+                        .workspace_name
+                        .as_deref()
+                        .unwrap_or_else(|| ctx.t("Loading…"));
+                    style::muted_label(
+                        ui,
+                        format!(
+                            "{}: {workspace} · {} {}",
+                            ctx.t("Active input set"),
+                            lookback,
+                            ctx.t("days back")
+                        ),
+                    );
+                    style::muted_label(
+                        ui,
+                        ctx.t("Runs every source with the saved Input Set lookback."),
+                    );
+                });
 
-            if self.loading {
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if ui
+                        .add_enabled_ui(
+                            workspace_ready && !self.action_in_flight && !all_busy,
+                            |ui| style::primary_button(ui, ctx.t("Run all sources")),
+                        )
+                        .inner
+                        .clicked()
+                    {
+                        self.start_job_with_days(ctx, "all", lookback);
+                    }
+                    if ui.button(ctx.t("Edit Input Set")).clicked() {
+                        let _ = ctx.ui_tx.send(UiEvent::SwitchTab(Tab::Workspace));
+                    }
+                    if ui
+                        .add_enabled(!self.loading, egui::Button::new(ctx.t("Refresh")))
+                        .clicked()
+                    {
+                        self.refresh_workspace(ctx);
+                        self.refresh(ctx);
+                        self.refresh_operations(ctx);
+                        self.refresh_scheduler(ctx);
+                    }
+                });
+            });
+
+            if self.loading || self.workspace_loading {
+                ui.add_space(6.0);
                 style::loading_indicator(ui, ctx.t("Loading…"));
             }
         });
 
-        ui.add_space(6.0);
-        ui.horizontal_wrapped(|ui| {
-            let running_sources = self.running_sources();
-            let all_busy = self.source_is_busy("all", &running_sources);
-            if ui
-                .add_enabled_ui(!self.action_in_flight && !all_busy, |ui| {
-                    style::primary_button(ui, ctx.t("Run all sources"))
-                })
-                .inner
-                .clicked()
-            {
-                self.start_job(ctx, "all");
-            }
+        ui.add_space(8.0);
+        egui::CollapsingHeader::new(ctx.t("More sources"))
+            .default_open(false)
+            .show(ui, |ui| {
+                style::muted_label(
+                    ui,
+                    ctx.t("Use this when you need to retry or inspect one source."),
+                );
+                ui.add_space(4.0);
+                ui.horizontal_wrapped(|ui| {
+                    ui.label(ctx.t("Source"));
+                    source_combo(
+                        ui,
+                        "gather-manual-source-combo",
+                        &mut self.manual_source,
+                        GATHER_SOURCE_IDS,
+                    );
 
-            for &source in GATHER_SOURCE_IDS {
-                let busy = self.source_is_busy(source, &running_sources);
-                let label = format!("Run {}", label_for(source));
-                if ui
-                    .add_enabled(!self.action_in_flight && !busy, egui::Button::new(label))
-                    .clicked()
-                {
-                    self.start_job(ctx, source);
-                }
-            }
-        });
+                    ui.label(ctx.t("Days back"));
+                    style::help_icon(
+                        ui,
+                        ctx.t(
+                            "Gather caps: each source returns ~50 candidates per query; PMC only looks back 30 days. A long lookback broadens coverage across sources rather than exhaustively.",
+                        ),
+                    );
+                    ui.add(
+                        egui::DragValue::new(&mut self.days_back)
+                            .range(DAYS_BACK_MIN..=DAYS_BACK_MAX)
+                            .speed(0.5),
+                    );
+
+                    let busy = self.source_is_busy(&self.manual_source, &running_sources);
+                    if ui
+                        .add_enabled(
+                            !self.action_in_flight && !busy,
+                            egui::Button::new(ctx.t("Run selected source")),
+                        )
+                        .clicked()
+                    {
+                        let source = self.manual_source.clone();
+                        self.start_job(ctx, &source);
+                    }
+                });
+            });
     }
 
     fn show_error(&mut self, ui: &mut egui::Ui, ctx: &PanelCtx<'_>) {
@@ -850,22 +934,26 @@ impl Panel {
                     ui.strong(format!("{} ({})", label_for(&job.source), job.status));
                     ui.separator();
                     ui.label(format!(
-                        "found {} | screened {} | relevant {}",
-                        job.candidates_found, job.candidates_screened, job.candidates_relevant
-                    ));
-                    ui.separator();
-                    ui.label(format!(
-                        "fetched {} | evaluated {} | saved {} | skipped {} | errors {}",
-                        job.candidates_fetched,
-                        job.candidates_evaluated,
+                        "found {} | relevant {} | saved {} | errors {}",
+                        job.candidates_found,
+                        job.candidates_relevant,
                         job.candidates_saved,
-                        job.candidates_skipped,
                         job.errors
                     ));
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if ui
+                            .add_enabled(!self.action_in_flight, egui::Button::new(ctx.t("Cancel")))
+                            .clicked()
+                        {
+                            cancel_request = Some(job.run_id.clone());
+                        }
+                        if ui.button(ctx.t("Details")).clicked() {
+                            detail_request = Some(job.run_id.clone());
+                        }
+                    });
                 });
 
                 ui.add_space(4.0);
-                ui.add(egui::Label::new(format!("Run: {}", job.run_id)).wrap());
                 ui.add(
                     egui::Label::new(format!(
                         "Step: {}",
@@ -876,19 +964,6 @@ impl Panel {
                 if let Some(item) = &job.current_item {
                     ui.add(egui::Label::new(format!("Current: {item}")).wrap());
                 }
-
-                ui.add_space(4.0);
-                ui.horizontal(|ui| {
-                    if ui.button(ctx.t("Details")).clicked() {
-                        detail_request = Some(job.run_id.clone());
-                    }
-                    if ui
-                        .add_enabled(!self.action_in_flight, egui::Button::new(ctx.t("Cancel")))
-                        .clicked()
-                    {
-                        cancel_request = Some(job.run_id.clone());
-                    }
-                });
             });
             ui.add_space(6.0);
         }
@@ -1134,6 +1209,23 @@ impl Panel {
         }
     }
 
+    fn refresh_workspace(&mut self, ctx: &PanelCtx<'_>) {
+        let Some(channel) = self.channel.as_ref() else {
+            return;
+        };
+        self.workspace_loading = true;
+        let tx = channel.tx.clone();
+        let svc = ctx.state.workspace_service.clone();
+        let workspace_id = ctx.active_workspace_id;
+        ctx.handle.spawn(async move {
+            let result = svc.get(workspace_id).await;
+            let _ = match result {
+                Ok(workspace) => tx.send(Msg::WorkspaceLoaded(workspace)),
+                Err(err) => tx.send(Msg::Error(format!("Failed to load Input Set: {err}"))),
+            };
+        });
+    }
+
     fn refresh(&mut self, ctx: &PanelCtx<'_>) {
         let Some(channel) = self.channel.as_ref() else {
             return;
@@ -1165,6 +1257,7 @@ impl Panel {
         let ui_tx = ctx.ui_tx.clone();
         let jobs = ctx.state.job_service.clone();
         let source = source.to_string();
+        let days_back = clamp_days_back(days_back);
         let workspace_id = ctx.active_workspace_id;
         ctx.handle.spawn(async move {
             let result = jobs.enqueue_source(&source, days_back, workspace_id).await;
@@ -1605,6 +1698,12 @@ impl Panel {
             running_sources.contains(source) || running_sources.contains("all")
         }
     }
+
+    fn primary_days_back(&self) -> i32 {
+        self.workspace_lookback_days
+            .map(clamp_days_back)
+            .unwrap_or_else(|| clamp_days_back(self.days_back))
+    }
 }
 
 /// Developer diagnostics (pipeline smoke test, scheduler arm-test) are hidden in
@@ -1623,6 +1722,10 @@ fn upsert_job(jobs: &mut Vec<JobRunResponse>, run: JobRunResponse) {
 
 fn is_active_status(status: &str) -> bool {
     ACTIVE_STATUSES.contains(&status)
+}
+
+fn clamp_days_back(days_back: i32) -> i32 {
+    days_back.clamp(DAYS_BACK_MIN, DAYS_BACK_MAX)
 }
 
 fn label_for(source: &str) -> &str {

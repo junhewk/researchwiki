@@ -389,6 +389,35 @@ tr:hover td {
   color: var(--muted);
 }
 
+.section-head {
+  margin: 16px 0 10px;
+}
+
+.section-head h2 {
+  margin: 0;
+  font-size: 16px;
+}
+
+.section-head p {
+  margin: 4px 0 0;
+  color: var(--muted);
+}
+
+details {
+  margin-top: 10px;
+}
+
+summary {
+  color: var(--muted);
+  cursor: pointer;
+  font-size: 13px;
+  font-weight: 700;
+}
+
+.gather-start .button.primary {
+  align-self: start;
+}
+
 .panel {
   align-self: start;
   min-width: 0;

@@ -9,6 +9,9 @@ const TTL_ERROR: Duration = Duration::from_secs(10);
 const FADE: Duration = Duration::from_millis(300);
 /// Maximum toasts rendered at once; older ones collapse into a "+N more" row.
 const MAX_VISIBLE: usize = 5;
+const TOAST_WIDTH: f32 = 320.0;
+const TOAST_ICON_WIDTH: f32 = 20.0;
+const TOAST_CLOSE_WIDTH: f32 = 24.0;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ToastKind {
@@ -141,15 +144,21 @@ fn show_toast(ui: &mut egui::Ui, toast: &Toast) -> bool {
             color: egui::Color32::from_black_alpha(25),
         })
         .show(ui, |ui| {
-            ui.set_width(320.0);
-            ui.horizontal(|ui| {
-                ui.label(
-                    egui::RichText::new(toast.kind.glyph())
-                        .size(style::SECTION_TEXT_SIZE)
-                        .color(fg),
+            ui.set_width(TOAST_WIDTH);
+            let spacing = ui.spacing().item_spacing.x;
+            let text_width =
+                (TOAST_WIDTH - TOAST_ICON_WIDTH - TOAST_CLOSE_WIDTH - spacing * 2.0).max(120.0);
+            ui.horizontal_top(|ui| {
+                ui.add_sized(
+                    [TOAST_ICON_WIDTH, 0.0],
+                    egui::Label::new(
+                        egui::RichText::new(toast.kind.glyph())
+                            .size(style::SECTION_TEXT_SIZE)
+                            .color(fg),
+                    ),
                 );
                 ui.add_sized(
-                    [ui.available_width() - 28.0, 0.0],
+                    [text_width, 0.0],
                     egui::Label::new(
                         egui::RichText::new(&toast.message)
                             .size(style::HELP_TEXT_SIZE)
@@ -157,21 +166,20 @@ fn show_toast(ui: &mut egui::Ui, toast: &Toast) -> bool {
                     )
                     .wrap(),
                 );
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if ui
-                        .add(
-                            egui::Button::new(
-                                egui::RichText::new(style::icon::X)
-                                    .size(style::HELP_TEXT_SIZE)
-                                    .color(fg),
-                            )
-                            .frame(false),
+                if ui
+                    .add_sized(
+                        [TOAST_CLOSE_WIDTH, 0.0],
+                        egui::Button::new(
+                            egui::RichText::new(style::icon::X)
+                                .size(style::HELP_TEXT_SIZE)
+                                .color(fg),
                         )
-                        .clicked()
-                    {
-                        dismissed = true;
-                    }
-                });
+                        .frame(false),
+                    )
+                    .clicked()
+                {
+                    dismissed = true;
+                }
             });
         });
     dismissed
