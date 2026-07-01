@@ -60,14 +60,23 @@ On Windows, unzip `ResearchWiki-windows.zip` and run `ResearchWiki.exe` from the
 
 ### What's new in v0.1.8
 
-- **Provider and model dropdowns.** Settings and first-run setup now include guided
-  provider/model selection for LLM and embedding endpoints, with presets for OpenAI,
-  Anthropic, Gemini, OpenRouter, Ollama, LM Studio, and llama-server.
-- **Native Anthropic support.** Anthropic LLM requests now use the native Messages API,
-  including structured JSON output through tool use.
-- **Embedding size handling.** Embedding size now lives beside the embedding endpoint
-  settings, auto-updates for known OpenAI/Gemini/OpenRouter embedding models, and saved
-  endpoint/size changes apply to new requests immediately.
+- **Cleaner Gather workflow.** The Gather tab now starts all sources with the saved
+  Input Set lookback by default, moves one-off source retries under *More sources*, and
+  separates active runs, interrupted runs, run history, and KG/wiki operations for easier
+  monitoring.
+- **Interrupted run recovery.** Gathers interrupted by an app restart or crash are
+  detected, shown in the UI, and can be resumed or marked failed without digging through
+  the database.
+- **KG/wiki backfill progress.** Full knowledge-graph and wiki backfills now report
+  clearer phase, batch, and remaining-work progress, and can continue from articles or
+  entities that still need downstream processing.
+- **Guided AI provider setup.** Settings and first-run setup now include provider/model
+  dropdowns for LLM and embedding endpoints, with presets for OpenAI, Anthropic, Gemini,
+  OpenRouter, Ollama, LM Studio, and llama-server.
+- **Native Anthropic and embedding-size support.** Anthropic LLM requests now use the
+  native Messages API, embedding size sits beside the embedding endpoint setting,
+  auto-updates for known OpenAI/Gemini/OpenRouter embedding models, and saved AI endpoint
+  changes apply to new requests immediately.
 
 ## Build from source
 
