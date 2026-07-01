@@ -1,5 +1,8 @@
 use crate::{
-    config::{AppConfig, EmbeddingConfig, LlmConfig, normalize_api_key},
+    config::{
+        AppConfig, EmbeddingConfig, EmbeddingProvider, LlmConfig, LlmProvider, custom_model_label,
+        infer_embedding_provider, infer_llm_provider, normalize_api_key,
+    },
     models::settings::UiLanguage,
     ui::{i18n, style},
 };
@@ -7,9 +10,11 @@ use crate::{
 /// Step 1 of the setup wizard: connect the two OpenAI-compatible endpoints and
 /// (optionally) provide a contact email for polite-pool/Unpaywall requests.
 pub struct FirstRunForm {
+    pub llm_provider: LlmProvider,
     pub llm_base_url: String,
     pub llm_model: String,
     pub llm_api_key: String,
+    pub embed_provider: EmbeddingProvider,
     pub embed_base_url: String,
     pub embed_model: String,
     pub embed_api_key: String,
@@ -21,11 +26,14 @@ pub struct FirstRunForm {
 
 impl Default for FirstRunForm {
     fn default() -> Self {
+        let llm_provider = LlmProvider::Openai;
         let embed_defaults = EmbeddingConfig::default();
         Self {
-            llm_base_url: String::new(),
-            llm_model: String::new(),
+            llm_provider,
+            llm_base_url: llm_provider.default_base_url().to_string(),
+            llm_model: llm_provider.default_model().to_string(),
             llm_api_key: String::new(),
+            embed_provider: embed_defaults.effective_provider(),
             embed_base_url: embed_defaults.base_url,
             embed_model: embed_defaults.model,
             embed_api_key: String::new(),
@@ -59,6 +67,7 @@ pub enum FirstRunOutcome {
     Submitted {
         llm: LlmConfig,
         embedding: EmbeddingConfig,
+        embedding_dimensions: Option<u32>,
         contact_email: Option<String>,
     },
 }
@@ -67,6 +76,7 @@ impl FirstRunForm {
     /// Pre-fills from an existing (possibly invalid) config so a user routed
     /// back to setup can fix what's wrong instead of retyping everything.
     pub fn prefill_from(&mut self, config: &AppConfig) {
+        self.llm_provider = config.llm.effective_provider();
         if !config.llm.base_url.is_empty() {
             self.llm_base_url = config.llm.base_url.clone();
         }
@@ -76,6 +86,7 @@ impl FirstRunForm {
         if !config.llm.api_key.is_empty() {
             self.llm_api_key = config.llm.api_key.clone();
         }
+        self.embed_provider = config.embedding.effective_provider();
         if !config.embedding.base_url.is_empty() {
             self.embed_base_url = config.embedding.base_url.clone();
         }
@@ -125,8 +136,35 @@ impl FirstRunForm {
                     .num_columns(2)
                     .spacing([8.0, 6.0])
                     .show(ui, |ui| {
+                        ui.label(i18n::t(language, "Provider"));
+                        let old_provider = self.llm_provider;
+                        egui::ComboBox::from_id_salt("first-run-llm-provider")
+                            .selected_text(self.llm_provider.label())
+                            .show_ui(ui, |ui| {
+                                for provider in LlmProvider::ALL {
+                                    ui.selectable_value(
+                                        &mut self.llm_provider,
+                                        provider,
+                                        provider.label(),
+                                    );
+                                }
+                            });
+                        if self.llm_provider != old_provider {
+                            apply_llm_provider_defaults(
+                                old_provider,
+                                self.llm_provider,
+                                &mut self.llm_base_url,
+                                &mut self.llm_model,
+                            );
+                        }
+                        ui.end_row();
+
                         ui.label(i18n::t(language, "Base URL"));
-                        ui.text_edit_singleline(&mut self.llm_base_url);
+                        if ui.text_edit_singleline(&mut self.llm_base_url).changed()
+                            && let Some(provider) = infer_llm_provider(&self.llm_base_url)
+                        {
+                            self.llm_provider = provider;
+                        }
                         ui.end_row();
                         if missing_scheme(&self.llm_base_url) {
                             ui.label("");
@@ -135,7 +173,13 @@ impl FirstRunForm {
                         }
 
                         ui.label(i18n::t(language, "Model"));
-                        ui.text_edit_singleline(&mut self.llm_model);
+                        model_combo(
+                            ui,
+                            "first-run-llm-model",
+                            self.llm_provider.model_presets(),
+                            &mut self.llm_model,
+                            i18n::t(language, custom_model_label()),
+                        );
                         ui.end_row();
 
                         ui.label(i18n::t(language, "API key"));
@@ -156,8 +200,36 @@ impl FirstRunForm {
                     .num_columns(2)
                     .spacing([8.0, 6.0])
                     .show(ui, |ui| {
+                        ui.label(i18n::t(language, "Provider"));
+                        let old_provider = self.embed_provider;
+                        egui::ComboBox::from_id_salt("first-run-embed-provider")
+                            .selected_text(self.embed_provider.label())
+                            .show_ui(ui, |ui| {
+                                for provider in EmbeddingProvider::ALL {
+                                    ui.selectable_value(
+                                        &mut self.embed_provider,
+                                        provider,
+                                        provider.label(),
+                                    );
+                                }
+                            });
+                        if self.embed_provider != old_provider {
+                            apply_embedding_provider_defaults(
+                                old_provider,
+                                self.embed_provider,
+                                &mut self.embed_base_url,
+                                &mut self.embed_model,
+                            );
+                        }
+                        ui.end_row();
+
                         ui.label(i18n::t(language, "Base URL"));
-                        ui.text_edit_singleline(&mut self.embed_base_url);
+                        if ui.text_edit_singleline(&mut self.embed_base_url).changed()
+                            && let Some(provider) =
+                                infer_embedding_provider(&self.embed_base_url)
+                        {
+                            self.embed_provider = provider;
+                        }
                         ui.end_row();
                         if missing_scheme(&self.embed_base_url) {
                             ui.label("");
@@ -166,7 +238,13 @@ impl FirstRunForm {
                         }
 
                         ui.label(i18n::t(language, "Model"));
-                        ui.text_edit_singleline(&mut self.embed_model);
+                        model_combo(
+                            ui,
+                            "first-run-embed-model",
+                            self.embed_provider.model_presets(),
+                            &mut self.embed_model,
+                            i18n::t(language, custom_model_label()),
+                        );
                         ui.end_row();
 
                         ui.label(i18n::t(language, "API key"));
@@ -212,9 +290,13 @@ impl FirstRunForm {
                     if style::primary_button(ui, i18n::t(language, "Next")).clicked() {
                         match self.validate() {
                             Ok((llm, embedding, contact_email)) => {
+                                let embedding_dimensions = embedding
+                                    .effective_provider()
+                                    .known_dimensions(&embedding.model);
                                 outcome = FirstRunOutcome::Submitted {
                                     llm,
                                     embedding,
+                                    embedding_dimensions,
                                     contact_email,
                                 }
                             }
@@ -263,12 +345,14 @@ impl FirstRunForm {
 
         Ok((
             LlmConfig {
+                provider: Some(self.llm_provider),
                 base_url: llm_base_url,
                 model: llm_model,
                 api_key: llm_api_key,
                 ..LlmConfig::default()
             },
             EmbeddingConfig {
+                provider: Some(self.embed_provider),
                 base_url: embed_base_url,
                 model: embed_model,
                 api_key: embed_api_key,
@@ -276,6 +360,78 @@ impl FirstRunForm {
             contact_email,
         ))
     }
+}
+
+fn model_combo(
+    ui: &mut egui::Ui,
+    id: &'static str,
+    presets: &[&'static str],
+    model: &mut String,
+    custom_label: &'static str,
+) {
+    let current_is_preset = presets.iter().any(|preset| *preset == model.trim());
+    let mut selected = if current_is_preset {
+        model.trim().to_string()
+    } else {
+        custom_label.to_string()
+    };
+    let selected_text = if current_is_preset {
+        model.trim().to_string()
+    } else if model.trim().is_empty() {
+        custom_label.to_string()
+    } else {
+        model.trim().to_string()
+    };
+
+    egui::ComboBox::from_id_salt(id)
+        .selected_text(selected_text)
+        .show_ui(ui, |ui| {
+            for preset in presets {
+                ui.selectable_value(&mut selected, (*preset).to_string(), *preset);
+            }
+            ui.selectable_value(&mut selected, custom_label.to_string(), custom_label);
+        });
+
+    if selected != custom_label && selected != model.trim() {
+        *model = selected.clone();
+    }
+
+    if selected == custom_label {
+        ui.add(egui::TextEdit::singleline(model).hint_text(custom_label));
+    }
+}
+
+fn apply_llm_provider_defaults(
+    old: LlmProvider,
+    new: LlmProvider,
+    base_url: &mut String,
+    model: &mut String,
+) {
+    if base_url.trim().is_empty() || infer_llm_provider(base_url) == Some(old) {
+        *base_url = new.default_base_url().to_string();
+    }
+    if should_replace_model(old.model_presets(), model) {
+        *model = new.default_model().to_string();
+    }
+}
+
+fn apply_embedding_provider_defaults(
+    old: EmbeddingProvider,
+    new: EmbeddingProvider,
+    base_url: &mut String,
+    model: &mut String,
+) {
+    if base_url.trim().is_empty() || infer_embedding_provider(base_url) == Some(old) {
+        *base_url = new.default_base_url().to_string();
+    }
+    if should_replace_model(old.model_presets(), model) {
+        *model = new.default_model().to_string();
+    }
+}
+
+fn should_replace_model(old_presets: &[&'static str], model: &str) -> bool {
+    let trimmed = model.trim();
+    trimmed.is_empty() || old_presets.iter().any(|preset| *preset == trimmed)
 }
 
 /// Step 2 of the setup wizard: describe the research in plain language. Writes

@@ -1,5 +1,9 @@
 use crate::{
-    config::{EmbeddingConfig, LlmConfig, normalize_api_key},
+    config::{
+        EmbeddingConfig, EmbeddingProvider, LlmConfig, LlmProvider, custom_model_label,
+        infer_embedding_provider, infer_llm_provider, normalize_api_key,
+    },
+    error::AppError,
     models::settings::UiLanguage,
     runtime::UiEvent,
     startup::{self, LoginStartupStatus},
@@ -36,12 +40,14 @@ pub struct Panel {
     login_startup_loading: bool,
 
     llm_base_url: String,
+    llm_provider: LlmProvider,
     llm_model: String,
     llm_api_key: String,
     llm_key_revealed: bool,
     llm_dirty: bool,
 
     embed_base_url: String,
+    embed_provider: EmbeddingProvider,
     embed_model: String,
     embed_api_key: String,
     embed_key_revealed: bool,
@@ -115,9 +121,6 @@ impl Panel {
                 ui.add_space(8.0);
                 ui.separator();
                 self.section_paths(ui, ctx);
-                ui.add_space(8.0);
-                ui.separator();
-                self.section_embedding(ui, ctx);
 
                 ui.add_space(12.0);
                 if let Some(err) = self.error.clone()
@@ -202,9 +205,11 @@ impl Panel {
     fn populate_from_state(&mut self, ctx: &PanelCtx<'_>) {
         let cfg = &ctx.state.config;
         self.ui_language = ctx.language;
+        self.llm_provider = cfg.llm.effective_provider();
         self.llm_base_url = cfg.llm.base_url.clone();
         self.llm_model = cfg.llm.model.clone();
         self.llm_api_key = cfg.llm.api_key.clone();
+        self.embed_provider = cfg.embedding.effective_provider();
         self.embed_base_url = cfg.embedding.base_url.clone();
         self.embed_model = cfg.embedding.model.clone();
         self.embed_api_key = cfg.embedding.api_key.clone();
@@ -300,14 +305,43 @@ impl Panel {
             .num_columns(2)
             .spacing([8.0, 6.0])
             .show(ui, |ui| {
+                ui.label(ctx.t("Provider"));
+                let old_provider = self.llm_provider;
+                egui::ComboBox::from_id_salt("settings-llm-provider")
+                    .selected_text(self.llm_provider.label())
+                    .show_ui(ui, |ui| {
+                        for provider in LlmProvider::ALL {
+                            ui.selectable_value(&mut self.llm_provider, provider, provider.label());
+                        }
+                    });
+                if self.llm_provider != old_provider {
+                    apply_llm_provider_defaults(
+                        old_provider,
+                        self.llm_provider,
+                        &mut self.llm_base_url,
+                        &mut self.llm_model,
+                    );
+                    self.llm_dirty = true;
+                }
+                ui.end_row();
+
                 ui.label(ctx.t("Base URL"));
                 if ui.text_edit_singleline(&mut self.llm_base_url).changed() {
+                    if let Some(provider) = infer_llm_provider(&self.llm_base_url) {
+                        self.llm_provider = provider;
+                    }
                     self.llm_dirty = true;
                 }
                 ui.end_row();
 
                 ui.label(ctx.t("Model"));
-                if ui.text_edit_singleline(&mut self.llm_model).changed() {
+                if model_combo(
+                    ui,
+                    "settings-llm-model",
+                    self.llm_provider.model_presets(),
+                    &mut self.llm_model,
+                    ctx.t(custom_model_label()),
+                ) {
                     self.llm_dirty = true;
                 }
                 ui.end_row();
@@ -349,7 +383,7 @@ impl Panel {
         style::muted_label(
             ui,
             ctx.t(
-                "Sent to scholarly APIs (OpenAlex, Crossref, Unpaywall). Required for Unpaywall; leave blank to skip it. Restart to apply.",
+                "Sent to scholarly APIs (OpenAlex, Crossref, Unpaywall). Required for Unpaywall; leave blank to skip it. New gathers use saved changes immediately.",
             ),
         );
         ui.add_space(4.0);
@@ -394,7 +428,7 @@ impl Panel {
         style::muted_label(
             ui,
             ctx.t(
-                "Optional. The Semantic Scholar gather source only runs when a key is set (its keyless tier is rate-limited). Get one free at semanticscholar.org. Restart to apply.",
+                "Optional. The Semantic Scholar gather source only runs when a key is set (its keyless tier is rate-limited). Get one free at semanticscholar.org. New gathers use saved changes immediately.",
             ),
         );
         ui.add_space(4.0);
@@ -449,16 +483,71 @@ impl Panel {
             .num_columns(2)
             .spacing([8.0, 6.0])
             .show(ui, |ui| {
+                ui.label(ctx.t("Provider"));
+                let old_provider = self.embed_provider;
+                egui::ComboBox::from_id_salt("settings-embed-provider")
+                    .selected_text(self.embed_provider.label())
+                    .show_ui(ui, |ui| {
+                        for provider in EmbeddingProvider::ALL {
+                            ui.selectable_value(
+                                &mut self.embed_provider,
+                                provider,
+                                provider.label(),
+                            );
+                        }
+                    });
+                if self.embed_provider != old_provider {
+                    apply_embedding_provider_defaults(
+                        old_provider,
+                        self.embed_provider,
+                        &mut self.embed_base_url,
+                        &mut self.embed_model,
+                    );
+                    self.apply_known_embedding_dimension();
+                    self.embed_dirty = true;
+                }
+                ui.end_row();
+
                 ui.label(ctx.t("Base URL"));
                 if ui.text_edit_singleline(&mut self.embed_base_url).changed() {
+                    if let Some(provider) = infer_embedding_provider(&self.embed_base_url) {
+                        self.embed_provider = provider;
+                        self.apply_known_embedding_dimension();
+                    }
                     self.embed_dirty = true;
                 }
                 ui.end_row();
 
                 ui.label(ctx.t("Model"));
-                if ui.text_edit_singleline(&mut self.embed_model).changed() {
+                if model_combo(
+                    ui,
+                    "settings-embed-model",
+                    self.embed_provider.model_presets(),
+                    &mut self.embed_model,
+                    ctx.t(custom_model_label()),
+                ) {
+                    self.apply_known_embedding_dimension();
                     self.embed_dirty = true;
                 }
+                ui.end_row();
+
+                ui.label(ctx.t("Embedding size"));
+                ui.horizontal(|ui| {
+                    if ui
+                        .add(
+                            egui::TextEdit::singleline(&mut self.embedding_dim_input)
+                                .desired_width(80.0),
+                        )
+                        .changed()
+                    {
+                        self.embed_dirty = true;
+                    }
+                    ui.label(format!(
+                        "{} {}",
+                        ctx.t("Current dimension:"),
+                        ctx.state.config.embedding_dimensions
+                    ));
+                });
                 ui.end_row();
 
                 ui.label(ctx.t("API key"));
@@ -474,15 +563,33 @@ impl Panel {
                 ui.end_row();
             });
 
+        if let Some(dim) = self.embedding_dim_persisted
+            && dim != ctx.state.config.embedding_dimensions
+        {
+            ui.colored_label(
+                egui::Color32::from_rgb(180, 120, 0),
+                format!("Saved size: {dim} (applying now)"),
+            );
+        }
+        if !self.embedding_dim_input.trim().is_empty()
+            && !embedding_dimension_input_is_valid(&self.embedding_dim_input)
+        {
+            ui.colored_label(
+                egui::Color32::from_rgb(180, 120, 0),
+                ctx.t("Embedding size must be 1–8192."),
+            );
+        }
+
         ui.horizontal(|ui| {
             let save_enabled = self.embed_dirty
                 && self.saving.is_none()
                 && !self.embed_base_url.trim().is_empty()
-                && !self.embed_model.trim().is_empty();
+                && !self.embed_model.trim().is_empty()
+                && embedding_dimension_input_is_valid(&self.embedding_dim_input);
             if ui
                 .add_enabled(
                     save_enabled,
-                    egui::Button::new(ctx.t("Save embedding endpoint")),
+                    egui::Button::new(ctx.t("Save embedding settings")),
                 )
                 .clicked()
             {
@@ -510,39 +617,6 @@ impl Panel {
             });
     }
 
-    fn section_embedding(&mut self, ui: &mut egui::Ui, ctx: &PanelCtx<'_>) {
-        style::section_heading(ui, ctx.t("Embeddings"));
-        ui.label(format!(
-            "{} {}",
-            ctx.t("Current dimension:"),
-            ctx.state.config.embedding_dimensions
-        ));
-        if let Some(dim) = self.embedding_dim_persisted
-            && dim != ctx.state.config.embedding_dimensions
-        {
-            ui.colored_label(
-                egui::Color32::from_rgb(180, 120, 0),
-                format!("Persisted override: {dim} (restart to apply)"),
-            );
-        }
-
-        ui.add_space(4.0);
-        ui.horizontal(|ui| {
-            ui.label(ctx.t("New dimension:"));
-            ui.add(egui::TextEdit::singleline(&mut self.embedding_dim_input).desired_width(80.0));
-            let parsed = self.embedding_dim_input.trim().parse::<u32>().ok();
-            let new_dim_differs =
-                parsed.is_some_and(|d| d != ctx.state.config.embedding_dimensions);
-            let enabled = parsed.is_some_and(|d| (1..=8192).contains(&d)) && new_dim_differs;
-            if ui
-                .add_enabled(enabled, egui::Button::new(ctx.t("Change...")))
-                .clicked()
-            {
-                self.embedding_confirm_open = true;
-            }
-        });
-    }
-
     fn show_embedding_confirm(&mut self, egui_ctx: &egui::Context, ctx: &PanelCtx<'_>) {
         if egui_ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
             self.embedding_confirm_open = false;
@@ -558,8 +632,8 @@ impl Panel {
             .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
             .show(egui_ctx, |ui| {
                 ui.label(ctx.t(
-                    "Changing the embedding dimension drops the existing vector \
-                     table on the next startup. All article and entity embeddings \
+                    "Changing the embedding dimension rebuilds the existing vector \
+                     table immediately. All article and entity embeddings \
                      will need to be regenerated from scratch.",
                 ));
                 ui.add_space(6.0);
@@ -588,7 +662,8 @@ impl Panel {
             });
 
         if confirm {
-            self.save_embedding_dim(ctx, new_dim);
+            self.save_embedding_endpoint_with_dim(ctx, Some(new_dim));
+            self.embedding_dim_persisted = Some(new_dim);
             close = true;
         }
         if close {
@@ -604,6 +679,7 @@ impl Panel {
         let tx = channel.tx.clone();
         let ui_tx = ctx.ui_tx.clone();
         let mut new_llm: LlmConfig = ctx.state.config.llm.clone();
+        new_llm.provider = Some(self.llm_provider);
         new_llm.base_url = self.llm_base_url.trim().trim_end_matches('/').to_string();
         new_llm.model = self.llm_model.trim().to_string();
         new_llm.api_key = normalize_api_key(&self.llm_api_key);
@@ -702,7 +778,39 @@ impl Panel {
         });
     }
 
+    fn apply_known_embedding_dimension(&mut self) {
+        let Some(dim) = self
+            .embed_provider
+            .known_dimensions(self.embed_model.trim())
+        else {
+            return;
+        };
+        let next = dim.to_string();
+        if self.embedding_dim_input.trim() != next {
+            self.embedding_dim_input = next;
+            self.embed_dirty = true;
+        }
+    }
+
     fn save_embedding_endpoint(&mut self, ctx: &PanelCtx<'_>) {
+        let Some(dim) = parse_embedding_dimension_input(&self.embedding_dim_input) else {
+            self.error = Some("Embedding size must be a number from 1 to 8192.".to_string());
+            return;
+        };
+
+        if dim != ctx.state.config.embedding_dimensions {
+            self.embedding_confirm_open = true;
+            return;
+        }
+
+        let dim_to_persist = self
+            .embedding_dim_persisted
+            .filter(|persisted| *persisted != dim)
+            .map(|_| dim);
+        self.save_embedding_endpoint_with_dim(ctx, dim_to_persist);
+    }
+
+    fn save_embedding_endpoint_with_dim(&mut self, ctx: &PanelCtx<'_>, new_dim: Option<u32>) {
         let Some(channel) = self.channel.as_ref() else {
             return;
         };
@@ -710,38 +818,35 @@ impl Panel {
         let tx = channel.tx.clone();
         let ui_tx = ctx.ui_tx.clone();
         let new_embed = EmbeddingConfig {
+            provider: Some(self.embed_provider),
             base_url: self.embed_base_url.trim().trim_end_matches('/').to_string(),
             model: self.embed_model.trim().to_string(),
             api_key: normalize_api_key(&self.embed_api_key),
         };
+        if let Some(new_dim) = new_dim {
+            self.embedding_dim_persisted = Some(new_dim);
+        }
         let svc = ctx.state.settings_service.clone();
         ctx.handle.spawn(async move {
-            let result = svc.set_embedding_config(new_embed.clone()).await;
+            let result = async {
+                svc.set_embedding_config(new_embed.clone()).await?;
+                if let Some(new_dim) = new_dim {
+                    svc.set_embedding_dimensions(new_dim).await?;
+                }
+                Ok::<(), AppError>(())
+            }
+            .await;
             let _ = match result {
                 Ok(()) => {
-                    let _ = ui_tx.send(UiEvent::EmbeddingConfigChanged(new_embed));
+                    let _ = ui_tx.send(UiEvent::EmbeddingConfigChanged {
+                        embedding: new_embed,
+                        embedding_dimensions: new_dim,
+                    });
                     tx.send(Msg::Saved("Embedding endpoint"))
                 }
                 Err(err) => tx.send(Msg::SaveError(err.to_string())),
             };
         });
-    }
-
-    fn save_embedding_dim(&mut self, ctx: &PanelCtx<'_>, new_dim: u32) {
-        let Some(channel) = self.channel.as_ref() else {
-            return;
-        };
-        self.saving = Some("Embedding dimension");
-        let tx = channel.tx.clone();
-        let svc = ctx.state.settings_service.clone();
-        ctx.handle.spawn(async move {
-            let result = svc.set_embedding_dimensions(new_dim).await;
-            let _ = match result {
-                Ok(()) => tx.send(Msg::Saved("Embedding dimension")),
-                Err(err) => tx.send(Msg::SaveError(err.to_string())),
-            };
-        });
-        self.embedding_dim_persisted = Some(new_dim);
     }
 }
 
@@ -757,6 +862,106 @@ async fn blocking_set_login_startup_enabled(enabled: bool) -> Result<LoginStartu
         .await
         .map_err(|error| error.to_string())?
         .map_err(|error| error.to_string())
+}
+
+fn model_combo(
+    ui: &mut egui::Ui,
+    id: &'static str,
+    presets: &[&'static str],
+    model: &mut String,
+    custom_label: &'static str,
+) -> bool {
+    let current_is_preset = presets.iter().any(|preset| *preset == model.trim());
+    let mut selected = if current_is_preset {
+        model.trim().to_string()
+    } else {
+        custom_label.to_string()
+    };
+    let selected_text = if current_is_preset {
+        model.trim().to_string()
+    } else if model.trim().is_empty() {
+        custom_label.to_string()
+    } else {
+        model.trim().to_string()
+    };
+    let mut changed = false;
+
+    egui::ComboBox::from_id_salt(id)
+        .selected_text(selected_text)
+        .show_ui(ui, |ui| {
+            for preset in presets {
+                ui.selectable_value(&mut selected, (*preset).to_string(), *preset);
+            }
+            ui.selectable_value(&mut selected, custom_label.to_string(), custom_label);
+        });
+
+    if selected != custom_label && selected != model.trim() {
+        *model = selected.clone();
+        changed = true;
+    }
+
+    if selected == custom_label
+        && ui
+            .add(egui::TextEdit::singleline(model).hint_text(custom_label))
+            .changed()
+    {
+        changed = true;
+    }
+
+    changed
+}
+
+fn parse_embedding_dimension_input(value: &str) -> Option<u32> {
+    value
+        .trim()
+        .parse::<u32>()
+        .ok()
+        .filter(|dim| (1..=8192).contains(dim))
+}
+
+fn embedding_dimension_input_is_valid(value: &str) -> bool {
+    parse_embedding_dimension_input(value).is_some()
+}
+
+fn apply_llm_provider_defaults(
+    old: LlmProvider,
+    new: LlmProvider,
+    base_url: &mut String,
+    model: &mut String,
+) {
+    if should_replace_base_url(old, base_url) {
+        *base_url = new.default_base_url().to_string();
+    }
+    if should_replace_model(old.model_presets(), model) {
+        *model = new.default_model().to_string();
+    }
+}
+
+fn apply_embedding_provider_defaults(
+    old: EmbeddingProvider,
+    new: EmbeddingProvider,
+    base_url: &mut String,
+    model: &mut String,
+) {
+    if should_replace_base_url_for_embedding(old, base_url) {
+        *base_url = new.default_base_url().to_string();
+    }
+    if should_replace_model(old.model_presets(), model) {
+        *model = new.default_model().to_string();
+    }
+}
+
+fn should_replace_base_url(old: LlmProvider, base_url: &str) -> bool {
+    base_url.trim().is_empty() || infer_llm_provider(base_url) == Some(old)
+}
+
+fn should_replace_base_url_for_embedding(old: EmbeddingProvider, base_url: &str) -> bool {
+    base_url.trim().is_empty() || infer_embedding_provider(base_url) == Some(old)
+}
+
+fn should_replace_model(old_presets: &[&'static str], model: &str) -> bool {
+    let trimmed = model.trim();
+    trimmed.is_empty() || old_presets.iter().any(|preset| *preset == trimmed)
 }
 
 fn path_row(ui: &mut egui::Ui, ctx: &PanelCtx<'_>, label: &'static str, path: &std::path::Path) {

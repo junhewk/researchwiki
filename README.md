@@ -48,7 +48,7 @@ key in the setup wizard.
 
 Pre-built desktop artifacts are attached to tagged releases:
 
-Latest release: **v0.1.7**.
+Latest release: **v0.1.8**.
 
 | Platform | File |
 |---|---|
@@ -58,13 +58,16 @@ Latest release: **v0.1.7**.
 On macOS, open the DMG and copy `ResearchWiki.app` to `/Applications`.
 On Windows, unzip `ResearchWiki-windows.zip` and run `ResearchWiki.exe` from the extracted folder.
 
-### What's new in v0.1.7
+### What's new in v0.1.8
 
-- **Start at login.** On macOS and Windows, Settings now includes a Startup toggle that
-  registers ResearchWiki as a per-user login item and launches it hidden in the tray /
-  menu bar so scheduled gathers can run after sign-in.
-- **Hidden launch mode.** Login launches use a private `--hidden` startup flag and fall
-  back to showing the window if the system tray cannot be initialized.
+- **Provider and model dropdowns.** Settings and first-run setup now include guided
+  provider/model selection for LLM and embedding endpoints, with presets for OpenAI,
+  Anthropic, Gemini, OpenRouter, Ollama, LM Studio, and llama-server.
+- **Native Anthropic support.** Anthropic LLM requests now use the native Messages API,
+  including structured JSON output through tool use.
+- **Embedding size handling.** Embedding size now lives beside the embedding endpoint
+  settings, auto-updates for known OpenAI/Gemini/OpenRouter embedding models, and saved
+  endpoint/size changes apply to new requests immediately.
 
 ## Build from source
 

@@ -395,10 +395,16 @@ impl DesktopApp {
                         "LLM endpoint updated for new requests.",
                     );
                 }
-                UiEvent::EmbeddingConfigChanged(embedding) => {
+                UiEvent::EmbeddingConfigChanged {
+                    embedding,
+                    embedding_dimensions,
+                } => {
                     self.config.embedding = embedding;
+                    if let Some(dim) = embedding_dimensions {
+                        self.config.embedding_dimensions = dim;
+                    }
                     self.rebuild_active_state_after_settings_change(
-                        "Embedding endpoint updated for new requests.",
+                        "Embedding settings updated for new requests.",
                     );
                 }
                 UiEvent::ContactEmailChanged(email) => {
@@ -1063,6 +1069,7 @@ impl eframe::App for DesktopApp {
             if let FirstRunOutcome::Submitted {
                 llm,
                 embedding,
+                embedding_dimensions,
                 contact_email,
             } = self.first_run.show(ctx, self.language)
             {
@@ -1078,6 +1085,9 @@ impl eframe::App for DesktopApp {
                     let svc = SettingsService::new(path);
                     svc.set_llm_config(llm_to_save).await?;
                     svc.set_embedding_config(embedding_to_save).await?;
+                    if let Some(dim) = embedding_dimensions {
+                        svc.set_embedding_dimensions(dim).await?;
+                    }
                     if let Some(email) = contact_to_save {
                         svc.set_contact_email(Some(email)).await?;
                     }
@@ -1088,6 +1098,9 @@ impl eframe::App for DesktopApp {
                 }
                 self.config.llm = llm;
                 self.config.embedding = embedding;
+                if let Some(dim) = embedding_dimensions {
+                    self.config.embedding_dimensions = dim;
+                }
                 if let Some(email) = contact_email {
                     self.config.contact_email = email;
                 }

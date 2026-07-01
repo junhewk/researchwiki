@@ -5,6 +5,8 @@ use std::{
 
 use anyhow::{Context, Result};
 
+const CUSTOM_MODEL_LABEL: &str = "Custom...";
+
 #[derive(Clone, Debug)]
 pub struct AppConfig {
     pub storage: StorageConfig,
@@ -32,6 +34,8 @@ pub struct StorageConfig {
 
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct LlmConfig {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider: Option<LlmProvider>,
     pub base_url: String,
     pub model: String,
     #[serde(default)]
@@ -67,6 +71,7 @@ fn default_max_concurrent() -> usize {
 impl Default for LlmConfig {
     fn default() -> Self {
         Self {
+            provider: Some(LlmProvider::Openai),
             base_url: String::new(),
             model: String::new(),
             api_key: String::new(),
@@ -83,10 +88,18 @@ impl LlmConfig {
     pub fn is_configured(&self) -> bool {
         !self.base_url.is_empty() && !self.model.is_empty()
     }
+
+    pub fn effective_provider(&self) -> LlmProvider {
+        self.provider.unwrap_or_else(|| {
+            infer_llm_provider(&self.base_url).unwrap_or(LlmProvider::CustomOpenaiCompatible)
+        })
+    }
 }
 
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct EmbeddingConfig {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider: Option<EmbeddingProvider>,
     pub base_url: String,
     pub model: String,
     #[serde(default)]
@@ -96,6 +109,7 @@ pub struct EmbeddingConfig {
 impl Default for EmbeddingConfig {
     fn default() -> Self {
         Self {
+            provider: Some(EmbeddingProvider::Openai),
             base_url: "https://api.openai.com/v1".to_string(),
             model: "text-embedding-3-small".to_string(),
             api_key: String::new(),
@@ -107,6 +121,255 @@ impl EmbeddingConfig {
     pub fn is_configured(&self) -> bool {
         !self.base_url.is_empty() && !self.model.is_empty()
     }
+
+    pub fn effective_provider(&self) -> EmbeddingProvider {
+        self.provider.unwrap_or_else(|| {
+            infer_embedding_provider(&self.base_url)
+                .unwrap_or(EmbeddingProvider::CustomOpenaiCompatible)
+        })
+    }
+}
+
+#[derive(Clone, Copy, Debug, serde::Serialize, serde::Deserialize, PartialEq, Eq, Hash)]
+#[serde(rename_all = "snake_case")]
+pub enum LlmProvider {
+    Openai,
+    Anthropic,
+    Gemini,
+    Openrouter,
+    Ollama,
+    LmStudio,
+    LlamaServer,
+    CustomOpenaiCompatible,
+}
+
+impl LlmProvider {
+    pub const ALL: [Self; 8] = [
+        Self::Openai,
+        Self::Anthropic,
+        Self::Gemini,
+        Self::Openrouter,
+        Self::Ollama,
+        Self::LmStudio,
+        Self::LlamaServer,
+        Self::CustomOpenaiCompatible,
+    ];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Openai => "OpenAI",
+            Self::Anthropic => "Anthropic",
+            Self::Gemini => "Gemini",
+            Self::Openrouter => "OpenRouter",
+            Self::Ollama => "Ollama",
+            Self::LmStudio => "LM Studio",
+            Self::LlamaServer => "llama-server",
+            Self::CustomOpenaiCompatible => "Custom OpenAI-compatible",
+        }
+    }
+
+    pub fn default_base_url(self) -> &'static str {
+        match self {
+            Self::Openai => "https://api.openai.com/v1",
+            Self::Anthropic => "https://api.anthropic.com/v1",
+            Self::Gemini => "https://generativelanguage.googleapis.com/v1beta/openai",
+            Self::Openrouter => "https://openrouter.ai/api/v1",
+            Self::Ollama => "http://localhost:11434/v1",
+            Self::LmStudio => "http://localhost:1234/v1",
+            Self::LlamaServer => "http://localhost:8080/v1",
+            Self::CustomOpenaiCompatible => "",
+        }
+    }
+
+    pub fn default_model(self) -> &'static str {
+        match self {
+            Self::Openai => "gpt-5.5",
+            Self::Anthropic => "claude-sonnet-5",
+            Self::Gemini => "gemini-3.5-flash",
+            Self::Openrouter => "~openai/gpt-latest",
+            Self::Ollama => "gpt-oss:20b",
+            Self::LmStudio | Self::LlamaServer | Self::CustomOpenaiCompatible => "",
+        }
+    }
+
+    pub fn model_presets(self) -> &'static [&'static str] {
+        match self {
+            Self::Openai => &["gpt-5.5", "gpt-5.5-mini", "gpt-5.5-nano"],
+            Self::Anthropic => &["claude-opus-5", "claude-sonnet-5", "claude-haiku-5"],
+            Self::Gemini => &[
+                "gemini-3.5-pro",
+                "gemini-3.5-flash",
+                "gemini-3.5-flash-lite",
+            ],
+            Self::Openrouter => &[
+                "~openai/gpt-latest",
+                "openai/gpt-5.5",
+                "anthropic/claude-sonnet-5",
+                "google/gemini-3.5-pro",
+            ],
+            Self::Ollama => &["gpt-oss:20b", "gpt-oss:120b", "qwen3:8b", "llama3.3:70b"],
+            Self::LmStudio | Self::LlamaServer | Self::CustomOpenaiCompatible => &[],
+        }
+    }
+
+    pub fn uses_native_anthropic_api(self) -> bool {
+        self == Self::Anthropic
+    }
+}
+
+impl Default for LlmProvider {
+    fn default() -> Self {
+        Self::Openai
+    }
+}
+
+impl std::str::FromStr for LlmProvider {
+    type Err = ();
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match normalize_provider_key(value).as_str() {
+            "openai" => Ok(Self::Openai),
+            "anthropic" | "claude" => Ok(Self::Anthropic),
+            "gemini" | "google" => Ok(Self::Gemini),
+            "openrouter" => Ok(Self::Openrouter),
+            "ollama" => Ok(Self::Ollama),
+            "lm_studio" | "lmstudio" => Ok(Self::LmStudio),
+            "llama_server" | "llama-server" | "llamacpp" | "llama_cpp" => Ok(Self::LlamaServer),
+            "custom" | "custom_openai_compatible" | "openai_compatible" => {
+                Ok(Self::CustomOpenaiCompatible)
+            }
+            _ => Err(()),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, serde::Serialize, serde::Deserialize, PartialEq, Eq, Hash)]
+#[serde(rename_all = "snake_case")]
+pub enum EmbeddingProvider {
+    Openai,
+    Gemini,
+    Openrouter,
+    CustomOpenaiCompatible,
+}
+
+impl EmbeddingProvider {
+    pub const ALL: [Self; 4] = [
+        Self::Openai,
+        Self::Gemini,
+        Self::Openrouter,
+        Self::CustomOpenaiCompatible,
+    ];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Openai => "OpenAI",
+            Self::Gemini => "Gemini",
+            Self::Openrouter => "OpenRouter",
+            Self::CustomOpenaiCompatible => "Custom OpenAI-compatible",
+        }
+    }
+
+    pub fn default_base_url(self) -> &'static str {
+        match self {
+            Self::Openai => "https://api.openai.com/v1",
+            Self::Gemini => "https://generativelanguage.googleapis.com/v1beta/openai",
+            Self::Openrouter => "https://openrouter.ai/api/v1",
+            Self::CustomOpenaiCompatible => "",
+        }
+    }
+
+    pub fn default_model(self) -> &'static str {
+        match self {
+            Self::Openai => "text-embedding-3-small",
+            Self::Gemini => "gemini-embedding-001",
+            Self::Openrouter => "openai/text-embedding-3-small",
+            Self::CustomOpenaiCompatible => "",
+        }
+    }
+
+    pub fn model_presets(self) -> &'static [&'static str] {
+        match self {
+            Self::Openai => &["text-embedding-3-small", "text-embedding-3-large"],
+            Self::Gemini => &["gemini-embedding-001", "text-embedding-004"],
+            Self::Openrouter => &[
+                "openai/text-embedding-3-small",
+                "openai/text-embedding-3-large",
+            ],
+            Self::CustomOpenaiCompatible => &[],
+        }
+    }
+
+    pub fn known_dimensions(self, model: &str) -> Option<u32> {
+        match (self, model.trim()) {
+            (Self::Openai, "text-embedding-3-small")
+            | (Self::Openrouter, "openai/text-embedding-3-small") => Some(1536),
+            (Self::Openai, "text-embedding-3-large")
+            | (Self::Openrouter, "openai/text-embedding-3-large")
+            | (Self::Gemini, "gemini-embedding-001") => Some(3072),
+            (Self::Gemini, "text-embedding-004") => Some(768),
+            _ => None,
+        }
+    }
+}
+
+impl Default for EmbeddingProvider {
+    fn default() -> Self {
+        Self::Openai
+    }
+}
+
+impl std::str::FromStr for EmbeddingProvider {
+    type Err = ();
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match normalize_provider_key(value).as_str() {
+            "openai" => Ok(Self::Openai),
+            "gemini" | "google" => Ok(Self::Gemini),
+            "openrouter" => Ok(Self::Openrouter),
+            "custom" | "custom_openai_compatible" | "openai_compatible" => {
+                Ok(Self::CustomOpenaiCompatible)
+            }
+            _ => Err(()),
+        }
+    }
+}
+
+pub fn custom_model_label() -> &'static str {
+    CUSTOM_MODEL_LABEL
+}
+
+pub fn infer_llm_provider(base_url: &str) -> Option<LlmProvider> {
+    let base = normalized_base_url(base_url);
+    match base.as_str() {
+        "https://api.openai.com/v1" => Some(LlmProvider::Openai),
+        "https://api.anthropic.com/v1" => Some(LlmProvider::Anthropic),
+        "https://generativelanguage.googleapis.com/v1beta/openai" => Some(LlmProvider::Gemini),
+        "https://openrouter.ai/api/v1" => Some(LlmProvider::Openrouter),
+        "http://localhost:11434/v1" | "http://127.0.0.1:11434/v1" => Some(LlmProvider::Ollama),
+        "http://localhost:1234/v1" | "http://127.0.0.1:1234/v1" => Some(LlmProvider::LmStudio),
+        "http://localhost:8080/v1" | "http://127.0.0.1:8080/v1" => Some(LlmProvider::LlamaServer),
+        _ => None,
+    }
+}
+
+pub fn infer_embedding_provider(base_url: &str) -> Option<EmbeddingProvider> {
+    let base = normalized_base_url(base_url);
+    match base.as_str() {
+        "https://api.openai.com/v1" => Some(EmbeddingProvider::Openai),
+        "https://generativelanguage.googleapis.com/v1beta/openai" => {
+            Some(EmbeddingProvider::Gemini)
+        }
+        "https://openrouter.ai/api/v1" => Some(EmbeddingProvider::Openrouter),
+        _ => None,
+    }
+}
+
+fn normalize_provider_key(value: &str) -> String {
+    value.trim().to_ascii_lowercase().replace([' ', '-'], "_")
+}
+
+fn normalized_base_url(base_url: &str) -> String {
+    base_url.trim().trim_end_matches('/').to_ascii_lowercase()
 }
 
 impl AppConfig {
@@ -149,6 +412,10 @@ impl AppConfig {
         };
 
         let llm = LlmConfig {
+            provider: env::var("LLM_PROVIDER")
+                .ok()
+                .and_then(|value| value.parse().ok())
+                .or(base.llm.provider),
             base_url: env::var("LLM_BASE_URL")
                 .map(|v| v.trim_end_matches('/').to_string())
                 .unwrap_or(base.llm.base_url),
@@ -176,6 +443,10 @@ impl AppConfig {
         };
 
         let embedding = EmbeddingConfig {
+            provider: env::var("EMBEDDING_PROVIDER")
+                .ok()
+                .and_then(|value| value.parse().ok())
+                .or(base.embedding.provider),
             base_url: env::var("EMBEDDING_BASE_URL")
                 .map(|v| v.trim_end_matches('/').to_string())
                 .unwrap_or(base.embedding.base_url),
@@ -311,4 +582,47 @@ fn parse_sqlite_database_path(value: &str) -> Option<PathBuf> {
         .find_map(|prefix| value.strip_prefix(prefix))
         .map(Path::new)
         .map(Path::to_path_buf)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn legacy_llm_config_without_provider_infers_from_base_url() {
+        let config: LlmConfig = serde_json::from_str(
+            r#"{"base_url":"https://api.anthropic.com/v1","model":"claude-sonnet-5"}"#,
+        )
+        .unwrap();
+
+        assert_eq!(config.provider, None);
+        assert_eq!(config.effective_provider(), LlmProvider::Anthropic);
+    }
+
+    #[test]
+    fn legacy_embedding_config_without_provider_infers_from_base_url() {
+        let config: EmbeddingConfig = serde_json::from_str(
+            r#"{"base_url":"https://generativelanguage.googleapis.com/v1beta/openai","model":"gemini-embedding-001"}"#,
+        )
+        .unwrap();
+
+        assert_eq!(config.provider, None);
+        assert_eq!(config.effective_provider(), EmbeddingProvider::Gemini);
+    }
+
+    #[test]
+    fn embedding_catalog_reports_known_dimensions() {
+        assert_eq!(
+            EmbeddingProvider::Openai.known_dimensions("text-embedding-3-small"),
+            Some(1536)
+        );
+        assert_eq!(
+            EmbeddingProvider::Gemini.known_dimensions("gemini-embedding-001"),
+            Some(3072)
+        );
+        assert_eq!(
+            EmbeddingProvider::CustomOpenaiCompatible.known_dimensions("local-embed"),
+            None
+        );
+    }
 }

@@ -221,6 +221,8 @@ pub fn t(language: UiLanguage, text: &'static str) -> &'static str {
 
         "LLM endpoint" => "LLM 엔드포인트",
         "Embedding endpoint" => "임베딩 엔드포인트",
+        "Embedding size" => "임베딩 크기",
+        "Embedding size must be 1–8192." => "임베딩 크기는 1–8192 사이여야 합니다.",
         "Changes are saved to settings.json. New LLM requests use them immediately." => {
             "변경 사항은 settings.json에 저장됩니다. 새 LLM 요청에 즉시 적용됩니다."
         }
@@ -231,18 +233,21 @@ pub fn t(language: UiLanguage, text: &'static str) -> &'static str {
         "Scheduler" => "스케줄러",
         "Embeddings" => "임베딩",
         "Base URL" => "기본 URL",
+        "Provider" => "제공자",
         "Model" => "모델",
+        "Custom..." => "직접 입력...",
         "API key" => "API 키",
         "Save LLM endpoint" => "LLM 엔드포인트 저장",
         "Save embedding endpoint" => "임베딩 엔드포인트 저장",
+        "Save embedding settings" => "임베딩 설정 저장",
         "Contact email" => "연락처 이메일",
-        "Sent to scholarly APIs (OpenAlex, Crossref, Unpaywall). Required for Unpaywall; leave blank to skip it. Restart to apply." => {
-            "학술 API(OpenAlex, Crossref, Unpaywall)에 전송됩니다. Unpaywall에는 필수이며, 비워 두면 건너뜁니다. 적용하려면 다시 시작하세요."
+        "Sent to scholarly APIs (OpenAlex, Crossref, Unpaywall). Required for Unpaywall; leave blank to skip it. New gathers use saved changes immediately." => {
+            "학술 API(OpenAlex, Crossref, Unpaywall)에 전송됩니다. Unpaywall에는 필수이며, 비워 두면 건너뜁니다. 저장한 변경 사항은 새 수집에 즉시 적용됩니다."
         }
         "Save contact email" => "연락처 이메일 저장",
         "Semantic Scholar API key" => "Semantic Scholar API 키",
-        "Optional. The Semantic Scholar gather source only runs when a key is set (its keyless tier is rate-limited). Get one free at semanticscholar.org. Restart to apply." => {
-            "선택 사항. Semantic Scholar 수집 소스는 키가 설정된 경우에만 실행됩니다(키 없는 등급은 요청 제한이 있습니다). semanticscholar.org에서 무료로 발급받을 수 있습니다. 적용하려면 다시 시작하세요."
+        "Optional. The Semantic Scholar gather source only runs when a key is set (its keyless tier is rate-limited). Get one free at semanticscholar.org. New gathers use saved changes immediately." => {
+            "선택 사항. Semantic Scholar 수집 소스는 키가 설정된 경우에만 실행됩니다(키 없는 등급은 요청 제한이 있습니다). semanticscholar.org에서 무료로 발급받을 수 있습니다. 저장한 변경 사항은 새 수집에 즉시 적용됩니다."
         }
         "(leave blank to skip Semantic Scholar)" => "(비워 두면 Semantic Scholar를 건너뜁니다)",
         "Save key" => "키 저장",
@@ -279,8 +284,8 @@ pub fn t(language: UiLanguage, text: &'static str) -> &'static str {
         "New dimension:" => "새 차원:",
         "Change..." => "변경...",
         "Confirm dimension change" => "차원 변경 확인",
-        "Changing the embedding dimension drops the existing vector table on the next startup. All article and entity embeddings will need to be regenerated from scratch." => {
-            "임베딩 차원을 변경하면 다음 시작 시 기존 벡터 테이블이 삭제됩니다. 모든 논문 및 엔티티 임베딩을 처음부터 다시 생성해야 합니다."
+        "Changing the embedding dimension rebuilds the existing vector table immediately. All article and entity embeddings will need to be regenerated from scratch." => {
+            "임베딩 차원을 변경하면 기존 벡터 테이블이 즉시 다시 생성됩니다. 모든 논문 및 엔티티 임베딩을 처음부터 다시 생성해야 합니다."
         }
         "Drop embeddings and save" => "임베딩 삭제 후 저장",
 

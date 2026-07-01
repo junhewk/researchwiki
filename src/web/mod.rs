@@ -26,7 +26,7 @@ use tokio::{
 use tower_http::trace::TraceLayer;
 
 use crate::{
-    config::{AppConfig, EmbeddingConfig, LlmConfig},
+    config::{AppConfig, EmbeddingConfig, LlmConfig, infer_embedding_provider, infer_llm_provider},
     db,
     error::AppError,
     models::{
@@ -2323,6 +2323,7 @@ async fn save_llm(State(state): State<WebState>, Form(form): Form<LlmForm>) -> W
         .inner
         .settings_service
         .set_llm_config(LlmConfig {
+            provider: infer_llm_provider(&form.base_url),
             base_url: form.base_url.trim_end_matches('/').to_string(),
             model: form.model,
             api_key: form.api_key,
@@ -2348,6 +2349,7 @@ async fn save_embedding(
         .inner
         .settings_service
         .set_embedding_config(EmbeddingConfig {
+            provider: infer_embedding_provider(&form.base_url),
             base_url: form.base_url.trim_end_matches('/').to_string(),
             model: form.model,
             api_key: form.api_key,

@@ -7,11 +7,16 @@ use crate::{config::EmbeddingConfig, error::AppError};
 pub struct EmbeddingService {
     client: Client,
     config: EmbeddingConfig,
+    expected_dimensions: u32,
 }
 
 impl EmbeddingService {
-    pub fn new(client: Client, config: EmbeddingConfig) -> Self {
-        Self { client, config }
+    pub fn new(client: Client, config: EmbeddingConfig, expected_dimensions: u32) -> Self {
+        Self {
+            client,
+            config,
+            expected_dimensions,
+        }
     }
 
     pub async fn embed_texts(&self, texts: &[String]) -> Result<Vec<Vec<f32>>, AppError> {
@@ -80,6 +85,7 @@ impl EmbeddingService {
                     })
                 })
                 .collect::<Result<Vec<_>, _>>()?;
+            validate_embedding_dimensions(&vector, self.expected_dimensions)?;
             if index >= embeddings.len() {
                 return Err(AppError::Internal(
                     "Embedding response returned an out-of-range index".to_string(),
@@ -107,5 +113,29 @@ impl EmbeddingService {
         } else {
             req.bearer_auth(&self.config.api_key)
         }
+    }
+}
+
+fn validate_embedding_dimensions(vector: &[f32], expected_dimensions: u32) -> Result<(), AppError> {
+    if vector.len() != expected_dimensions as usize {
+        return Err(AppError::Internal(format!(
+            "Embedding model returned {} dimensions, but the current vector table expects {}. Change Settings -> Embeddings to match the selected embedding model, then restart.",
+            vector.len(),
+            expected_dimensions
+        )));
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::validate_embedding_dimensions;
+
+    #[test]
+    fn validates_embedding_vector_length() {
+        assert!(validate_embedding_dimensions(&[0.0, 1.0, 2.0], 3).is_ok());
+
+        let err = validate_embedding_dimensions(&[0.0, 1.0], 3).unwrap_err();
+        assert!(err.to_string().contains("expects 3"));
     }
 }

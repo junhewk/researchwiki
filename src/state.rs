@@ -65,6 +65,7 @@ impl AppState {
         let embedding_service = std::sync::Arc::new(EmbeddingService::new(
             http_client.clone(),
             config.embedding.clone(),
+            config.embedding_dimensions,
         ));
         let knowledge_graph_service = std::sync::Arc::new(KnowledgeGraphService::new(
             workspace_db_path.clone(),

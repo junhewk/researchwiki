@@ -149,10 +149,9 @@ mod platform {
 mod tests {
     use std::path::{Path, PathBuf};
 
-    use super::{
-        HIDDEN_ARG, LoginStartupStatus, is_hidden_launch, macos_bundle_path_from_exe,
-        set_login_startup_enabled,
-    };
+    use super::{HIDDEN_ARG, is_hidden_launch, macos_bundle_path_from_exe};
+    #[cfg(not(any(target_os = "windows", target_os = "macos")))]
+    use super::{LoginStartupStatus, set_login_startup_enabled};
 
     #[test]
     fn hidden_launch_detects_exact_flag() {

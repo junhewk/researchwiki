@@ -199,6 +199,7 @@ async fn main() -> Result<()> {
     let embedding_service = Arc::new(EmbeddingService::new(
         http_client.clone(),
         config.embedding.clone(),
+        config.embedding_dimensions,
     ));
     let prompt_service = Arc::new(PromptService::new(
         config.storage.prompts_dir.clone(),

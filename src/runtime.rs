@@ -23,7 +23,10 @@ pub enum UiEvent {
     /// Settings that are part of AppState's service graph changed; rebuild the
     /// active workspace state so new requests use the saved config immediately.
     LlmConfigChanged(LlmConfig),
-    EmbeddingConfigChanged(EmbeddingConfig),
+    EmbeddingConfigChanged {
+        embedding: EmbeddingConfig,
+        embedding_dimensions: Option<u32>,
+    },
     ContactEmailChanged(Option<String>),
     SemanticScholarApiKeyChanged(Option<String>),
     ActiveJobsUpdated {

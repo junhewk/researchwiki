@@ -7,7 +7,9 @@ use std::{
 use tokio::sync::RwLock;
 
 use crate::{
-    config::{EmbeddingConfig, LlmConfig, normalize_api_key},
+    config::{
+        EmbeddingConfig, LlmConfig, infer_embedding_provider, infer_llm_provider, normalize_api_key,
+    },
     error::AppError,
     models::settings::{
         AiProvider, ApiKeyStatus, SettingsResponse, SettingsUpdate, StoredSettings, UiLanguage,
@@ -286,11 +288,17 @@ fn sanitize_stored_settings(stored: &mut StoredSettings) {
 
 fn sanitize_llm_config(mut llm: LlmConfig) -> LlmConfig {
     llm.api_key = normalize_api_key(&llm.api_key);
+    if llm.provider.is_none() {
+        llm.provider = infer_llm_provider(&llm.base_url);
+    }
     llm
 }
 
 fn sanitize_embedding_config(mut embedding: EmbeddingConfig) -> EmbeddingConfig {
     embedding.api_key = normalize_api_key(&embedding.api_key);
+    if embedding.provider.is_none() {
+        embedding.provider = infer_embedding_provider(&embedding.base_url);
+    }
     embedding
 }
 

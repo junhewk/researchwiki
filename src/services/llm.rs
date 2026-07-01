@@ -102,8 +102,27 @@ impl LlmService {
         let mut tokens_input = None;
         let mut tokens_output = None;
         let mut error_message = None;
+        let provider = self.config.effective_provider();
 
         let result = async {
+            if provider.uses_native_anthropic_api() {
+                let result = self
+                    .execute_anthropic(
+                        &model,
+                        &instructions,
+                        &input_text,
+                        output_mode,
+                        prompt_config.schema.as_ref(),
+                        temperature,
+                        started,
+                    )
+                    .await?;
+                tokens_input = result.tokens_input;
+                tokens_output = result.tokens_output;
+                raw_text = Some(result.raw_text.clone());
+                return Ok(result);
+            }
+
             let mut body = json!({
                 "model": model,
                 "messages": build_messages(&instructions, &input_text),
@@ -249,6 +268,126 @@ impl LlmService {
         result
     }
 
+    async fn execute_anthropic(
+        &self,
+        model: &str,
+        instructions: &str,
+        input_text: &str,
+        output_mode: LlmOutputMode,
+        schema: Option<&serde_yaml::Value>,
+        temperature: f64,
+        started: Instant,
+    ) -> Result<LlmExecutionResult, AppError> {
+        let mut body = json!({
+            "model": model,
+            "messages": [
+                {
+                    "role": "user",
+                    "content": input_text,
+                }
+            ],
+            "max_tokens": 8192,
+            "temperature": temperature,
+        });
+
+        if !instructions.trim().is_empty() {
+            body["system"] = json!(instructions);
+        }
+
+        if matches!(output_mode, LlmOutputMode::Json) {
+            body["tools"] = json!([build_anthropic_json_tool(schema)?]);
+            body["tool_choice"] = json!({
+                "type": "tool",
+                "name": "emit_json",
+            });
+        }
+
+        let queue_started = Instant::now();
+        let _permit = self
+            .request_permits
+            .clone()
+            .acquire_owned()
+            .await
+            .map_err(|error| {
+                AppError::Internal(format!(
+                    "failed to acquire Anthropic LLM request permit: {error}"
+                ))
+            })?;
+        let queue_wait = queue_started.elapsed();
+        if queue_wait > Duration::from_secs(1) {
+            warn!(
+                "Anthropic LLM request waited {} ms for concurrency permit",
+                queue_wait.as_millis()
+            );
+        }
+
+        let endpoint = format!("{}/messages", self.config.base_url);
+        let response = self.send_anthropic_with_retries(&endpoint, &body).await?;
+        let status = response.status();
+        let response_body = response.text().await.map_err(|error| {
+            AppError::Internal(format!("Failed to read Anthropic LLM response: {error}"))
+        })?;
+
+        if !status.is_success() {
+            let snippet = if response_body.len() > 500 {
+                format!("{}...", &response_body[..500])
+            } else {
+                response_body
+            };
+            return Err(AppError::Internal(format!(
+                "Anthropic LLM request failed with status {status}: {snippet}"
+            )));
+        }
+
+        let payload: Value = serde_json::from_str(&response_body).map_err(|error| {
+            AppError::Internal(format!(
+                "Failed to parse Anthropic LLM response JSON: {error}"
+            ))
+        })?;
+
+        let json_output = if matches!(output_mode, LlmOutputMode::Json) {
+            Some(extract_anthropic_tool_input(&payload).ok_or_else(|| {
+                AppError::Internal(
+                    "Anthropic LLM response did not contain the requested JSON tool output"
+                        .to_string(),
+                )
+            })?)
+        } else {
+            None
+        };
+
+        let raw_text = if let Some(json_output) = json_output.as_ref() {
+            serde_json::to_string(json_output).map_err(|error| {
+                AppError::Internal(format!(
+                    "Failed to serialize Anthropic JSON output: {error}"
+                ))
+            })?
+        } else {
+            extract_anthropic_text(&payload).ok_or_else(|| {
+                AppError::Internal("Anthropic LLM response did not contain output text".to_string())
+            })?
+        };
+
+        Ok(LlmExecutionResult {
+            raw_text,
+            json_output,
+            model: payload
+                .get("model")
+                .and_then(Value::as_str)
+                .unwrap_or(model)
+                .to_string(),
+            tokens_input: payload
+                .get("usage")
+                .and_then(|usage| usage.get("input_tokens"))
+                .and_then(Value::as_i64),
+            tokens_output: payload
+                .get("usage")
+                .and_then(|usage| usage.get("output_tokens"))
+                .and_then(Value::as_i64),
+            latency_ms: started.elapsed().as_millis() as i64,
+        })
+    }
+
     pub fn max_concurrent_requests(&self) -> usize {
         self.config.max_concurrent_requests.max(1)
     }
@@ -312,6 +451,68 @@ impl LlmService {
 
         Err(AppError::Internal(
             "Local LLM request failed before sending".to_string(),
+        ))
+    }
+
+    async fn send_anthropic_with_retries(
+        &self,
+        endpoint: &str,
+        body: &Value,
+    ) -> Result<Response, AppError> {
+        let max_attempts = self.config.max_attempts.max(1);
+
+        for attempt in 1..=max_attempts {
+            let mut request = self
+                .client
+                .post(endpoint)
+                .header("anthropic-version", "2023-06-01")
+                .json(body);
+            if !self.config.api_key.is_empty() {
+                request = request.header("x-api-key", &self.config.api_key);
+            }
+
+            let result = request.send().await;
+
+            match result {
+                Ok(response)
+                    if should_retry_response(response.status()) && attempt < max_attempts =>
+                {
+                    let status = response.status();
+                    let delay = response_retry_delay(attempt, &response);
+                    warn!(
+                        "Anthropic LLM request returned HTTP {status} on attempt {attempt}/{max_attempts}; retrying in {} ms",
+                        delay.as_millis()
+                    );
+                    tokio::time::sleep(delay).await;
+                }
+                Ok(response) => return Ok(response),
+                Err(error) if error.is_timeout() => {
+                    let detail = reqwest_error_with_sources(&error);
+                    return Err(AppError::Internal(format!(
+                        "Anthropic LLM request timed out after {} seconds; not retrying the same prompt. Original error: {detail}",
+                        self.config.request_timeout_seconds
+                    )));
+                }
+                Err(error) if attempt < max_attempts => {
+                    let detail = reqwest_error_with_sources(&error);
+                    let delay = retry_delay(attempt);
+                    warn!(
+                        "Anthropic LLM request send failed on attempt {attempt}/{max_attempts}; retrying in {} ms: {detail}",
+                        delay.as_millis()
+                    );
+                    tokio::time::sleep(delay).await;
+                }
+                Err(error) => {
+                    let detail = reqwest_error_with_sources(&error);
+                    return Err(AppError::Internal(format!(
+                        "Anthropic LLM request failed after {max_attempts} attempts: {detail}"
+                    )));
+                }
+            }
+        }
+
+        Err(AppError::Internal(
+            "Anthropic LLM request failed before sending".to_string(),
         ))
     }
 }
@@ -421,6 +622,32 @@ fn build_json_response_format(
     Ok(response_format)
 }
 
+fn build_anthropic_json_tool(schema: Option<&serde_yaml::Value>) -> Result<Value, AppError> {
+    let input_schema =
+        if let Some(schema) = schema.filter(|value| !matches!(value, serde_yaml::Value::Null)) {
+            serde_json::to_value(schema).map_err(|error| {
+                AppError::Internal(format!("Invalid JSON schema for prompt: {error}"))
+            })?
+        } else {
+            json!({
+                "type": "object",
+                "additionalProperties": true,
+            })
+        };
+
+    if input_schema.get("type").and_then(Value::as_str) != Some("object") {
+        return Err(AppError::Internal(
+            "Anthropic JSON tool output requires an object JSON schema".to_string(),
+        ));
+    }
+
+    Ok(json!({
+        "name": "emit_json",
+        "description": "Emit only the structured JSON output requested by the prompt.",
+        "input_schema": input_schema,
+    }))
+}
+
 fn append_example_style(system: String, example: Option<String>) -> String {
     match example {
         Some(example) if !example.trim().is_empty() => {
@@ -474,6 +701,36 @@ fn extract_output_text(payload: &Value) -> Option<String> {
     }
 
     if text.is_empty() { None } else { Some(text) }
+}
+
+fn extract_anthropic_text(payload: &Value) -> Option<String> {
+    let mut text = String::new();
+    let content = payload.get("content")?.as_array()?;
+
+    for part in content {
+        if part.get("type").and_then(Value::as_str) == Some("text")
+            && let Some(part_text) = part.get("text").and_then(Value::as_str)
+        {
+            text.push_str(part_text);
+        }
+    }
+
+    if text.trim().is_empty() {
+        None
+    } else {
+        Some(text)
+    }
+}
+
+fn extract_anthropic_tool_input(payload: &Value) -> Option<Value> {
+    let content = payload.get("content")?.as_array()?;
+
+    content.iter().find_map(|part| {
+        (part.get("type").and_then(Value::as_str) == Some("tool_use")
+            && part.get("name").and_then(Value::as_str) == Some("emit_json"))
+        .then(|| part.get("input").cloned())
+        .flatten()
+    })
 }
 
 fn parse_json_payload(text: &str) -> Option<Value> {
@@ -555,6 +812,70 @@ fn deepseek_json_format_omits_local_schema_extension() {
     assert_eq!(
         response_format,
         serde_json::json!({ "type": "json_object" })
+    );
+}
+
+#[cfg(test)]
+#[test]
+fn anthropic_json_tool_uses_prompt_schema() {
+    let schema = serde_yaml::to_value(serde_json::json!({
+        "type": "object",
+        "properties": {
+            "score": { "type": "integer" }
+        },
+        "required": ["score"]
+    }))
+    .unwrap();
+
+    let tool = build_anthropic_json_tool(Some(&schema)).unwrap();
+
+    assert_eq!(tool.get("name"), Some(&serde_json::json!("emit_json")));
+    assert_eq!(
+        tool.pointer("/input_schema/properties/score/type"),
+        Some(&serde_json::json!("integer"))
+    );
+}
+
+#[cfg(test)]
+#[test]
+fn anthropic_json_tool_rejects_non_object_schema() {
+    let schema = serde_yaml::to_value(serde_json::json!({
+        "type": "array",
+        "items": { "type": "string" }
+    }))
+    .unwrap();
+
+    let err = build_anthropic_json_tool(Some(&schema)).unwrap_err();
+
+    assert!(err.to_string().contains("object JSON schema"));
+}
+
+#[cfg(test)]
+#[test]
+fn anthropic_response_extractors_handle_text_and_tool_use() {
+    let text_payload = serde_json::json!({
+        "content": [
+            { "type": "text", "text": "hello" },
+            { "type": "text", "text": " world" }
+        ]
+    });
+    assert_eq!(
+        extract_anthropic_text(&text_payload),
+        Some("hello world".to_string())
+    );
+
+    let tool_payload = serde_json::json!({
+        "content": [
+            {
+                "type": "tool_use",
+                "name": "emit_json",
+                "input": { "score": 7 }
+            }
+        ]
+    });
+    assert_eq!(
+        extract_anthropic_tool_input(&tool_payload),
+        Some(serde_json::json!({ "score": 7 }))
     );
 }
 

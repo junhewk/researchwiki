@@ -73,6 +73,7 @@ fn demo_config_from_env() -> Result<AppConfig> {
             pdf_dir: env_path("PDF_DIR", root.join("pdfs")),
         },
         llm: LlmConfig {
+            provider: None,
             base_url: std::env::var("LLM_BASE_URL")
                 .unwrap_or_else(|_| "http://localhost:11434/v1".to_string()),
             model: std::env::var("LLM_MODEL").unwrap_or_else(|_| "demo-local".to_string()),
@@ -84,6 +85,7 @@ fn demo_config_from_env() -> Result<AppConfig> {
             max_concurrent_requests: env_parse("LLM_MAX_CONCURRENT_REQUESTS", 1),
         },
         embedding: EmbeddingConfig {
+            provider: None,
             base_url: std::env::var("EMBEDDING_BASE_URL").unwrap_or_default(),
             model: std::env::var("EMBEDDING_MODEL").unwrap_or_default(),
             api_key: std::env::var("EMBEDDING_API_KEY").unwrap_or_default(),
